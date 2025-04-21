@@ -4,3 +4,4 @@ __pycache__
 /.clangd
 *.egg-info
 *.pyd
+tmp
