@@ -17,3 +17,4 @@ include = [
 
 [project.scripts]
 gint-gen-llir = "gint.scripts.gen_llir:main"
+gint-driver = "gint.scripts.driver:main"
