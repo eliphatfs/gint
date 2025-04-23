@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gint"
+dynamic = ["version"]
+license = "LGPL-2.1-or-later"
+
+[tool.hatch.version]
+path = "gint/version.py"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/gint",
+]
+
+[project.scripts]
+gint-gen-llir = "gint.scripts.gen_llir:main"
