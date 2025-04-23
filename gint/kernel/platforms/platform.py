@@ -21,6 +21,10 @@ class PlatformIRBuilder(ir.IRBuilder):
     def printf(self, fmt: str, *args: tuple[ir.Value, ...]) -> ir.Value:
         raise NotImplementedError
     
+    def arg(self, idx: int) -> ir.Value:
+        fn: ir.Function = self.function
+        return fn.args[idx]
+    
     def intrinsic(self, name: str, res_ty: ir.Type, args: list[ir.Value]):
         return self.call(self.intrinsic_fn(name, res_ty, [a.type for a in args]), args)
 
