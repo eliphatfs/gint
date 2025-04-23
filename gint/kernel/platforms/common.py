@@ -9,3 +9,5 @@ f16 = ir.HalfType()
 f32 = ir.FloatType()
 f64 = ir.DoubleType()
 void = ir.VoidType()
+
+p_i8 = i8.as_pointer()
