@@ -133,6 +133,7 @@ def prepare_arg(arg: Union[int, float, ctypes._SimpleCData, cuda.CUdeviceptr]):
         return CTypesWrapper(arg)
     if isinstance(arg, cuda.CUdeviceptr):
         return arg
+    raise TypeError("Unrecognized argument type for kernel", type(arg))
 
 
 def launch_kernel(
