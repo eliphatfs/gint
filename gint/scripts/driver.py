@@ -1,10 +1,14 @@
-from cuda import cuda
-import sys
-import numpy as np
 import ctypes
+from cuda import cuda
+from typing import Callable, List, Tuple, Union
 
 
-def check_cuda_error(err):
+class CudaDriverError(RuntimeError):
+    """Custom exception for CUDA Driver API errors."""
+    pass
+
+
+def check_cuda_error(err, extra_message: Union[bytes, bytearray, str] = ""):
     """Checks for CUDA errors and raises an exception if one occurs."""
     if isinstance(err, tuple) and isinstance(err[0], cuda.CUresult):
         err = err[0]
@@ -13,12 +17,39 @@ def check_cuda_error(err):
             # [0] is CUresult
             err_name = cuda.cuGetErrorName(err)[1]
             err_string = cuda.cuGetErrorString(err)[1]
+            if isinstance(extra_message, (bytes, bytearray)):
+                extra_message = extra_message.decode(errors='ignore')
+            print(extra_message)
             raise CudaDriverError(f"CUDA Driver API Error: {err_name} ({err_string})")
 
 
-class CudaDriverError(RuntimeError):
-    """Custom exception for CUDA Driver API errors."""
-    pass
+class DriverContext(object):
+    context: cuda.CUcontext
+    device: cuda.CUdevice
+    
+    def __init__(self, device_ordinal: int) -> None:
+        self.context = None
+        self.cleanup_stack: List[Callable[[], None]] = []
+        check_cuda_error(cuda.cuInit(0))
+        err, device = cuda.cuDeviceGet(device_ordinal)
+        check_cuda_error(err)
+        err, context = cuda.cuCtxCreate(0, device)
+        check_cuda_error(err)
+        self.device = device
+        self.context = context
+    
+    def deferred(self, cleanup_fn: Callable[[], None]):
+        self.cleanup_stack.append(cleanup_fn)
+    
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, ty, value, tb):
+        for cleanup in reversed(self.cleanup_stack):
+            cleanup()
+        if self.context is not None:
+            err = cuda.cuCtxDestroy(self.context)
+            check_cuda_error(err)
 
 
 def read_ptx(filename):
@@ -26,9 +57,7 @@ def read_ptx(filename):
         return f.read()
 
 
-def ptx_link(ptx_source_bytes, fn_name):
-    lState = None # Initialize to None for finally block
-
+def ptx_link(driver_ctx: DriverContext, ptx_source_bytes: bytes, fn_name: bytes, verbose: int = 0) ->cuda.CUfunction:
     log_size = 16384
     info_log = bytearray(log_size)
     error_log = bytearray(log_size)
@@ -54,96 +83,107 @@ def ptx_link(ptx_source_bytes, fn_name):
         1                          # Verbose level as int
     ]
 
-    try:
-        err, lState = cuda.cuLinkCreate(len(options), options, option_vals)
-        check_cuda_error(err)
+    err, state = cuda.cuLinkCreate(len(options), options, option_vals)
+    check_cuda_error(err)
+    driver_ctx.deferred(lambda: check_cuda_error(cuda.cuLinkDestroy(state)))
 
-        err = cuda.cuLinkAddData(
-            lState,
-            cuda.CUjitInputType.CU_JIT_INPUT_PTX,
-            ptx_source_bytes,
-            len(ptx_source_bytes),
-            b"ptx_data",
-            0, None, None
-        )
+    err = cuda.cuLinkAddData(
+        state,
+        cuda.CUjitInputType.CU_JIT_INPUT_PTX,
+        ptx_source_bytes,
+        len(ptx_source_bytes),
+        b"ptx_data",
+        0, None, None
+    )
+    check_cuda_error(err, error_log)
 
-        if err != cuda.CUresult.CUDA_SUCCESS:
-            print(f"PTX Linker Error during cuLinkAddData:\n{error_log.decode(errors='ignore').strip()}", file=sys.stderr)
-            check_cuda_error(err)
+    err, cubin_out, cubin_size_out = cuda.cuLinkComplete(state)
+    check_cuda_error(err)
 
-        err, cubin_out, cubin_size_out = cuda.cuLinkComplete(lState)
-        check_cuda_error(err)
-
+    if verbose >= 1:
         print(f"CUDA Link Completed in {walltime.value:.4f} ms.")
+    if verbose >= 2:
         info_log_str = info_log.decode(errors='ignore').strip()
         if info_log_str:
-             print(f"Linker Info Log:\n{info_log_str}")
+            print(f"Linker Info Log:\n{info_log_str}")
 
-        err, module = cuda.cuModuleLoadData(cubin_out) # Pass the cubin handle directly
-        check_cuda_error(err)
+    err, module = cuda.cuModuleLoadData(cubin_out) # Pass the cubin handle directly
+    check_cuda_error(err)
+    driver_ctx.deferred(lambda: check_cuda_error(cuda.cuModuleUnload(module)))
 
-        err, func = cuda.cuModuleGetFunction(module, fn_name)
-        check_cuda_error(err)
-        return module, func
-    finally:
-        if lState is not None:
-            err = cuda.cuLinkDestroy(lState)
-            check_cuda_error(err)
+    err, func = cuda.cuModuleGetFunction(module, fn_name)
+    check_cuda_error(err)
+    return func
+
+
+class CTypesWrapper:
+    def __init__(self, c: ctypes._SimpleCData) -> None:
+        self.c = c
+    
+    def getPtr(self) -> int:
+        return ctypes.addressof(self.c)
+
+
+def prepare_arg(arg: Union[int, float, ctypes._SimpleCData, cuda.CUdeviceptr]):
+    if isinstance(arg, int):
+        return CTypesWrapper(ctypes.c_int(arg))
+    if isinstance(arg, float):
+        return CTypesWrapper(ctypes.c_float(arg))
+    if isinstance(arg, ctypes._SimpleCData):
+        return CTypesWrapper(arg)
+    if isinstance(arg, cuda.CUdeviceptr):
+        return arg
+
+
+def launch_kernel(
+    kernel: Union[cuda.CUfunction, cuda.CUkernel],
+    *args: Union[int, float, ctypes._SimpleCData, cuda.CUdeviceptr],
+    grid_dim: Union[Tuple[int, int, int], int],
+    block_dim: Union[Tuple[int, int, int], int],
+    smem_bytes: int = 0,
+    stream: cuda.CUstream = cuda.CUstream(0),
+    sync: bool = False
+):
+    """
+    | int args will be represented as native int in C.
+    | float args will be represented as single-precision float in C.
+    | CUdeviceptr will be passed as-is.
+    | ctypes scalars will be passed as-is.
+    """
+    if isinstance(grid_dim, int):
+        grid_dim = (grid_dim, 1, 1)
+    if isinstance(block_dim, int):
+        block_dim = (block_dim, 1, 1)
+    assert len(grid_dim) == 3, "Expected scalar or 3 dims in `grid_dim`, got %d" % len(grid_dim)
+    assert len(block_dim) == 3, "Expected scalar or 3 dims in `block_dim`, got %d" % len(block_dim)
+    preped_args = [prepare_arg(arg) for arg in args]
+    kernel_args = (ctypes.c_void_p * len(args))()
+    for i, parg in enumerate(preped_args):
+        kernel_args[i] = parg.getPtr()
+    extra = 0
+    err = cuda.cuLaunchKernel(kernel, *grid_dim, *block_dim, smem_bytes, stream, kernel_args, extra)
+    check_cuda_error(err)
+    if sync:
+        check_cuda_error(cuda.cuStreamSynchronize(stream))
 
 
 def main():
-    context = None
-    module = None
-
-    try:
-        check_cuda_error(cuda.cuInit(0))
-        err, device = cuda.cuDeviceGet(0)
-        check_cuda_error(err)
-        err, context = cuda.cuCtxCreate(0, device)
-        check_cuda_error(err)
+    with DriverContext(0) as driver_ctx:
+        context = driver_ctx.context
         print(f"Created context: {context}")
 
         ptx_file = "test.ptx"
         kernel_name = b"geval"
         ptx_content = read_ptx(ptx_file)
 
-        module, function = ptx_link(ptx_content, kernel_name)
+        function = ptx_link(driver_ctx, ptx_content, kernel_name, verbose=2)
 
-        x = ctypes.c_int(42)
-
-        kernel_args = (ctypes.c_void_p * 1)()
-        kernel_args[0] = ctypes.addressof(x)
-
-        # --- Launch Kernel ---
-        gridDimX = 2
-        gridDimY = 1
-        gridDimZ = 1
-        blockDimX = 64
-        blockDimY = 1
-        blockDimZ = 1
-        sharedMemBytes = 0
-        stream = cuda.CUstream(0)
-
-        err = cuda.cuLaunchKernel(
-            function,
-            gridDimX, gridDimY, gridDimZ,
-            blockDimX, blockDimY, blockDimZ,
-            sharedMemBytes,
-            stream,  # Stream handle
-            kernel_args,  # Arguments (list of pointers/values)
-            0
+        launch_kernel(
+            function, 42,
+            grid_dim=2,
+            block_dim=64,
+            sync=True
         )
-        check_cuda_error(err)
-
-        check_cuda_error(cuda.cuStreamSynchronize(stream))
-    finally:
-        if module is not None:
-            err = cuda.cuModuleUnload(module)
-            check_cuda_error(err)
-
-        if context is not None:
-            err = cuda.cuCtxDestroy(context)
-            check_cuda_error(err)
 
 
 if __name__ == "__main__":
