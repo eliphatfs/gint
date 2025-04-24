@@ -31,7 +31,7 @@ class NVPTXIRBuilder(PlatformIRBuilder):
     def lane_id(self) -> ir.Value:
         return self.read_sreg("laneid")
     
-    def printf(self, fmt: str, *args: tuple[ir.Value, ...]) -> ir.Value:
+    def printf(self, fmt: str, *args: ir.Value) -> ir.Value:
         fmt_lit = self.string_literal(fmt)
         
         wrapper_func_ty = ir.FunctionType(i32, [], True)
