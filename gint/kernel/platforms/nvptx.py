@@ -43,8 +43,8 @@ class NVPTXIRBuilder(PlatformIRBuilder):
         self.position_at_end(wrapper_func.append_basic_block("entry"))
         va_list_ptr = self.alloca(p_i8, name="va_list_storage")
         self.intrinsic("llvm.va_start", void, [va_list_ptr])
-        vprintf_type = ir.FunctionType(i32, [p_i8, p_i8])
-        vprintf = ir.Function(self.module, vprintf_type, 'vprintf')
+        
+        vprintf = self.intrinsic_fn('vprintf', i32, [p_i8, p_i8])
         va_list = self.load(va_list_ptr)
         call_result = self.call(vprintf, [fmt_lit, va_list])
         self.intrinsic("llvm.va_end", void, [va_list_ptr])

@@ -29,6 +29,9 @@ class PlatformIRBuilder(ir.IRBuilder):
         return self.call(self.intrinsic_fn(name, res_ty, [a.type for a in args]), args)
 
     def intrinsic_fn(self, name: str, res_ty: ir.Type, args_tys: list[ir.Type]):
+        mod: ir.Module = self.module
+        if name in mod.globals:
+            return mod.globals[name]
         return ir.Function(self.module, ir.FunctionType(res_ty, args_tys), name)
 
     def string_literal(self, string: str, name: Optional[str] = None) -> ir.Constant:
@@ -59,3 +62,7 @@ class PlatformIRBuilder(ir.IRBuilder):
         string_pointer = global_var.gep([i32(0), i32(0)])
 
         return string_pointer
+
+    def emit(self):
+        assert self.module is not None, "module is None. please point to a block before calling emit."
+        return str(self.module).encode()
