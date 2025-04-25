@@ -25,8 +25,9 @@ def build_main_loop(LL: PlatformIRBuilder):
     code = LL.arg(0)
     
     LL.position_at_end(entry_bb)
-    entry_insn = LL.load(code)
-    entry_next_pc = i32(1)
+    entry_opcode = LL.load(code)
+    entry_operand = LL.load(LL.gep(code, [i32(1)]))
+    entry_next_pc = i32(2)
     LL.branch(dispatch_bb)
     
     LL.position_at_end(dispatch_bb)  # in: entry, back
@@ -34,12 +35,15 @@ def build_main_loop(LL: PlatformIRBuilder):
     for reg, (name, init) in zip(regs, ispec.flat_reg_inits()):
         reg.add_incoming(init, entry_bb)
     
-    cur_insn = LL.phi(i32)
+    cur_opcode = LL.phi(i32)
+    cur_operand = LL.phi(i32)
     next_pc = LL.phi(i32)
-    cur_insn.add_incoming(entry_insn, entry_bb)
+    cur_opcode.add_incoming(entry_opcode, entry_bb)
+    cur_operand.add_incoming(entry_operand, entry_bb)
     next_pc.add_incoming(entry_next_pc, entry_bb)
-    opcode = cur_insn
-    next_insn = LL.load(LL.gep(code, [next_pc]))
+    opcode = cur_opcode
+    next_opcode = LL.load(LL.gep(code, [next_pc]))
+    next_operand = LL.load(LL.gep(code, [LL.add(next_pc, i32(1))]))
     dispatch_switch = LL.switch(opcode, undef_bb)
     
     LL.position_at_end(back_bb)  # in: insts
@@ -47,8 +51,9 @@ def build_main_loop(LL: PlatformIRBuilder):
     for reg, reg_b in zip(regs, reg_bs):
         reg.add_incoming(reg_b, back_bb)
     
-    cur_insn.add_incoming(next_insn, back_bb)
-    upd_pc = LL.add(next_pc, i32(1))
+    cur_opcode.add_incoming(next_opcode, back_bb)
+    cur_operand.add_incoming(next_operand, back_bb)
+    upd_pc = LL.add(next_pc, i32(2))
     next_pc.add_incoming(upd_pc, back_bb)
     LL.branch(dispatch_bb)
 
@@ -60,7 +65,7 @@ def build_main_loop(LL: PlatformIRBuilder):
         Halt()
     ]
     for opid, insn in enumerate(insns):
-        state = InterpreterState(regs, ispec)
+        state = InterpreterState(regs, cur_operand, ispec)
         insn_bb = LL.append_basic_block(insn.__class__.__name__)
         LL.position_at_end(insn_bb)
         insn.emit(LL, state, ispec)

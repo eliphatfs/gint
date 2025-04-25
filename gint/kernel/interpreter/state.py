@@ -58,9 +58,10 @@ class RegisterSet(object):
 
 class InterpreterState:
     
-    def __init__(self, regs: list[ir.Value], spec: InterpreterStateSpec) -> None:
+    def __init__(self, regs: list[ir.Value], operand: ir.Value, spec: InterpreterStateSpec) -> None:
         super().__init__()
         self.assn_regs = regs.copy()
+        self.operand = operand
         self.spec = spec
     
     def ilp_size(self):
