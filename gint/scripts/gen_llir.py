@@ -1,10 +1,11 @@
+import rich
 import argparse
 import subprocess
 from typing import Literal, Optional
 from gint.kernel.interpreter.main import build_interpreter_main_nvptx
 
 
-def invoke_clang_shim(llir: bytes, target: Literal['ptx'] = 'ptx', cc: Optional[int] = None):
+def invoke_clang_shim(llir: bytes, target: Literal['ptx'] = 'ptx', cc: Optional[int] = None, emit_llir: bool = False):
     targets = {'ptx': 'nvptx64-nvidia-cuda'}
     if target not in targets:
         raise ValueError("Unsupported target", target, "supported targets", targets)
@@ -15,21 +16,30 @@ def invoke_clang_shim(llir: bytes, target: Literal['ptx'] = 'ptx', cc: Optional[
         '-x', 'ir',
         '-S',
         '-O3',
+        '-emit-llvm' if emit_llir else '',
         '-o', '-',
         '-'
     ], input=llir)
 
 
 def main():
-    argp = argparse.ArgumentParser()
-    argp.add_argument("-o", "--output-path", type=str, required=True)
+    argp = argparse.ArgumentParser('gint-gen-llir')
+    argp.add_argument("-o", "--output-path", type=str, default=None)
     argp.add_argument("-t", "--target", type=str, default="llir", choices=['llir', 'ptx'])
+    argp.add_argument(
+        "-E", "--emit-llir",
+        action='store_true',
+        help="Emit optimized LLIR for the target (not effective when target is 'llir' when the program generates unoptimized LLIR)."
+    )
     argp.add_argument("--cc", type=int, default=None)
     args = argp.parse_args()
     
     mod = build_interpreter_main_nvptx()
     ir = str(mod).encode()
     if args.target != 'llir':
-        ir = invoke_clang_shim(ir, args.target, args.cc)
-    with open(args.output_path, "wb") as fo:
-        fo.write(ir)
+        ir = invoke_clang_shim(ir, args.target, args.cc, args.emit_llir)
+    if args.output_path is None:
+        rich.print(ir.decode().strip())
+    else:
+        with open(args.output_path, "wb") as fo:
+            fo.write(ir)
