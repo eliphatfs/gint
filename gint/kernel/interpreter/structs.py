@@ -9,5 +9,5 @@ TensorInfo = ir.LiteralStructType([
     i32,  # thread dim shape
     i32,  # element size in bytes
     i32,  # reserved
-    p_i8,  # tensor base, need reinterpret cast (llir bitcast) before loading
+    p_i8g,  # tensor base, need reinterpret cast (llir bitcast) before loading
 ])

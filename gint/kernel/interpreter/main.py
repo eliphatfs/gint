@@ -3,12 +3,10 @@ from ..platforms.common import *
 from ..platforms.platform import PlatformIRBuilder
 from ..platforms.nvptx import NVPTXIRBuilder
 from .instruction import EInsnAttrs
-from .instructions.load_store import LoadTensorInfos
+from .instructions.load_store import LoadTensorInfos, LoadGlobalF32, StoreGlobalF32
 from .instructions.control import Halt
 from .state import InterpreterState, get_spec
 from .structs import TensorInfo
-
-ILP = 4
 
 
 def build_main_loop(LL: PlatformIRBuilder):
@@ -65,6 +63,8 @@ def build_main_loop(LL: PlatformIRBuilder):
     insns = [
         Halt(),
         LoadTensorInfos(),
+        LoadGlobalF32(),
+        StoreGlobalF32(),
     ]
     for opid, insn in enumerate(insns):
         state = InterpreterState(regs, cur_operand, ispec)
@@ -76,7 +76,7 @@ def build_main_loop(LL: PlatformIRBuilder):
         if not (attrs & EInsnAttrs.NoReturn):
             LL.branch(back_bb)
             for reg_b, assn_reg in zip(reg_bs, state.assn_regs):
-                reg_b.add_incoming(assn_reg, insn_bb)  # todo: change to state variable
+                reg_b.add_incoming(assn_reg, LL.block)  # todo: change to state variable
 
 
 GEvalFType = ir.FunctionType(void, [
