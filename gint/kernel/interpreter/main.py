@@ -3,9 +3,10 @@ from ..platforms.common import *
 from ..platforms.platform import PlatformIRBuilder
 from ..platforms.nvptx import NVPTXIRBuilder
 from .instruction import EInsnAttrs
-from .instructions.load_store import LoadGlobal
+from .instructions.load_store import LoadTensorInfos
 from .instructions.control import Halt
 from .state import InterpreterState, get_spec
+from .structs import TensorInfo
 
 ILP = 4
 
@@ -26,7 +27,7 @@ def build_main_loop(LL: PlatformIRBuilder):
     
     LL.position_at_end(entry_bb)
     entry_opcode = LL.load(code)
-    entry_operand = LL.load(LL.gep(code, [i32(1)]))
+    entry_operand = LL.load(LL.gep(code, [i32(1)], inbounds=True))
     entry_next_pc = i32(2)
     LL.branch(dispatch_bb)
     
@@ -42,8 +43,8 @@ def build_main_loop(LL: PlatformIRBuilder):
     cur_operand.add_incoming(entry_operand, entry_bb)
     next_pc.add_incoming(entry_next_pc, entry_bb)
     opcode = cur_opcode
-    next_opcode = LL.load(LL.gep(code, [next_pc]))
-    next_operand = LL.load(LL.gep(code, [LL.add(next_pc, i32(1))]))
+    next_opcode = LL.load(LL.gep(code, [next_pc], inbounds=True))
+    next_operand = LL.load(LL.gep(code, [LL.add(next_pc, i32(1))], inbounds=True))
     dispatch_switch = LL.switch(opcode, undef_bb)
     
     LL.position_at_end(back_bb)  # in: insts
@@ -62,7 +63,8 @@ def build_main_loop(LL: PlatformIRBuilder):
     
     # all insts below. in: dispatch, dom: dispatch, entry
     insns = [
-        Halt()
+        Halt(),
+        LoadTensorInfos(),
     ]
     for opid, insn in enumerate(insns):
         state = InterpreterState(regs, cur_operand, ispec)
@@ -77,7 +79,14 @@ def build_main_loop(LL: PlatformIRBuilder):
                 reg_b.add_incoming(assn_reg, insn_bb)  # todo: change to state variable
 
 
+GEvalFType = ir.FunctionType(void, [
+    i32.as_pointer(1),  # code
+    TensorInfo.as_pointer(1),  # tensor info
+    i32  # num of tensors
+])
+
+
 def build_interpreter_main_nvptx() -> ir.Module:
-    LL = NVPTXIRBuilder.create_kernel_module(ir.FunctionType(void, [i32.as_pointer(1)]), "geval")
+    LL = NVPTXIRBuilder.create_kernel_module(GEvalFType, "geval")
     build_main_loop(LL)
     return LL.module

@@ -17,29 +17,38 @@ class InterpreterStateSpec:
     ilp: int
     rf0: RegisterSetSpec
     rf1: RegisterSetSpec
+    rf2: RegisterSetSpec
+    rf3: RegisterSetSpec
     rb0: RegisterSetSpec
-    rofs: RegisterSetSpec
+    rss: RegisterSetSpec
+    rof: RegisterSetSpec
     
     def __post_init__(self):
         self.flat_reg_inits()  # check bases are right
     
     def flat_reg_inits(self) -> list[tuple[str, ir.Constant]]:
-        sets = [self.rf0, self.rf1, self.rb0, self.rofs]
+        sets = [self.rf0, self.rf1, self.rf2, self.rf3, self.rb0, self.rss, self.rof]
         flat = []
         for s in sets:
-            assert s.base == len(flat)
+            assert s.base == len(flat), s.name
             for i in range(s.num):
                 flat.append((s.name + '_' + str(i), s.init))
         return flat
 
 
 def get_spec(ilp: int = 4) -> InterpreterStateSpec:
+    flat_rspec = [
+        RegisterSetSpec('rf0', ilp * 0, ilp, f32, f32(0.0)),
+        RegisterSetSpec('rf1', ilp * 1, ilp, f32, f32(0.0)),
+        RegisterSetSpec('rf2', ilp * 2, ilp, f32, f32(0.0)),
+        RegisterSetSpec('rf3', ilp * 3, ilp, f32, f32(0.0)),
+        RegisterSetSpec('rb0', ilp * 4, ilp, i1, i1(False)),
+        RegisterSetSpec('rss', ilp * 5 + 0, 4, i32, i32(0)),  # ilp and warp stride and limit
+        RegisterSetSpec('rof', ilp * 5 + 4, 1, p_i8, p_i8(None)),  # block offset
+    ]
     return InterpreterStateSpec(
         ilp=ilp,
-        rf0=RegisterSetSpec('rf0', 0, ilp, f32, f32(0.0)),
-        rf1=RegisterSetSpec('rf1', ilp, ilp, f32, f32(0.0)),
-        rb0=RegisterSetSpec('rb0', ilp * 2, ilp, i1, i1(False)),
-        rofs=RegisterSetSpec('rofs', ilp * 3, 1, i64, i64(0))
+        **{v.name: v for v in flat_rspec}
     )
 
 
@@ -64,8 +73,10 @@ class InterpreterState:
         self.operand = operand
         self.spec = spec
     
-    def ilp_size(self):
-        return self.spec.ilp
-    
     def __getitem__(self, regset_spec: RegisterSetSpec) -> RegisterSet:
         return RegisterSet(self.assn_regs, regset_spec)
+
+    def __setitem__(self, regset_spec: RegisterSetSpec, val_list: list[ir.Value]):
+        assert len(val_list) == regset_spec.num
+        for i in range(regset_spec.num):
+            self[regset_spec][i] = val_list[i]
