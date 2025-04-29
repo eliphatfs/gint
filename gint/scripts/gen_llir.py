@@ -39,7 +39,7 @@ def main():
     if args.target != 'llir':
         ir = invoke_clang_shim(ir, args.target, args.cc, args.emit_llir)
     if args.output_path is None:
-        rich.print(ir.decode().strip())
+        rich.print(ir.decode().strip().replace('[', '\\['))
     else:
         with open(args.output_path, "wb") as fo:
             fo.write(ir)
