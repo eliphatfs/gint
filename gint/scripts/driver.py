@@ -52,6 +52,22 @@ class DriverContext(object):
             check_cuda_error(err)
 
 
+class ExistingDriverContext(DriverContext):
+    
+    def __init__(self, device_ordinal: int) -> None:
+        self.cleanup_stack: List[Callable[[], None]] = []
+        err, device = cuda.cuDeviceGet(device_ordinal)
+        check_cuda_error(err)
+        err, context = cuda.cuCtxGetCurrent()
+        check_cuda_error(err)
+        self.device = device
+        self.context = context
+    
+    def __exit__(self, ty, value, tb):
+        for cleanup in reversed(self.cleanup_stack):
+            cleanup()
+        
+
 def read_ptx(filename):
     with open(filename, "rb") as f:
         return f.read()
