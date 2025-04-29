@@ -44,7 +44,7 @@ def get_spec(ilp: int = 4) -> InterpreterStateSpec:
         RegisterSetSpec('rf3', ilp * 3, ilp, f32, f32(0.0)),
         RegisterSetSpec('rb0', ilp * 4, ilp, i1, i1(False)),
         RegisterSetSpec('rss', ilp * 5 + 0, 4, i32, i32(0)),  # ilp and warp stride and limit
-        RegisterSetSpec('rof', ilp * 5 + 4, 1, p_i8, p_i8(None)),  # block offset
+        RegisterSetSpec('rof', ilp * 5 + 4, 1, p_i8g, p_i8g(None)),  # block offset
     ]
     return InterpreterStateSpec(
         ilp=ilp,
@@ -57,8 +57,11 @@ class RegisterSet(object):
     def __init__(self, flat_regs: list, spec: RegisterSetSpec) -> None:
         self.flat_regs = flat_regs
         self.base = spec.base
+        self.num = spec.num
     
     def __getitem__(self, index: int) -> ir.Value:
+        if index >= self.num:
+            raise IndexError("Register set index out of range", index)
         return self.flat_regs[index + self.base]
 
     def __setitem__(self, index: int, val: ir.Value):
