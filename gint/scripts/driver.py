@@ -8,8 +8,9 @@ class CudaDriverError(RuntimeError):
     pass
 
 
-def check_cuda_error(err, extra_message: Union[bytes, bytearray, str] = ""):
+def check_cuda_error(maybe_err, extra_message: Union[bytes, bytearray, str] = ""):
     """Checks for CUDA errors and raises an exception if one occurs."""
+    err = maybe_err
     if isinstance(err, tuple) and isinstance(err[0], cuda.CUresult):
         err = err[0]
     if isinstance(err, cuda.CUresult):
@@ -21,6 +22,7 @@ def check_cuda_error(err, extra_message: Union[bytes, bytearray, str] = ""):
                 extra_message = extra_message.decode(errors='ignore')
             print(extra_message)
             raise CudaDriverError(f"CUDA Driver API Error: {err_name} ({err_string})")
+    return maybe_err
 
 
 class DriverContext(object):
