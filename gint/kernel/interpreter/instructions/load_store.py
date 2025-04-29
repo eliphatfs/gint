@@ -1,4 +1,3 @@
-from llvmlite.ir.types import Type
 from ..state import InterpreterState, InterpreterStateSpec
 from ...platforms.platform import PlatformIRBuilder
 from ..instruction import Instruction
@@ -12,9 +11,9 @@ class LoadTensorInfos(Instruction):
         before_block = LL.block
         with LL.if_then(LL.icmp_signed('<', lane_id, LL.arg(2))):
             if_block = LL.block
-            b_strides, b_sizes, t_stride, t_size, elm_sz, resv, base_ptr = [
+            b_strides, b_sizes, t_stride, t_size, elm_sz, resv_0, resv_1, resv_2, base_ptr = [
                 LL.load(LL.gep(LL.arg(1), [lane_id, i32(eid)], inbounds=True))
-                for eid in range(7)
+                for eid in range(9)
             ]
             bidx = LL.block_idx_x()
             rbidx = bidx
