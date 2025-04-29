@@ -5,8 +5,18 @@ from ..platforms.nvptx import NVPTXIRBuilder
 from .instruction import EInsnAttrs
 from .instructions.load_store import LoadTensorInfos, LoadGlobalF32, StoreGlobalF32
 from .instructions.control import Halt
+from .instructions.arith import FAddTo
 from .state import InterpreterState, get_spec
 from .structs import TensorInfo
+
+
+insns = [
+    Halt(),
+    LoadTensorInfos(),
+    LoadGlobalF32(),
+    StoreGlobalF32(),
+    FAddTo(),
+]
 
 
 def build_main_loop(LL: PlatformIRBuilder):
@@ -60,12 +70,6 @@ def build_main_loop(LL: PlatformIRBuilder):
     LL.unreachable()
     
     # all insts below. in: dispatch, dom: dispatch, entry
-    insns = [
-        Halt(),
-        LoadTensorInfos(),
-        LoadGlobalF32(),
-        StoreGlobalF32(),
-    ]
     for opid, insn in enumerate(insns):
         state = InterpreterState(regs, cur_operand, ispec)
         insn_bb = LL.append_basic_block(insn.__class__.__name__)
