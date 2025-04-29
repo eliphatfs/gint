@@ -52,3 +52,16 @@ class NVPTXIRBuilder(PlatformIRBuilder):
         
         self.position_at_end(block_ptr)
         return ret
+
+    def warp_broadcast_lane(self, value: ir.NamedValue, lane: ir.Value) -> ir.Value:
+        if value.type == i32:
+            return self.intrinsic(
+                "llvm.nvvm.shfl.sync.idx.i32",
+                i32, [i32(-1), value, lane, i32(31)]
+            )
+        if value.type == f32:
+            return self.intrinsic(
+                "llvm.nvvm.shfl.sync.idx.f32",
+                f32, [i32(-1), value, lane, i32(31)]
+            )
+        raise TypeError("Expected value type f32 or i32, got", value.type)

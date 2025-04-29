@@ -21,6 +21,9 @@ class PlatformIRBuilder(ir.IRBuilder):
     def printf(self, fmt: str, *args: tuple[ir.Value, ...]) -> ir.Value:
         raise NotImplementedError
     
+    def warp_broadcast_lane(self, value: ir.Value, lane: ir.Value) -> ir.Value:
+        raise NotImplementedError
+    
     def arg(self, idx: int) -> ir.Value:
         fn: ir.Function = self.function
         return fn.args[idx]
@@ -59,10 +62,27 @@ class PlatformIRBuilder(ir.IRBuilder):
         global_var.initializer = ir.Constant(string_type, bytearray(string_bytes))
         global_var.unnamed_addr = True
 
-        string_pointer = global_var.gep([i32(0), i32(0)])
+        string_pointer = global_var.gep([i32(0), i32(0)], inbounds=True)
 
         return string_pointer
 
     def emit(self):
         assert self.module is not None, "module is None. please point to a block before calling emit."
         return str(self.module).encode()
+
+    def warp_broadcast_lane_b64_as_2xi32(self, value: ir.NamedValue, lane: ir.Value) -> ir.Value:
+        ptr_ty = None
+        if value.type.is_pointer:
+            ptr_ty = value.type
+            value = self.ptrtoint(value, i64)
+        i32x2 = self.bitcast(value, ir.VectorType(i32, 2))
+        e0 = self.extract_element(i32x2, i32(0))
+        e1 = self.extract_element(i32x2, i32(1))
+        be0 = self.warp_broadcast_lane(e0, lane)
+        be1 = self.warp_broadcast_lane(e1, lane)
+        bi32x2 = self.insert_element(i32x2, be0, i32(0))
+        bi32x2 = self.insert_element(bi32x2, be1, i32(1))
+        ret = self.bitcast(bi32x2, value.type)
+        if ptr_ty is not None:
+            ret = self.inttoptr(ret, ptr_ty)
+        return ret
