@@ -46,7 +46,7 @@ def main():
     args = argp.parse_args()
     
     mod = build_interpreter_main_nvptx()
-    ir = str(mod).encode()
+    ir = mod.emit()
     if args.check_only:
         ir = invoke_opt_shim(ir)
     elif args.target != 'llir':

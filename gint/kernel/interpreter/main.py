@@ -86,7 +86,7 @@ GEvalFType = ir.FunctionType(void, [
 ])
 
 
-def build_interpreter_main_nvptx() -> ir.Module:
+def build_interpreter_main_nvptx() -> PlatformIRBuilder:
     LL = NVPTXIRBuilder.create_kernel_module(GEvalFType, "geval")
     build_main_loop(LL)
-    return LL.module
+    return LL
