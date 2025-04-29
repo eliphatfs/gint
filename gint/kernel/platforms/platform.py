@@ -62,7 +62,7 @@ class PlatformIRBuilder(ir.IRBuilder):
         global_var.initializer = ir.Constant(string_type, bytearray(string_bytes))
         global_var.unnamed_addr = True
 
-        string_pointer = global_var.gep([i32(0), i32(0)], inbounds=True)
+        string_pointer = global_var.gep([i32(0), i32(0)])
 
         return string_pointer
 
