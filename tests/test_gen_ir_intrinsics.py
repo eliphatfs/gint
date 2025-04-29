@@ -11,6 +11,16 @@ from gint.scripts.driver import DriverContext, ptx_link, launch_kernel, check_cu
 
 class TestGenIRIntrinsicsNVPTX(unittest.TestCase):
     
+    def test_trivial(self):
+        LL = NVPTXIRBuilder.create_kernel_module(ir.FunctionType(void, []), "trivial")
+        LL.ret_void()
+        
+        ptx = invoke_clang_shim(LL.emit())
+        
+        with DriverContext(0) as dctx:
+            kernel = ptx_link(dctx, ptx, b"trivial")
+            launch_kernel(kernel, grid_dim=1, block_dim=1, sync=True)
+    
     def test_printf(self):
         LL = NVPTXIRBuilder.create_kernel_module(ir.FunctionType(void, [i32]), "test_printf")
         LL.printf("Hello World %d, ", LL.arg(0))
