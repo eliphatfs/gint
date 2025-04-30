@@ -20,7 +20,7 @@ class TestInterpretTrivial(unittest.TestCase):
             cuda.cuMemcpyHtoD(dptr, code, 8)
             launch_kernel(
                 func,
-                dptr, ctypes.c_void_p(0), 0,
+                dptr, ctypes.c_void_p(0), ctypes.c_void_p(0), 0,
                 grid_dim=1, block_dim=32, sync=True
             )
             cuda.cuMemFree(dptr)

@@ -142,12 +142,14 @@ class CTypesWrapper:
         return ctypes.addressof(self.c)
 
 
-def prepare_arg(arg: Union[int, float, ctypes._SimpleCData, cuda.CUdeviceptr]):
+def prepare_arg(arg: Union[int, float, ctypes._SimpleCData, ctypes.Structure, cuda.CUdeviceptr]):
     if isinstance(arg, int):
         return CTypesWrapper(ctypes.c_int(arg))
     if isinstance(arg, float):
         return CTypesWrapper(ctypes.c_float(arg))
     if isinstance(arg, ctypes._SimpleCData):
+        return CTypesWrapper(arg)
+    if isinstance(arg, ctypes.Structure):
         return CTypesWrapper(arg)
     if isinstance(arg, cuda.CUdeviceptr):
         return arg
