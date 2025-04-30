@@ -4,27 +4,21 @@ from ..platforms.common import *
 
 
 TensorInfo = ir.LiteralStructType([
-    ir.VectorType(i32, 4),  # block strides, lowest dim share with ilp
-    ir.VectorType(i32, 4),  # block shapes, lowest dim div by ilp
-    i32,  # thread dim stride
-    i32,  # thread dim shape
-    i32,  # element size in bytes
-    i32,  # reserved_0
-    i32,  # reserved_1
-    i32,  # reserved_2
-    p_i8g,  # tensor base, need reinterpret cast (llir bitcast) before loading
+    ir.ArrayType(p_i8g, 8),  # tensor base, need reinterpret cast (llir bitcast) before loading
+    ir.ArrayType(ir.VectorType(i32, 4), 8),  # block strides, lowest dim share with ilp
+    ir.ArrayType(ir.VectorType(i32, 4), 8),  # block shapes, lowest dim div by ilp
+    ir.ArrayType(i32, 8),  # thread dim stride
+    ir.ArrayType(i32, 8),  # thread dim shape
+    ir.ArrayType(i32, 8),  # element size in bytes
 ])
 
 
 class HTensorInfo(ctypes.Structure):
     _fields_ = [
-        ("b_stride", ctypes.c_int32 * 4),
-        ("b_size", ctypes.c_int32 * 4),
-        ("t_stride", ctypes.c_int32),
-        ("t_size", ctypes.c_int32),
-        ("elm_size", ctypes.c_int32),
-        ("resv_0", ctypes.c_int32),
-        ("resv_1", ctypes.c_int32),
-        ("resv_2", ctypes.c_int32),
-        ("base_ptr", ctypes.c_int64),
+        ("base_ptr", ctypes.c_int64 * 8),
+        ("b_stride", (ctypes.c_int32 * 4) * 8),
+        ("b_size", (ctypes.c_int32 * 4) * 8),
+        ("t_stride", ctypes.c_int32 * 8),
+        ("t_size", ctypes.c_int32 * 8),
+        ("elm_size", ctypes.c_int32 * 8),
     ]
