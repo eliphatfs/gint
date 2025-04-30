@@ -85,4 +85,7 @@ class TestInterpretAPB(unittest.TestCase):
                     b = numpy.random.rand(s, p).astype(numpy.float32)
                     c_host = a + b
                     c_device = bap32.run(a, b)
+                    if p == 64 and s == 200000:
+                        import torch
+                        torch.tensor(a).cuda() + torch.tensor(b).cuda()
                     numpy.testing.assert_allclose(c_device, c_host)
