@@ -9,13 +9,12 @@ class LoadTensorInfos(Instruction):
     def emit(self, LL: PlatformIRBuilder, state: InterpreterState, ispec: InterpreterStateSpec):
         lane_id = LL.lane_id()
         before_block = LL.block
-        with LL.if_then(LL.icmp_signed('<', lane_id, LL.arg(3)), likely=False):
+        with LL.if_then(LL.icmp_signed('<', lane_id, LL.arg(2))):
             if_block = LL.block
-            b_strides, b_sizes, t_stride, t_size, elm_sz, resv_0 = [
+            b_strides, b_sizes, t_stride, t_size, elm_sz, resv_0, resv_1, resv_2, base_ptr = [
                 LL.load(LL.gep(LL.arg(1), [lane_id, i32(eid)], inbounds=True))
-                for eid in range(6)
+                for eid in range(9)
             ]
-            base_ptr = LL.extract_element(LL.extract_value(LL.arg(2), 0), lane_id)
             bidx = LL.block_idx_x()
             rbidx = bidx
             for i in range(4):

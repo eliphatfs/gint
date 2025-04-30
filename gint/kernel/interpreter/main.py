@@ -7,7 +7,7 @@ from .instructions.load_store import LoadTensorInfos, LoadGlobalF32, StoreGlobal
 from .instructions.control import Halt
 from .instructions.arith import FAddTo
 from .state import InterpreterState, get_spec
-from .structs import TensorInfo, TensorAddrs
+from .structs import TensorInfo
 
 
 insns = [
@@ -86,7 +86,6 @@ def build_main_loop(LL: PlatformIRBuilder):
 GEvalFType = ir.FunctionType(void, [
     i32.as_pointer(1),  # code
     TensorInfo.as_pointer(1),  # tensor info
-    TensorAddrs,  # base pointers to tensors
     i32  # num of tensors
 ])
 
