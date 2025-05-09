@@ -5,7 +5,7 @@ from cuda import cuda
 from gint.scripts.gen_llir import invoke_clang_shim
 from gint.kernel.interpreter.main import build_interpreter_main_nvptx, ILP
 from gint.kernel.interpreter.structs import HTensorInfo
-from gint.scripts.driver import DriverContext, ptx_link, launch_kernel, check_cuda_error
+from gint.host.cuda.driver import DriverContext, ptx_link, launch_kernel, check_cuda_error
 
 
 class BatchAddProgram:
@@ -85,7 +85,4 @@ class TestInterpretAPB(unittest.TestCase):
                     b = numpy.random.rand(s, p).astype(numpy.float32)
                     c_host = a + b
                     c_device = bap32.run(a, b)
-                    if p == 64 and s == 200000:
-                        import torch
-                        torch.tensor(a).cuda() + torch.tensor(b).cuda()
                     numpy.testing.assert_allclose(c_device, c_host)

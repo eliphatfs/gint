@@ -6,7 +6,7 @@ from typing import Callable
 from gint.kernel.platforms.common import *
 from gint.scripts.gen_llir import invoke_clang_shim
 from gint.kernel.platforms.nvptx import NVPTXIRBuilder
-from gint.scripts.driver import DriverContext, ptx_link, launch_kernel, check_cuda_error
+from gint.host.cuda.driver import DriverContext, ptx_link, launch_kernel, check_cuda_error
 
 
 class TestGenIRIntrinsicsNVPTX(unittest.TestCase):
