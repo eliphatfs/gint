@@ -30,13 +30,14 @@ class TensorInterface:
     shape: tuple[int, ...]
     strides: tuple[int, ...]  # in elements, not bytes
     
+    @property
     def __cuda_array_interface__(self):
         return {
             'version': 2,
             'data': (self.base_ptr, False),
             'shape': self.shape,
             'typestr': f'<{self.typechr}{self.elm_size}',
-            'strides': self.strides
+            'strides': tuple(x * self.elm_size for x in self.strides)
         }
     
     @classmethod
@@ -60,7 +61,7 @@ class TensorInterface:
         assert not ro, 'gint does not support readonly'
         strides_bytes = cai.get('strides')
         if strides_bytes:
-            strides = [x // nbytes for x in strides_bytes]
+            strides = tuple(x // nbytes for x in strides_bytes)
         else:
             # C-contiguous
             strides = []
@@ -68,7 +69,7 @@ class TensorInterface:
             for s in reversed(shape):
                 strides.append(prod)
                 prod *= s
-            strides = list(reversed(strides))
+            strides = tuple(reversed(strides))
         return TensorInterface(typechr, nbytes, ptr, shape, strides)
 
 
