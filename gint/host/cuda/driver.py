@@ -1,3 +1,4 @@
+import atexit
 import ctypes
 from cuda import cuda
 from typing import Callable, List, Tuple, Union
@@ -27,7 +28,6 @@ def check_cuda_error(maybe_err, extra_message: Union[bytes, bytearray, str] = ""
 
 class DriverContext(object):
     context: cuda.CUcontext
-    device: cuda.CUdevice
     
     def __init__(self, device_ordinal: int) -> None:
         self.context = None
@@ -37,7 +37,6 @@ class DriverContext(object):
         check_cuda_error(err)
         err, context = cuda.cuCtxCreate(0, device)
         check_cuda_error(err)
-        self.device = device
         self.context = context
     
     def deferred(self, cleanup_fn: Callable[[], None]):
@@ -56,19 +55,33 @@ class DriverContext(object):
 
 class ExistingDriverContext(DriverContext):
     
-    def __init__(self, device_ordinal: int) -> None:
+    def __init__(self) -> None:
         self.cleanup_stack: List[Callable[[], None]] = []
-        err, device = cuda.cuDeviceGet(device_ordinal)
-        check_cuda_error(err)
         err, context = cuda.cuCtxGetCurrent()
         check_cuda_error(err)
-        self.device = device
         self.context = context
     
     def __exit__(self, ty, value, tb):
         for cleanup in reversed(self.cleanup_stack):
             cleanup()
-        
+
+
+_existing_driver_ctx_cache: dict[int, ExistingDriverContext] = {}
+
+
+def current_context():
+    err, context = cuda.cuCtxGetCurrent()
+    if err == cuda.CUresult.CUDA_ERROR_NOT_INITIALIZED:
+        raise RuntimeError(
+            "CUDA is not initialized. Please initialize cuda (for example, create any torch cuda tensor) or use `with DriverContext`."
+        )
+    check_cuda_error(err)
+    ctx_id = int(context)
+    if ctx_id not in _existing_driver_ctx_cache:
+        _existing_driver_ctx_cache[ctx_id] = ExistingDriverContext()
+        atexit.register(lambda: _existing_driver_ctx_cache[ctx_id].__exit__(None, None, None))
+    return _existing_driver_ctx_cache[ctx_id]
+
 
 def read_ptx(filename):
     with open(filename, "rb") as f:
