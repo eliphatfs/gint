@@ -38,7 +38,7 @@ class CudaExecutor(BaseExecutor):
             dctx.deferred(lambda: check_cuda_error(cuda.cuMemFree(dcode)))
             dctx.deferred(lambda: check_cuda_error(cuda.cuMemFree(dinfo)))
             dctx.deferred(lambda: check_cuda_error(cuda.cuMemFreeHost(hinfo)))
-            pcu[pcp] = cacheline = dcode, dinfo, HTensorInfo.from_address(int(hinfo)), len(pd.inputs)
+            pcu[pcp] = cacheline = dcode, dinfo, HTensorInfo.from_address(int(hinfo)), len(pd.input_infos)
             ti = HTensorInfo.from_address(int(hinfo))
             
             for i, t in enumerate(pd.input_infos):

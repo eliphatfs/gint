@@ -29,6 +29,11 @@ class TensorInterface:
     base_ptr: int
     shape: tuple[int, ...]
     strides: tuple[int, ...]  # in elements, not bytes
+    assert sys.byteorder == 'little', 'gint does not support big endian yet'
+    
+    @property
+    def typestr(self):
+        return f'{self.typechr}{self.elm_size}'
     
     @property
     def __cuda_array_interface__(self):
@@ -42,12 +47,12 @@ class TensorInterface:
     
     @classmethod
     def from_cuda_array_interface(cls, cai_supported: Union[dict, Any]):
-        if hasattr(cai_supported, '__cuda_array_interface__'):
-            cai: dict = cai_supported.__cuda_array_interface__
-        elif not isinstance(cai_supported, dict):
-            raise TypeError('__cuda_array_interface__ not found for cuda array interface object.')
-        else:
-            cai: dict = cai_supported
+        cai: Optional[dict] = getattr(cai_supported, '__cuda_array_interface__', None)
+        if cai is None:
+            if isinstance(cai_supported, dict):
+                cai = cai_supported
+            else:
+                raise TypeError('__cuda_array_interface__ not found for cuda array interface object.')
         if 'typestr' not in cai:
             raise TypeError("Invalid __cuda_array_interface__: missing `typestr`")
         typestr = cai["typestr"]
@@ -57,7 +62,6 @@ class TensorInterface:
         assert cai_version >= 2, cai_version
         endian, typechr, nbytes = typestr[0], typestr[1], int(typestr[2:])
         assert endian == '<', 'gint does not support big endian yet'
-        assert sys.byteorder == 'little', 'gint does not support big endian yet'
         assert not ro, 'gint does not support readonly'
         strides_bytes = cai.get('strides')
         if strides_bytes:
@@ -73,16 +77,23 @@ class TensorInterface:
         return TensorInterface(typechr, nbytes, ptr, shape, strides)
 
 
+def _convert_arg(arg):
+    if isinstance(arg, TensorInterface):
+        return arg
+    else:
+        return TensorInterface.from_cuda_array_interface(arg)
+
+
 class BaseExecutableProgram(object):
     
     def get_program(self, *args: TensorInterface) -> ProgramData:
         raise NotImplementedError()
     
     def cache_policy(self, *args: TensorInterface) -> Hashable:
-        raise NotImplementedError
+        return tuple((x.shape, x.strides, x.typechr, x.elm_size) for x in args)
 
-    def __call__(self, *args: TensorInterface, grid_dim: int):
-        get_executor().execute(self, args, grid_dim)
+    def __call__(self, *args, grid_dim: int):
+        get_executor().execute(self, [_convert_arg(x) for x in args], grid_dim)
 
 
 class BaseExecutor(object):
