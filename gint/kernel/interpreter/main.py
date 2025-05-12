@@ -5,7 +5,7 @@ from ..platforms.nvptx import NVPTXIRBuilder
 from .instruction import EInsnAttrs
 from .instructions.load_store import LoadTensorInfos, LoadGlobalF32, StoreGlobalF32
 from .instructions.control import Halt
-from .instructions.arith import FAddTo
+from .instructions.arith import *
 from .instructions.move import *
 from .state import InterpreterState, get_spec
 from .structs import TensorInfo
@@ -16,7 +16,7 @@ insns: list[Instruction] = [
     LoadTensorInfos(),
     LoadGlobalF32(),
     StoreGlobalF32(),
-    FAddTo(),
+    FAdd(),
     MovF1F0(),
     MovF2F0(),
     MovF3F0(),
@@ -29,6 +29,13 @@ insns: list[Instruction] = [
     MovF0F3(),
     MovF1F3(),
     MovF2F3(),
+    FMul(),
+    FMA(),
+    FSub(),
+    FRSub(),
+    FDiv(),
+    FRDiv(),
+    FNeg(),
 ]
 
 ILP = 8
