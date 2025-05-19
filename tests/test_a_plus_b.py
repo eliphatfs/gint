@@ -1,7 +1,7 @@
 import numpy
 import ctypes
 import unittest
-from cuda import cuda
+import cuda.bindings.driver as cuda
 from gint.scripts.gen_llir import invoke_clang_shim
 from gint.kernel.interpreter.main import build_interpreter_main_nvptx, ILP
 from gint.kernel.interpreter.structs import HTensorInfo
@@ -54,6 +54,7 @@ class BatchAddProgram:
             for j in range(1, 4):
                 ti.b_stride[i][j] = 0
                 ti.b_size[i][j] = 1
+                ti.bt_ofs_stride[i][j] = 0
             ti.t_stride[i] = h.strides[1] // 4
             ti.t_size[i] = h.shape[1]
             ti.elm_size[i] = 4

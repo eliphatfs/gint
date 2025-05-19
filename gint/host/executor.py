@@ -14,6 +14,7 @@ class ProgramTensorInfo:
     
     block_strides: list[int]
     block_sizes: list[int]
+    block_thread_offset_strides: list[int]
 
 
 @dataclass

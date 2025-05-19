@@ -1,6 +1,6 @@
 import os
 import ctypes
-from cuda import cuda
+import cuda.bindings.driver as cuda
 from typing import Sequence
 from ...kernel.interpreter.structs import HTensorInfo
 from ..executor import BaseExecutor, BaseExecutableProgram, TensorInterface
@@ -44,13 +44,16 @@ class CudaExecutor(BaseExecutor):
             for i, t in enumerate(pd.input_infos):
                 rev_bs = t.block_strides[::-1]
                 rev_bsz = t.block_sizes[::-1]
+                rev_btofss = t.block_thread_offset_strides[::-1]
                 for j in range(4):
                     if j < len(rev_bsz):
                         ti.b_stride[i][j] = rev_bs[j]
                         ti.b_size[i][j] = rev_bsz[j]
+                        ti.bt_ofs_stride[i][j] = rev_btofss[j]
                     else:
                         ti.b_stride[i][j] = 0
                         ti.b_size[i][j] = 1
+                        ti.bt_ofs_stride[i][j] = 0
                 ti.t_stride[i] = t.thread_stride
                 ti.t_size[i] = t.thread_size
                 ti.elm_size[i] = t.elm_size

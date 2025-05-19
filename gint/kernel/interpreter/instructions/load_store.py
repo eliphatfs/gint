@@ -9,21 +9,24 @@ class LoadTensorInfos(Instruction):
     def emit(self, LL: PlatformIRBuilder, state: InterpreterState, ispec: InterpreterStateSpec):
         lane_id = LL.lane_id()
         before_block = LL.block
+        rt_ofs = i32(0)
         with LL.if_then(LL.icmp_signed('<', lane_id, LL.arg(2)), likely=False):
             if_block = LL.block
-            base_ptr, b_strides, b_sizes, t_stride, t_size, elm_sz = [
+            base_ptr, b_strides, b_sizes, b_tofs_stride, t_stride, t_size, elm_sz = [
                 LL.load(LL.gep(LL.arg(1), [i32(0), i32(eid), lane_id], inbounds=True))
-                for eid in range(6)
+                for eid in range(7)
             ]
             bidx = LL.block_idx_x()
             rbidx = bidx
             for i in range(4):
                 bs = LL.extract_element(b_strides, i32(i))
                 sz = LL.extract_element(b_sizes, i32(i))
+                btofss = LL.extract_element(b_tofs_stride, i32(i))
                 if i == 0:
                     # ilp block size
                     ilp_s = bs
                     ilp_sz = sz
+                    ilp_ofs_stride = btofss
                     sz = LL.udiv(LL.add(sz, i32(ispec.ilp - 1)), i32(ispec.ilp))  # ceil div
                 idx = LL.urem(rbidx, sz)
                 rbidx = LL.udiv(rbidx, sz)
@@ -31,6 +34,8 @@ class LoadTensorInfos(Instruction):
                     idx = LL.mul(idx, i32(ispec.ilp))
                     ilp_sz = LL.sub(ilp_sz, idx)
                 base_ptr = LL.gep(base_ptr, [LL.mul(LL.mul(LL.zext(bs, i64), LL.zext(idx, i64)), LL.zext(elm_sz, i64))], inbounds=True)
+                rt_ofs = LL.add(rt_ofs, LL.mul(idx, btofss))
+            t_size = LL.sub(t_size, rt_ofs)
         rts = LL.phi(i32)
         rts.add_incoming(t_stride, if_block)
         rts.add_incoming(i32(0), before_block)
@@ -46,8 +51,11 @@ class LoadTensorInfos(Instruction):
         ptr = LL.phi(p_i8g)
         ptr.add_incoming(base_ptr, if_block)
         ptr.add_incoming(p_i8g(None), before_block)
+        itofss = LL.phi(i32)
+        itofss.add_incoming(ilp_ofs_stride, if_block)
+        itofss.add_incoming(i32(0), before_block)
         state[ispec.rof][0] = ptr
-        state[ispec.rss] = [ilps, ilpsz, rts, rtsz]
+        state[ispec.rss] = [ilps, ilpsz, rts, rtsz, itofss]
 
 
 class _LoadStoreGlobalBase(Instruction):
@@ -86,37 +94,36 @@ class _LoadStoreGlobalBase(Instruction):
         
         t_base = LL.add(idx_t, LL.thread_idx_x())
         
-        ilps, ilpsz, rts, rtsz = state[ispec.rss]
+        ilps, ilpsz, rts, rtsz, itofss = state[ispec.rss]
         t_sz = LL.warp_broadcast_lane(rtsz, load_i)
         t_s = LL.warp_broadcast_lane(rts, load_i)
         
         ilp_s = LL.warp_broadcast_lane(ilps, load_i)
         ilp_sz = LL.warp_broadcast_lane(ilpsz, load_i)
+        i_tofs_s = LL.warp_broadcast_lane(itofss, load_i)
         
-        beforeall_block = LL.block
-        with LL.if_then(LL.icmp_unsigned('<', t_base, t_sz), likely=True):
-            base_ptr = LL.gep(base_ptr, [LL.mul(t_s, t_base)])
-            f0 = self.load_store(LL, base_ptr, state[ispec.rf0][0])
-            fs = [f0]
-            for i in range(1, ispec.ilp):
-                before_cond = LL.block
+        base_ptr = LL.gep(base_ptr, [LL.mul(t_s, t_base)])
+        fs = []
+        for i in range(0, ispec.ilp):
+            before_cond = LL.block
+            cond_b = LL.icmp_unsigned('<', t_base, t_sz)
+            if i > 0:
+                ilp_t = LL.icmp_unsigned('<', i32(i), ilp_sz)
+                cond_b = LL.and_(ilp_t, cond_b)
+            with LL.if_then(cond_b, likely=True):
+                if_block = LL.block
+                load_val = self.load_store(LL, base_ptr, state[ispec.rf0][i])
+            if self.mode == 'load':
+                # this dominates the final block
+                f = LL.phi(f32)
+                f.add_incoming(self.oob_value, before_cond)
+                f.add_incoming(load_val, if_block)
+                fs.append(f)
+            if i < ispec.ilp - 1:
+                t_base = LL.add(t_base, i_tofs_s)
                 base_ptr = LL.gep(base_ptr, [ilp_s])
-                with LL.if_then(LL.icmp_signed('<', i32(i), ilp_sz), likely=True):
-                    if_block = LL.block
-                    load_val = self.load_store(LL, base_ptr, state[ispec.rf0][i])
-                if self.mode == 'load':
-                    # this dominates the final block
-                    f = LL.phi(f32)
-                    f.add_incoming(self.oob_value, before_cond)
-                    f.add_incoming(load_val, if_block)
-                    fs.append(f)
-            t_block = LL.block
         if self.mode == 'load':
-            fs_phi = [LL.phi(f32) for _ in range(ispec.ilp)]
-            for i in range(ispec.ilp):
-                fs_phi[i].add_incoming(self.oob_value, beforeall_block)
-                fs_phi[i].add_incoming(fs[i], t_block)
-            state[ispec.rf1] = fs_phi
+            state[ispec.rf1] = fs
 
 
 class LoadGlobalF32(_LoadStoreGlobalBase):

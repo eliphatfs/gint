@@ -43,8 +43,8 @@ def get_spec(ilp: int = 4) -> InterpreterStateSpec:
         RegisterSetSpec('rf2', ilp * 2, ilp, f32, f32(0.0)),
         RegisterSetSpec('rf3', ilp * 3, ilp, f32, f32(0.0)),
         RegisterSetSpec('rb0', ilp * 4, ilp, i1, i1(False)),
-        RegisterSetSpec('rss', ilp * 5 + 0, 4, i32, i32(0)),  # ilp and warp stride and limit
-        RegisterSetSpec('rof', ilp * 5 + 4, 1, p_i8g, p_i8g(None)),  # block offset
+        RegisterSetSpec('rss', ilp * 5 + 0, 5, i32, i32(0)),  # ilp and warp stride and limit; ilp thread offset contribution stride
+        RegisterSetSpec('rof', ilp * 5 + 5, 1, p_i8g, p_i8g(None)),  # block offset
     ]
     return InterpreterStateSpec(
         ilp=ilp,
