@@ -1,6 +1,6 @@
 import numpy
 import unittest
-from cuda import cuda
+import cuda.bindings.driver as cuda
 from llvmlite import ir
 from typing import Callable
 from gint.kernel.platforms.common import *

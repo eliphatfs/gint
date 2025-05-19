@@ -1,6 +1,6 @@
 import atexit
 import ctypes
-from cuda import cuda
+import cuda.bindings.driver as cuda
 from typing import Callable, List, Tuple, Union
 
 
@@ -88,7 +88,7 @@ def read_ptx(filename):
         return f.read()
 
 
-def ptx_link(driver_ctx: DriverContext, ptx_source_bytes: bytes, fn_name: bytes, verbose: int = 0) ->cuda.CUfunction:
+def ptx_link(driver_ctx: DriverContext, ptx_source_bytes: bytes, fn_name: bytes, verbose: int = 0) -> cuda.CUfunction:
     log_size = 16384
     info_log = bytearray(log_size)
     error_log = bytearray(log_size)
@@ -107,11 +107,11 @@ def ptx_link(driver_ctx: DriverContext, ptx_source_bytes: bytes, fn_name: bytes,
 
     option_vals = [
         ctypes.addressof(walltime), # Pointer to the float
-        info_log,                  # Pass bytearray directly (check bindings doc)
-        log_size,                  # Pass size as int
-        error_log,                 # Pass bytearray directly
-        log_size,                  # Pass size as int
-        1                          # Verbose level as int
+        info_log,                   # Pass bytearray directly (check bindings doc)
+        log_size,                   # Pass size as int
+        error_log,                  # Pass bytearray directly
+        log_size,                   # Pass size as int
+        1,                          # Verbose level as int
     ]
 
     err, state = cuda.cuLinkCreate(len(options), options, option_vals)

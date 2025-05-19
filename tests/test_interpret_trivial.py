@@ -1,7 +1,7 @@
 import numpy
 import ctypes
 import unittest
-from cuda import cuda
+import cuda.bindings.driver as cuda
 from gint.scripts.gen_llir import invoke_clang_shim
 from gint.kernel.interpreter.main import build_interpreter_main_nvptx
 from gint.host.cuda.driver import DriverContext, ptx_link, launch_kernel, check_cuda_error
