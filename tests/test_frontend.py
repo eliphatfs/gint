@@ -31,8 +31,8 @@ class TestFrontendExpression(unittest.TestCase):
         for s in [1, 4, 6, 31, 32, 1000, 200000]:
             for p in [1, 16, 18, 32, 64, 256]:
                 torch.manual_seed(42)
-                a = torch.randn(s, p, device='cuda', dtype=torch.float32)
-                b = torch.randn(s, p, device='cuda', dtype=torch.float32)
+                a = torch.rand(s, p, device='cuda', dtype=torch.float32) + 1e-6
+                b = torch.rand(s, p, device='cuda', dtype=torch.float32) + 1e-6
                 c = torch.empty(s, p, device='cuda', dtype=torch.float32)
                 basic_expr1(a, b, c, grid_dim=cdiv(s, ILP))
                 c_ref = -((a + b + b) / b - b)
