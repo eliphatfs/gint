@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from collections.abc import Hashable
 from typing import Any, Union, Optional, Sequence
 
+from ..kernel.interpreter.main import ILP as _ILP
+
 
 @dataclass
 class ProgramTensorInfo:
@@ -86,6 +88,8 @@ def _convert_arg(arg):
 
 
 class BaseExecutableProgram(object):
+    
+    ILP = _ILP
     
     def get_program(self, *args: TensorInterface) -> ProgramData:
         raise NotImplementedError()
