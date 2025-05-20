@@ -7,6 +7,7 @@ from .instructions.load_store import LoadTensorInfos, LoadGlobalF32, StoreGlobal
 from .instructions.control import Halt
 from .instructions.arith import *
 from .instructions.move import *
+from .instructions.immediate import *
 from .state import InterpreterState, get_spec
 from .structs import TensorInfo
 
@@ -36,6 +37,10 @@ insns: list[Instruction] = [
     FDiv(),
     FRDiv(),
     FNeg(),
+    LoadF0Imm(),
+    LoadF1Imm(),
+    LoadF2Imm(),
+    LoadF3Imm(),
 ]
 
 ILP = 8

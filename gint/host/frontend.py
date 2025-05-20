@@ -1,3 +1,4 @@
+import numpy
 import functools
 from threading import Lock
 from typing import Optional, Sequence
@@ -107,3 +108,8 @@ def rdiv_f0_f1():
 @_bc
 def neg_f0():
     return [23, 0]
+
+
+@_bc
+def immf(dst: int, val: float):
+    return [24 + dst, numpy.float32(val).view(numpy.int32)]
