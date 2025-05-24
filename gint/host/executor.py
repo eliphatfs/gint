@@ -96,12 +96,18 @@ class BaseExecutableProgram(object):
     
     def cache_policy(self, *args: TensorInterface) -> Hashable:
         return tuple((x.shape, x.strides, x.typechr, x.elm_size) for x in args)
+    
+    def executor_warp_size(self) -> int:
+        return get_executor().warp_size()
 
     def __call__(self, *args, grid_dim: int):
         get_executor().execute(self, [_convert_arg(x) for x in args], grid_dim)
 
 
 class BaseExecutor(object):
+    
+    def warp_size(self) -> int:
+        raise NotImplementedError
     
     def execute(self, program: BaseExecutableProgram, args: Sequence[TensorInterface], grid_dim: int):
         raise NotImplementedError

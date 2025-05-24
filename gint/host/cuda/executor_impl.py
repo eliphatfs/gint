@@ -12,6 +12,9 @@ class CudaExecutor(BaseExecutor):
     def __init__(self) -> None:
         self.func_cache = {}
         self.ptx = read_ptx(os.path.join(os.path.dirname(os.path.abspath(__file__)), "gint.ptx"))
+
+    def warp_size(self) -> int:
+        return 32
     
     def geval_func_handle(self):
         dctx = current_context()

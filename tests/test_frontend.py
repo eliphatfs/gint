@@ -5,13 +5,13 @@ from gint.host.frontend import *
 
 
 @bytecode
-def basic_expr1(a: TensorInterface, b: TensorInterface, c: TensorInterface, ILP: int):
+def basic_expr1(a: TensorInterface, b: TensorInterface, c: TensorInterface, ILP: int, WARP: int):
     assert a.shape == b.shape == c.shape
     for arg in (a, b, c):
         assert arg.typestr == 'f4'
     B, C = a.shape
     ldtinfos()
-    for i in range(0, C, 32):
+    for i in range(0, C, WARP):
         ldg_f1_float(i, a)
         movf(0, 1)
         ldg_f1_float(i, b)
@@ -26,7 +26,7 @@ def basic_expr1(a: TensorInterface, b: TensorInterface, c: TensorInterface, ILP:
 
 
 @bytecode
-def vector_expr2(x: TensorInterface, y: TensorInterface, ILP: int):
+def vector_expr2(x: TensorInterface, y: TensorInterface, ILP: int, WARP: int):
     # implements cubic easing function x ** 2 * (3 - 2 * x)
     assert x.shape == y.shape
     for arg in (x, y):
@@ -34,7 +34,7 @@ def vector_expr2(x: TensorInterface, y: TensorInterface, ILP: int):
     C, = x.shape
     block = 256
     ldtinfos()
-    for i in range(0, block, 32):
+    for i in range(0, block, WARP):
         ldg_f1_float(i, x)
         immf(0, 3.0)  # 3, x, 0, 0
         immf(2, -2.0)  # 3, x, -2, 0
