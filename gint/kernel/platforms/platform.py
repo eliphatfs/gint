@@ -24,6 +24,9 @@ class PlatformIRBuilder(ir.IRBuilder):
     def warp_broadcast_lane(self, value: ir.Value, lane: ir.Value) -> ir.Value:
         raise NotImplementedError
     
+    def warp_allreduce_f32(self, value: ir.Value, op: EReducePrimitiveOp) -> ir.Value:
+        raise NotImplementedError
+    
     def arg(self, idx: int) -> ir.Value:
         fn: ir.Function = self.function
         return fn.args[idx]

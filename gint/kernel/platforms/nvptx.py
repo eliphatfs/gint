@@ -1,5 +1,6 @@
 import uuid
 from llvmlite import ir
+
 from .common import *
 from .platform import PlatformIRBuilder
 
@@ -65,3 +66,20 @@ class NVPTXIRBuilder(PlatformIRBuilder):
                 f32, [i32(-1), value, lane, i32(31)]
             )
         raise TypeError("Expected value type f32 or i32, got", value.type)
+
+    def warp_allreduce_f32(self, value: ir.Value, op: EReducePrimitiveOp) -> ir.Value:
+        red = value
+        for mask in [16, 8, 4, 2, 1]:
+            comm = self.intrinsic(
+                "llvm.nvvm.shfl.sync.bfly.f32",
+                f32, [i32(-1), red, i32(mask), i32(31)]
+            )
+            if op == EReducePrimitiveOp.Sum:
+                red = self.fadd(red, comm)
+            elif op == EReducePrimitiveOp.Max:
+                red = self.intrinsic('llvm.maximum.f32', f32, [red, comm])
+            elif op == EReducePrimitiveOp.Min:
+                red = self.intrinsic('llvm.minimum.f32', f32, [red, comm])
+            elif op == EReducePrimitiveOp.Prod:
+                red = self.fmul(red, comm)
+        return red

@@ -2,7 +2,7 @@ import numpy
 import unittest
 import cuda.bindings.driver as cuda
 from llvmlite import ir
-from typing import Callable
+from typing import Callable, Iterable
 from gint.kernel.platforms.common import *
 from gint.scripts.gen_llir import invoke_clang_shim
 from gint.kernel.platforms.nvptx import NVPTXIRBuilder
@@ -56,6 +56,27 @@ class TestGenIRIntrinsicsNVPTX(unittest.TestCase):
             expected[:, i] = i
             expected[:, i + 32] = i
         self._helper_test_sreg(expected.reshape(-1).tolist(), lambda LL: LL.lane_id())
+    
+    def test_warp_allreduce_sum(self):
+        self._helper_test_warp_allreduce(sum, EReducePrimitiveOp.Sum)
+    
+    def test_warp_allreduce_max(self):
+        self._helper_test_warp_allreduce(max, EReducePrimitiveOp.Max)
+    
+    def test_warp_allreduce_min(self):
+        self._helper_test_warp_allreduce(min, EReducePrimitiveOp.Min)
+
+    def _helper_test_warp_allreduce(self, py_red: Callable[[Iterable[int]], int], op: EReducePrimitiveOp):
+        expected = numpy.zeros([4, 64], dtype=numpy.int32)
+        for i in range(4):
+            warp1 = py_red(i + j for j in range(32))
+            warp2 = py_red(i + j for j in range(32, 64))
+            expected[i, :32] = warp1
+            expected[i, 32:] = warp2
+        self._helper_test_sreg(
+            expected.reshape(-1).tolist(),
+            lambda LL: LL.fptosi(LL.warp_allreduce_f32(LL.sitofp(LL.add(LL.block_idx_x(), LL.thread_idx_x()), f32), op), i32)
+        )
 
     def _helper_test_sreg(self, expected: list[int], get_fn: Callable[[NVPTXIRBuilder], ir.Value]):
         LL = NVPTXIRBuilder.create_kernel_module(ir.FunctionType(void, [i32.as_pointer()]), "test_sreg")

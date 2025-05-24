@@ -1,5 +1,13 @@
+import enum
 from llvmlite import ir
 from llvmlite.ir.types import _BaseFloatType
+
+
+class EReducePrimitiveOp(enum.Enum):
+    Sum = 1
+    Max = 2
+    Min = 3
+    Prod = 4
 
 
 class BFloat16Type(_BaseFloatType):
