@@ -133,3 +133,98 @@ def warp_allreduce_min_f0():
 @_bc
 def warp_allreduce_prod_f0():
     return [31, 0]
+
+
+@_bc
+def frem_f0_f1():
+    return [32, 0]
+
+
+@_bc
+def fsqrt_f0():
+    return [33, 0]
+
+
+@_bc
+def fsin_f0():
+    return [34, 0]
+
+
+@_bc
+def fcos_f0():
+    return [35, 0]
+
+
+@_bc
+def ftan_f0():
+    return [36, 0]
+
+
+@_bc
+def fasin_f0():
+    return [37, 0]
+
+
+@_bc
+def facos_f0():
+    return [38, 0]
+
+
+@_bc
+def fatan_f0():
+    return [39, 0]
+
+
+@_bc
+def fatan2_f0():
+    return [40, 0]
+
+
+@_bc
+def fpow_f0():
+    return [41, 0]
+
+
+@_bc
+def fexp_f0():
+    return [42, 0]
+
+
+@_bc
+def fexp2_f0():
+    return [43, 0]
+
+
+@_bc
+def flog_f0():
+    return [44, 0]
+
+
+@_bc
+def flog2_f0():
+    return [45, 0]
+
+
+@_bc
+def fabs_f0():
+    return [46, 0]
+
+
+@_bc
+def ffloor_f0():
+    return [47, 0]
+
+
+@_bc
+def fceil_f0():
+    return [48, 0]
+
+
+@_bc
+def ftrunc_f0():
+    return [49, 0]
+
+
+@_bc
+def fround_f0():
+    return [50, 0]

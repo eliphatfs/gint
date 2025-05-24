@@ -54,3 +54,9 @@ class FRDiv(Instruction):
     
     def emit(self, LL: PlatformIRBuilder, state: InterpreterState, ispec: InterpreterStateSpec):
         emit_set_arith(state, LL.fdiv, ispec, ispec.rf1, ispec.rf0)
+
+
+class FRem(Instruction):
+    
+    def emit(self, LL: PlatformIRBuilder, state: InterpreterState, ispec: InterpreterStateSpec):
+        emit_set_arith(state, LL.frem, ispec, ispec.rf0, ispec.rf1)

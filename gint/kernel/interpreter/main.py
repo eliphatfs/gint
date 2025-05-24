@@ -9,6 +9,7 @@ from .instructions.arith import *
 from .instructions.move import *
 from .instructions.immediate import *
 from .instructions.reduction import *
+from .instructions.special import *
 from .state import InterpreterState, get_spec
 from .structs import TensorInfo
 
@@ -46,6 +47,25 @@ insns: list[Instruction] = [
     WarpAllReduceMax(),
     WarpAllReduceMin(),
     WarpAllReduceProd(),
+    FRem(),
+    FSqrt(),
+    FSin(),
+    FCos(),
+    FTan(),
+    FArcSin(),
+    FArcCos(),
+    FArcTan(),
+    FArcTan2(),
+    FPow(),
+    FExp(),
+    FExp2(),
+    FLog(),
+    FLog2(),
+    FAbs(),
+    FFloor(),
+    FCeil(),
+    FTrunc(),
+    FRound(),
 ]
 
 ILP = 8
