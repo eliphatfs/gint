@@ -113,3 +113,23 @@ def neg_f0():
 @_bc
 def immf(dst: int, val: float):
     return [24 + dst, numpy.float32(val).view(numpy.int32)]
+
+
+@_bc
+def warp_allreduce_sum_f0():
+    return [28, 0]
+
+
+@_bc
+def warp_allreduce_max_f0():
+    return [29, 0]
+
+
+@_bc
+def warp_allreduce_min_f0():
+    return [30, 0]
+
+
+@_bc
+def warp_allreduce_prod_f0():
+    return [31, 0]

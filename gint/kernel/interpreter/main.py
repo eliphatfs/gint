@@ -3,11 +3,12 @@ from ..platforms.common import *
 from ..platforms.platform import PlatformIRBuilder
 from ..platforms.nvptx import NVPTXIRBuilder
 from .instruction import EInsnAttrs
-from .instructions.load_store import LoadTensorInfos, LoadGlobalF32, StoreGlobalF32
-from .instructions.control import Halt
+from .instructions.load_store import *
+from .instructions.control import *
 from .instructions.arith import *
 from .instructions.move import *
 from .instructions.immediate import *
+from .instructions.reduction import *
 from .state import InterpreterState, get_spec
 from .structs import TensorInfo
 
@@ -41,6 +42,10 @@ insns: list[Instruction] = [
     LoadF1Imm(),
     LoadF2Imm(),
     LoadF3Imm(),
+    WarpAllReduceSum(),
+    WarpAllReduceMax(),
+    WarpAllReduceMin(),
+    WarpAllReduceProd(),
 ]
 
 ILP = 8
