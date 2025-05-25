@@ -206,25 +206,35 @@ def flog2_f0():
 
 
 @_bc
-def fabs_f0():
+def frsqrt_f0():
     return [46, 0]
 
 
 @_bc
-def ffloor_f0():
+def ferf_f0():
     return [47, 0]
 
 
 @_bc
-def fceil_f0():
-    return [48, 0]
+def ldg_f1_half(offset, arg_i):
+    return [48, 16 * offset + arg_i]
 
 
 @_bc
-def ftrunc_f0():
-    return [49, 0]
+def stg_f0_half(offset, arg_i):
+    return [49, 16 * offset + arg_i]
 
 
 @_bc
-def fround_f0():
-    return [50, 0]
+def ldg_f1_bf16(offset, arg_i):
+    return [50, 16 * offset + arg_i]
+
+
+@_bc
+def stg_f0_bf16(offset, arg_i):
+    return [51, 16 * offset + arg_i]
+
+
+@_bc
+def ldg_f1_u8(offset, arg_i):
+    return [52, 16 * offset + arg_i]

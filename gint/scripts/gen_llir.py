@@ -1,14 +1,24 @@
+import os
 import rich
 import argparse
 import subprocess
 from typing import Literal, Optional
 from gint.kernel.interpreter.main import build_interpreter_main_nvptx
+from gint.kernel import platforms
 
 
 def invoke_clang_shim(llir: bytes, target: Literal['ptx'] = 'ptx', cc: Optional[int] = None, emit_llir: bool = False):
     targets = {'ptx': 'nvptx64-nvidia-cuda'}
     if target not in targets:
         raise ValueError("Unsupported target", target, "supported targets", targets)
+    if target == 'ptx':
+        libdevice = os.path.join(os.path.dirname(os.path.abspath(platforms.__file__)), 'nvptx.libdevice.10.bc')
+        llir = subprocess.check_output([
+            'llvm-link',
+            '--only-needed',
+            '-', libdevice,
+            '-o', '-'
+        ], input=llir)
     return subprocess.check_output([
         'clang',
         '--target=%s' % targets[target],

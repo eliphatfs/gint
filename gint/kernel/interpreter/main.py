@@ -61,11 +61,13 @@ insns: list[Instruction] = [
     FExp2(),
     FLog(),
     FLog2(),
-    FAbs(),
-    FFloor(),
-    FCeil(),
-    FTrunc(),
-    FRound(),
+    FRSqrt(),
+    FErf(),
+    LoadGlobalF16(),
+    StoreGlobalF16(),
+    LoadGlobalBF16(),
+    StoreGlobalBF16(),
+    LoadGlobalU8()
 ]
 
 ILP = 8

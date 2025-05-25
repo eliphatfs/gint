@@ -134,3 +134,28 @@ class LoadGlobalF32(_LoadStoreGlobalBase):
 class StoreGlobalF32(_LoadStoreGlobalBase):
     source_dtype = f32
     mode = 'store'
+
+
+class LoadGlobalF16(_LoadStoreGlobalBase):
+    source_dtype = f16
+    mode = 'load'
+
+
+class StoreGlobalF16(_LoadStoreGlobalBase):
+    source_dtype = f16
+    mode = 'store'
+
+
+class LoadGlobalBF16(_LoadStoreGlobalBase):
+    source_dtype = bf16
+    mode = 'load'
+
+
+class StoreGlobalBF16(_LoadStoreGlobalBase):
+    source_dtype = bf16
+    mode = 'store'
+
+
+class LoadGlobalU8(_LoadStoreGlobalBase):
+    source_dtype = i8
+    mode = 'load'

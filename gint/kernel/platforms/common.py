@@ -10,6 +10,27 @@ class EReducePrimitiveOp(enum.Enum):
     Prod = 4
 
 
+class EUnarySpecialOp(enum.Enum):
+    Sqrt = 1
+    Sin = 2
+    Cos = 3
+    Tan = 4
+    ArcSin = 5
+    ArcCos = 6
+    ArcTan = 7
+    Exp = 8
+    Exp2 = 9
+    Log = 10
+    Log2 = 11
+    RSqrt = 12
+    Erf = 13
+
+
+class EBinarySpecialOp(enum.Enum):
+    ArcTan2 = 1
+    Pow = 2
+
+
 class BFloat16Type(_BaseFloatType):
     """
     The type for single-precision floats.

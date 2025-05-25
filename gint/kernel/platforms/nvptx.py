@@ -83,3 +83,28 @@ class NVPTXIRBuilder(PlatformIRBuilder):
             elif op == EReducePrimitiveOp.Prod:
                 red = self.fmul(red, comm)
         return red
+    
+    def special_unary(self, value: ir.Value, op: EUnarySpecialOp) -> ir.Value:
+        intrinsic_map = {
+            EUnarySpecialOp.Sqrt: '__nv_sqrtf',
+            EUnarySpecialOp.Sin: '__nv_sinf',
+            EUnarySpecialOp.Cos: '__nv_cosf',
+            EUnarySpecialOp.Tan: '__nv_tanf',
+            EUnarySpecialOp.ArcSin: '__nv_asinf',
+            EUnarySpecialOp.ArcCos: '__nv_acosf',
+            EUnarySpecialOp.ArcTan: '__nv_atanf',
+            EUnarySpecialOp.Exp: '__nv_expf',
+            EUnarySpecialOp.Exp2: '__nv_exp2f',
+            EUnarySpecialOp.Log: '__nv_logf',
+            EUnarySpecialOp.Log2: '__nv_log2f',
+            EUnarySpecialOp.RSqrt: '__nv_rsqrtf',
+            EUnarySpecialOp.Erf: '__nv_erff',
+        }
+        return self.intrinsic(intrinsic_map[op], f32, [value])
+    
+    def special_binary(self, a: ir.Value, b: ir.Value, op: EBinarySpecialOp) -> ir.Value:
+        intrinsic_map = {
+            EBinarySpecialOp.ArcTan2: '__nv_atan2f',
+            EBinarySpecialOp.Pow: '__nv_powf',
+        }
+        return self.intrinsic(intrinsic_map[op], f32, [a, b])

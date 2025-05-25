@@ -6,91 +6,83 @@ from ...platforms.common import *
 # portable special functions only for now
 # do we add platform-functions like rsqrt?
 
-def emit_set_special(state: InterpreterState, LL: PlatformIRBuilder, ispec: InterpreterStateSpec, intrinsic: str, *rss: RegisterSetSpec):
-    state[ispec.rf0] = [LL.intrinsic(intrinsic, f32, list(args)) for args in zip(*[state[rs] for rs in rss])]
+def emit_set_special_unary(state: InterpreterState, LL: PlatformIRBuilder, ispec: InterpreterStateSpec, op: EUnarySpecialOp, *rss: RegisterSetSpec):
+    state[ispec.rf0] = [LL.special_unary(x, op) for x, in zip(*[state[rs] for rs in rss])]
+
+
+def emit_set_special_binary(state: InterpreterState, LL: PlatformIRBuilder, ispec: InterpreterStateSpec, op: EBinarySpecialOp, *rss: RegisterSetSpec):
+    state[ispec.rf0] = [LL.special_binary(a, b, op) for a, b in zip(*[state[rs] for rs in rss])]
 
 
 class _UnarySpecialBase(Instruction):
-    intrinsic: str
+    op: EUnarySpecialOp
     
     def emit(self, LL: PlatformIRBuilder, state: InterpreterState, ispec: InterpreterStateSpec):
-        emit_set_special(state, LL, ispec, self.intrinsic, ispec.rf0)
+        emit_set_special_unary(state, LL, ispec, self.op, ispec.rf0)
 
 
 class _BinarySpecialBase(Instruction):
-    intrinsic: str
+    op: EBinarySpecialOp
     
     def emit(self, LL: PlatformIRBuilder, state: InterpreterState, ispec: InterpreterStateSpec):
-        emit_set_special(state, LL, ispec, self.intrinsic, ispec.rf0, ispec.rf1)
+        emit_set_special_binary(state, LL, ispec, self.op, ispec.rf0, ispec.rf1)
 
 
 class FSqrt(_UnarySpecialBase):
-    intrinsic = 'llvm.sqrt.f32'
+    op = EUnarySpecialOp.Sqrt
 
 
 class FSin(_UnarySpecialBase):
-    intrinsic = 'llvm.sin.f32'
+    op = EUnarySpecialOp.Sin
 
 
 class FCos(_UnarySpecialBase):
-    intrinsic = 'llvm.cos.f32'
+    op = EUnarySpecialOp.Cos
 
 
 class FTan(_UnarySpecialBase):
-    intrinsic = 'llvm.tan.f32'
+    op = EUnarySpecialOp.Tan
 
 
 class FArcSin(_UnarySpecialBase):
-    intrinsic = 'llvm.asin.f32'
+    op = EUnarySpecialOp.ArcSin
 
 
 class FArcCos(_UnarySpecialBase):
-    intrinsic = 'llvm.acos.f32'
+    op = EUnarySpecialOp.ArcCos
 
 
 class FArcTan(_UnarySpecialBase):
-    intrinsic = 'llvm.atan.f32'
+    op = EUnarySpecialOp.ArcTan
 
 
 class FArcTan2(_BinarySpecialBase):
-    intrinsic = 'llvm.atan2.f32'
+    op = EBinarySpecialOp.ArcTan2
 
 
 class FPow(_BinarySpecialBase):
-    intrinsic = 'llvm.pow.f32'
+    op = EBinarySpecialOp.Pow
 
 
 class FExp(_UnarySpecialBase):
-    intrinsic = 'llvm.exp.f32'
+    op = EUnarySpecialOp.Exp
 
 
 class FExp2(_UnarySpecialBase):
-    intrinsic = 'llvm.exp2.f32'
+    op = EUnarySpecialOp.Exp2
 
 
 class FLog(_UnarySpecialBase):
-    intrinsic = 'llvm.log.f32'
+    op = EUnarySpecialOp.Log
 
 
 class FLog2(_UnarySpecialBase):
-    intrinsic = 'llvm.log2.f32'
+    op = EUnarySpecialOp.Log2
 
 
-class FAbs(_UnarySpecialBase):
-    intrinsic = 'llvm.fabs.f32'
+class FRSqrt(_UnarySpecialBase):
+    op = EUnarySpecialOp.RSqrt
 
 
-class FFloor(_UnarySpecialBase):
-    intrinsic = 'llvm.floor.f32'
-
-
-class FCeil(_UnarySpecialBase):
-    intrinsic = 'llvm.ceil.f32'
-
-
-class FTrunc(_UnarySpecialBase):
-    intrinsic = 'llvm.trunc.f32'
-
-
-class FRound(_UnarySpecialBase):
-    intrinsic = 'llvm.round.f32'
+class FErf(_UnarySpecialBase):
+    op = EUnarySpecialOp.Erf

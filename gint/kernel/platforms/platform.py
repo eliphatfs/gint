@@ -27,6 +27,12 @@ class PlatformIRBuilder(ir.IRBuilder):
     def warp_allreduce_f32(self, value: ir.Value, op: EReducePrimitiveOp) -> ir.Value:
         raise NotImplementedError
     
+    def special_unary(self, value: ir.Value, op: EUnarySpecialOp) -> ir.Value:
+        raise NotImplementedError
+    
+    def special_binary(self, a: ir.Value, b: ir.Value, op: EBinarySpecialOp) -> ir.Value:
+        raise NotImplementedError
+    
     def arg(self, idx: int) -> ir.Value:
         fn: ir.Function = self.function
         return fn.args[idx]
