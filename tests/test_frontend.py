@@ -26,13 +26,13 @@ def basic_expr1(a: TensorInterface, b: TensorInterface, c: TensorInterface, ILP:
 
 
 @bytecode
-def vector_expr2(x: TensorInterface, y: TensorInterface, ILP: int, WARP: int):
+def vector_expr2(x: TensorInterface, y: TensorInterface, ILP: int, WARP: int, BLOCK: int):
     # implements cubic easing function x ** 2 * (3 - 2 * x)
     assert x.shape == y.shape
     for arg in (x, y):
         assert arg.typestr == 'f4'
     C, = x.shape
-    block = 256
+    block = BLOCK
     ldtinfos()
     for i in range(0, block, WARP):
         ldg_f1_float(i, x)
@@ -68,6 +68,6 @@ class TestFrontendExpression(unittest.TestCase):
             torch.manual_seed(42)
             x = torch.rand(z, device='cuda', dtype=torch.float32)
             y = torch.empty(z, device='cuda', dtype=torch.float32)
-            vector_expr2(x, y, grid_dim=cdiv(cdiv(z, 256), ILP))
+            vector_expr2(x, y, grid_dim=cdiv(cdiv(z, 256), ILP), BLOCK=256)
             y_ref = x ** 2 * (3 - 2 * x)
             torch.testing.assert_close(y, y_ref)

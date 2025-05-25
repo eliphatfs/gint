@@ -91,17 +91,17 @@ class BaseExecutableProgram(object):
     
     ILP = _ILP
     
-    def get_program(self, *args: TensorInterface) -> ProgramData:
+    def get_program(self, *args: TensorInterface, **extra_kwargs) -> ProgramData:
         raise NotImplementedError()
     
-    def cache_policy(self, *args: TensorInterface) -> Hashable:
-        return tuple((x.shape, x.strides, x.typechr, x.elm_size) for x in args)
+    def cache_policy(self, *args: TensorInterface, **extra_kwargs) -> Hashable:
+        return tuple((x.shape, x.strides, x.typechr, x.elm_size) for x in args) + tuple(sorted(extra_kwargs.items()))
     
     def executor_warp_size(self) -> int:
         return get_executor().warp_size()
 
-    def __call__(self, *args, grid_dim: int):
-        get_executor().execute(self, [_convert_arg(x) for x in args], grid_dim)
+    def __call__(self, *args, grid_dim: int, **extra_kwargs):
+        get_executor().execute(self, [_convert_arg(x) for x in args], grid_dim, **extra_kwargs)
 
 
 class BaseExecutor(object):
@@ -109,7 +109,7 @@ class BaseExecutor(object):
     def warp_size(self) -> int:
         raise NotImplementedError
     
-    def execute(self, program: BaseExecutableProgram, args: Sequence[TensorInterface], grid_dim: int):
+    def execute(self, program: BaseExecutableProgram, args: Sequence[TensorInterface], grid_dim: int, **extra_kwargs):
         raise NotImplementedError
 
 

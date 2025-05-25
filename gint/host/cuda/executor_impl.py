@@ -22,18 +22,18 @@ class CudaExecutor(BaseExecutor):
             self.func_cache[dctx] = ptx_link(dctx, self.ptx, b'geval')
         return dctx, self.func_cache[dctx]
 
-    def execute(self, program: BaseExecutableProgram, args: Sequence[TensorInterface], grid_dim: int):
+    def execute(self, program: BaseExecutableProgram, args: Sequence[TensorInterface], grid_dim: int, **extra_kwargs):
         dctx, cufunc = self.geval_func_handle()
         
         if not hasattr(program, '_cu'):
             program._cu = {}
         
         pcu: dict = program._cu
-        pcp = program.cache_policy(*args)
+        pcp = program.cache_policy(*args, **extra_kwargs)
         cacheline = pcu.get(pcp)
         
         if cacheline is None:
-            pd = program.get_program(*args)
+            pd = program.get_program(*args, **extra_kwargs)
             _, dcode = check_cuda_error(cuda.cuMemAlloc(len(pd.program) * 4))
             check_cuda_error(cuda.cuMemcpyHtoD(dcode, pd.program, len(pd.program) * 4))
             _, hinfo = check_cuda_error(cuda.cuMemAllocHost(ctypes.sizeof(HTensorInfo)))

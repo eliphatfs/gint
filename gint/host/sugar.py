@@ -6,15 +6,15 @@ from .executor import BaseExecutableProgram, ProgramData, ProgramTensorInfo, Ten
 
 
 class CachePolicyCallable(Protocol):
-    def __call__(self, *args: TensorInterface) -> Hashable: ...
+    def __call__(self, *args: TensorInterface, **extra_kwargs) -> Hashable: ...
 
 
 class SugarCallable(Protocol):
-    def __call__(self, *args: TensorInterface, ILP: int, WARP: int) -> list[ProgramTensorInfo]: ...
+    def __call__(self, *args: TensorInterface, ILP: int, WARP: int, **extra_kwargs) -> list[ProgramTensorInfo]: ...
 
 
 class SugarDeviceCallable(Protocol):
-    def __call__(self, *args: TensorInterface, grid_dim: int) -> None: ...
+    def __call__(self, *args: TensorInterface, grid_dim: int, **extra_kwargs) -> None: ...
 
 
 class SugarProgram(BaseExecutableProgram):
@@ -24,26 +24,26 @@ class SugarProgram(BaseExecutableProgram):
         self.func = func
         self.cache_policy_fn = cache_policy_fn
     
-    def cache_policy(self, *args: TensorInterface) -> Hashable:
+    def cache_policy(self, *args: TensorInterface, **extra_kwargs) -> Hashable:
         if self.cache_policy_fn is not None:
-            return self.cache_policy_fn(*args)
+            return self.cache_policy_fn(*args, **extra_kwargs)
         else:
-            return super().cache_policy(*args)
+            return super().cache_policy(*args, **extra_kwargs)
     
-    def get_program(self, *args: TensorInterface) -> ProgramData:
-        bc, tis = self.func(*args, ILP=self.ILP, WARP=self.executor_warp_size())
+    def get_program(self, *args: TensorInterface, **extra_kwargs) -> ProgramData:
+        bc, tis = self.func(*args, ILP=self.ILP, WARP=self.executor_warp_size(), **extra_kwargs)
         return ProgramData(numpy.array(bc, dtype=numpy.int32).reshape(-1), tis)
     
 
 def _bytecode(func: SugarCallable, cache_policy: CachePolicyCallable) -> SugarDeviceCallable:
     
     @functools.wraps(func)
-    def sugar_wrapper(*args, ILP: int, WARP: int):
+    def sugar_wrapper(*args, ILP: int, WARP: int, **extra_kwargs):
         global _f
         with _flock:
             try:
                 _f[0] = FrontendState(args)
-                tis = func(*args, ILP=ILP, WARP=WARP)
+                tis = func(*args, ILP=ILP, WARP=WARP, **extra_kwargs)
                 return _f[0].bc, tis
             finally:
                 _f[0] = None
