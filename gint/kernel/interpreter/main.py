@@ -77,12 +77,12 @@ def build_main_loop(LL: PlatformIRBuilder):
     # Stages for main interpreter loop:
     # issue load next instruction from memory (but don't use) (probably in L1)
     # dispatch!
-    # come back from dispatch. phi-in local vars
+    # come back from instructions directly to dispatch. phi-in local vars
     ispec = get_spec(ILP)
     
     entry_bb = LL.block
     dispatch_bb = LL.append_basic_block("dispatch")
-    back_bb = LL.append_basic_block("back")
+    # back_bb = LL.append_basic_block("back")
     undef_bb = LL.append_basic_block("unreachable")
     
     code = LL.bitcast(LL.arg(0), ir.VectorType(i32, 2).as_pointer(1))
@@ -99,7 +99,7 @@ def build_main_loop(LL: PlatformIRBuilder):
     
     LL.branch(dispatch_bb)
     
-    LL.position_at_end(dispatch_bb)  # in: post_entry, back
+    LL.position_at_end(dispatch_bb)  # in: post_entry, insns
     regs = [LL.phi(init.type, name) for name, init in ispec.flat_reg_inits()]
     for reg, assn_reg in zip(regs, state.assn_regs):
         reg.add_incoming(assn_reg, post_entry_bb)
@@ -112,16 +112,17 @@ def build_main_loop(LL: PlatformIRBuilder):
     
     next_insn = LL.load(LL.gep(code, [next_pc], inbounds=True))
     dispatch_switch = LL.switch(opcode, undef_bb)
+    # dispatch_weights = [1]
     
-    LL.position_at_end(back_bb)  # in: insts
-    reg_bs = [LL.phi(phi.type, 'back_' + phi.name) for phi in regs]
-    for reg, reg_b in zip(regs, reg_bs):
-        reg.add_incoming(reg_b, back_bb)
+    # LL.position_at_end(back_bb)  # in: insts
+    # reg_bs = [LL.phi(phi.type, 'back_' + phi.name) for phi in regs]
+    # for reg, reg_b in zip(regs, reg_bs):
+    #     reg.add_incoming(reg_b, back_bb)
     
-    cur_insn.add_incoming(next_insn, back_bb)
-    upd_pc = LL.add(next_pc, i32(1))
-    next_pc.add_incoming(upd_pc, back_bb)
-    LL.branch(dispatch_bb)
+    # cur_insn.add_incoming(next_insn, back_bb)
+    # upd_pc = LL.add(next_pc, i32(1))
+    # next_pc.add_incoming(upd_pc, back_bb)
+    # LL.branch(dispatch_bb)
 
     LL.position_at_end(undef_bb)
     LL.unreachable()
@@ -135,10 +136,20 @@ def build_main_loop(LL: PlatformIRBuilder):
         insn.emit(LL, state, ispec)
         dispatch_switch.add_case(opid, insn_bb)
         attrs = insn.attrs()
+        # if attrs & EInsnAttrs.Unlikely:
+        #     dispatch_weights.append(1)
+        # else:
+        #     dispatch_weights.append(99)
         if not (attrs & EInsnAttrs.NoReturn):
-            LL.branch(back_bb)
-            for reg_b, assn_reg in zip(reg_bs, state.assn_regs):
-                reg_b.add_incoming(assn_reg, LL.block)  # todo: change to state variable
+            # TODO: dynamic control flow
+            upd_pc = LL.add(next_pc, i32(1))
+            LL.branch(dispatch_bb)
+            cur_insn.add_incoming(next_insn, LL.block)
+            next_pc.add_incoming(upd_pc, LL.block)
+            
+            for reg_b, assn_reg in zip(regs, state.assn_regs):
+                reg_b.add_incoming(assn_reg, LL.block)
+    # dispatch_switch.set_weights(dispatch_weights)
 
 
 GEvalFType = ir.FunctionType(void, [
