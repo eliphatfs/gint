@@ -39,12 +39,12 @@ class InterpreterStateSpec:
 def get_spec(ilp: int = 4) -> InterpreterStateSpec:
     flat_rspec = [
         RegisterSetSpec('rf0', ilp * 0, ilp, f32, f32(0.0)),
-        RegisterSetSpec('rf1', ilp * 1, ilp, f32, f32(0.0)),
-        RegisterSetSpec('rf2', ilp * 2, ilp, f32, f32(0.0)),
-        RegisterSetSpec('rf3', ilp * 3, ilp, f32, f32(0.0)),
-        RegisterSetSpec('rb0', ilp * 4, ilp, i1, i1(False)),
-        RegisterSetSpec('rss', ilp * 5 + 0, 5, i32, i32(0)),  # ilp and warp stride and limit; ilp thread offset contribution stride
-        RegisterSetSpec('rof', ilp * 5 + 5, 1, p_i8g, p_i8g(None)),  # block offset
+        RegisterSetSpec('rf1', ilp * 1, ilp, f32, f32(ir.Undefined)),
+        RegisterSetSpec('rf2', ilp * 2, ilp, f32, f32(ir.Undefined)),
+        RegisterSetSpec('rf3', ilp * 3, ilp, f32, f32(ir.Undefined)),
+        RegisterSetSpec('rb0', ilp * 4, ilp, i1, i1(ir.Undefined)),
+        RegisterSetSpec('rss', ilp * 5 + 0, 5, i32, i32(ir.Undefined)),  # ilp and warp stride and limit; ilp thread offset contribution stride
+        RegisterSetSpec('rof', ilp * 5 + 5, 1, p_i8g, p_i8g(ir.Undefined)),  # block offset
     ]
     return InterpreterStateSpec(
         ilp=ilp,
