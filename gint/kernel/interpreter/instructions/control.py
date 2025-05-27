@@ -10,3 +10,9 @@ class Halt(Instruction):
     
     def attrs(self):
         return EInsnAttrs.NoReturn
+
+
+class Nop(Instruction):
+    
+    def emit(self, LL: PlatformIRBuilder, state: InterpreterState, ispec: InterpreterStateSpec):
+        pass

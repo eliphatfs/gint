@@ -115,7 +115,6 @@ def rmsnorm(x: TensorInterface, y: TensorInterface, w: TensorInterface, ILP: int
     B, NH, T, H = x.shape
     assert (H,) == tuple(w.shape)
     
-    ldtinfos()
     # compute sum of head
     for c in range(0, H, WARP):
         ldg_f1_bf16(c, x)  # r, x[c:c+32], 0, 0

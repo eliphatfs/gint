@@ -14,7 +14,7 @@ class BatchAddProgram(BaseExecutableProgram):
             assert arg.typestr == 'f4'
         B, C = a.shape
         
-        bc = [1, 0]  # load tensor infos
+        bc = []
         for i in range(0, C, 32):
             bc.extend([
                 2, 16 * i,  # ldg f1 a[i: i + 32]
@@ -38,7 +38,7 @@ class VectorAddProgram(BaseExecutableProgram):
             assert arg.typestr == 'f4'
         C, = a.shape
         
-        bc = [1, 0]  # load tensor infos
+        bc = []
         block = 256
         for i in range(0, block, 32):
             bc.extend([

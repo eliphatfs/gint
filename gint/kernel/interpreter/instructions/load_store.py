@@ -102,7 +102,7 @@ class _LoadStoreGlobalBase(Instruction):
         ilp_sz = LL.warp_broadcast_lane(ilpsz, load_i)
         i_tofs_s = LL.warp_broadcast_lane(itofss, load_i)
         
-        base_ptr = LL.gep(base_ptr, [LL.mul(t_s, t_base)])
+        base_ptr = LL.gep(base_ptr, [LL.mul(t_s, t_base)], inbounds=True)
         fs = []
         for i in range(0, ispec.ilp):
             before_cond = LL.block
@@ -121,7 +121,7 @@ class _LoadStoreGlobalBase(Instruction):
                 fs.append(f)
             if i < ispec.ilp - 1:
                 t_base = LL.add(t_base, i_tofs_s)
-                base_ptr = LL.gep(base_ptr, [ilp_s])
+                base_ptr = LL.gep(base_ptr, [ilp_s], inbounds=True)
         if self.mode == 'load':
             state[ispec.rf1] = fs
 

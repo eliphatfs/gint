@@ -1,6 +1,6 @@
 from ..state import InterpreterState, InterpreterStateSpec, RegisterSetSpec
 from ...platforms.platform import PlatformIRBuilder
-from ..instruction import Instruction
+from ..instruction import Instruction, EInsnAttrs
 from ...platforms.common import *
 
 # portable special functions only for now
@@ -19,6 +19,9 @@ class _UnarySpecialBase(Instruction):
     
     def emit(self, LL: PlatformIRBuilder, state: InterpreterState, ispec: InterpreterStateSpec):
         emit_set_special_unary(state, LL, ispec, self.op, ispec.rf0)
+    
+    def attrs(self):
+        return EInsnAttrs.Unlikely
 
 
 class _BinarySpecialBase(Instruction):
@@ -26,6 +29,9 @@ class _BinarySpecialBase(Instruction):
     
     def emit(self, LL: PlatformIRBuilder, state: InterpreterState, ispec: InterpreterStateSpec):
         emit_set_special_binary(state, LL, ispec, self.op, ispec.rf0, ispec.rf1)
+    
+    def attrs(self):
+        return EInsnAttrs.Unlikely
 
 
 class FSqrt(_UnarySpecialBase):

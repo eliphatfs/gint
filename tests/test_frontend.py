@@ -10,7 +10,6 @@ def basic_expr1(a: TensorInterface, b: TensorInterface, c: TensorInterface, ILP:
     for arg in (a, b, c):
         assert arg.typestr == 'f4'
     B, C = a.shape
-    ldtinfos()
     for i in range(0, C, WARP):
         ldg_f1_float(i, a)
         movf(0, 1)
@@ -33,7 +32,6 @@ def vector_expr2(x: TensorInterface, y: TensorInterface, ILP: int, WARP: int, BL
         assert arg.typestr == 'f4'
     C, = x.shape
     block = BLOCK
-    ldtinfos()
     for i in range(0, block, WARP):
         ldg_f1_float(i, x)
         immf(0, 3.0)  # 3, x, 0, 0

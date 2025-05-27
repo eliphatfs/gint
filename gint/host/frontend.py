@@ -41,7 +41,7 @@ def halt():
 
 
 @_bc
-def ldtinfos():
+def nop():
     return [1, 0]
 
 

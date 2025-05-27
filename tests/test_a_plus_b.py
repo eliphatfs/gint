@@ -13,7 +13,6 @@ class BatchAddProgram:
     def __init__(self, intp: cuda.CUfunction, last_dim: int):
         self.last_dim = last_dim
         self.program = numpy.array([
-            1, 0,  # load tensor infos
             2, 0,  # load global idx 0 tensor 0
             8, 0,  # mov f0 f1
             2, 1,  # load global idx 0 tensor 1

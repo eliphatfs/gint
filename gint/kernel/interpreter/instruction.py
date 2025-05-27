@@ -6,6 +6,7 @@ from ..platforms.platform import PlatformIRBuilder
 class EInsnAttrs(Flag):
     Nothing = 0
     NoReturn = 1
+    Unlikely = 2
 
 
 class Instruction:

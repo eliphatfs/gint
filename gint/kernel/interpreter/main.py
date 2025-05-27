@@ -16,7 +16,7 @@ from .structs import TensorInfo
 
 insns: list[Instruction] = [
     Halt(),
-    LoadTensorInfos(),
+    Nop(),  # LoadTensorInfos(),
     LoadGlobalF32(),
     StoreGlobalF32(),
     FAdd(),
@@ -85,16 +85,15 @@ def build_main_loop(LL: PlatformIRBuilder):
     # back_bb = LL.append_basic_block("back")
     undef_bb = LL.append_basic_block("unreachable")
     
-    code = LL.bitcast(LL.arg(0), ir.VectorType(i32, 2).as_pointer(1))
-    
     LL.position_at_end(entry_bb)
-    entry_insn = LL.load(code)
-    entry_next_pc = i32(1)
+    entry_pc = LL.bitcast(LL.arg(0), i32.as_pointer(1))
+    # entry_insn = LL.load(code)
+    # entry_next_pc = i32(0)
 
     state = InterpreterState([init for name, init in ispec.flat_reg_inits()], i32(0), ispec)
     # issue LoadTensorInfos() once?
     # not yet because we don't see improvements in runtime, while reg wasted
-    # LoadTensorInfos().emit(LL, state, ispec)
+    LoadTensorInfos().emit(LL, state, ispec)
     post_entry_bb = LL.block
     
     LL.branch(dispatch_bb)
@@ -104,25 +103,15 @@ def build_main_loop(LL: PlatformIRBuilder):
     for reg, assn_reg in zip(regs, state.assn_regs):
         reg.add_incoming(assn_reg, post_entry_bb)
     
-    cur_insn = LL.phi(ir.VectorType(i32, 2))
-    next_pc = LL.phi(i32)
-    cur_insn.add_incoming(entry_insn, post_entry_bb)
-    next_pc.add_incoming(entry_next_pc, post_entry_bb)
-    opcode = LL.extract_element(cur_insn, i32(0))
+    # cur_insn = LL.phi(ir.VectorType(i32, 2))
+    pc = LL.phi(i32.as_pointer(1))
+    # cur_insn.add_incoming(entry_insn, post_entry_bb)
+    pc.add_incoming(entry_pc, post_entry_bb)
+    opcode = LL.load(pc)
     
-    next_insn = LL.load(LL.gep(code, [next_pc], inbounds=True))
+    # next_insn = LL.load(LL.gep(code, [next_pc], inbounds=True))
     dispatch_switch = LL.switch(opcode, undef_bb)
-    # dispatch_weights = [1]
-    
-    # LL.position_at_end(back_bb)  # in: insts
-    # reg_bs = [LL.phi(phi.type, 'back_' + phi.name) for phi in regs]
-    # for reg, reg_b in zip(regs, reg_bs):
-    #     reg.add_incoming(reg_b, back_bb)
-    
-    # cur_insn.add_incoming(next_insn, back_bb)
-    # upd_pc = LL.add(next_pc, i32(1))
-    # next_pc.add_incoming(upd_pc, back_bb)
-    # LL.branch(dispatch_bb)
+    dispatch_weights = [1]
 
     LL.position_at_end(undef_bb)
     LL.unreachable()
@@ -131,25 +120,24 @@ def build_main_loop(LL: PlatformIRBuilder):
     for opid, insn in enumerate(insns):
         insn_bb = LL.append_basic_block(insn.__class__.__name__)
         LL.position_at_end(insn_bb)
-        cur_operand = LL.extract_element(cur_insn, i32(1))
+        cur_operand = LL.load(LL.gep(pc, [i32(1)], inbounds=True))
         state = InterpreterState(regs, cur_operand, ispec)
         insn.emit(LL, state, ispec)
         dispatch_switch.add_case(opid, insn_bb)
         attrs = insn.attrs()
-        # if attrs & EInsnAttrs.Unlikely:
-        #     dispatch_weights.append(1)
-        # else:
-        #     dispatch_weights.append(99)
+        if attrs & EInsnAttrs.Unlikely:
+            dispatch_weights.append(1)
+        else:
+            dispatch_weights.append(10)
         if not (attrs & EInsnAttrs.NoReturn):
             # TODO: dynamic control flow
-            upd_pc = LL.add(next_pc, i32(1))
+            upd_pc = LL.gep(pc, [i32(2)], inbounds=True)
             LL.branch(dispatch_bb)
-            cur_insn.add_incoming(next_insn, LL.block)
-            next_pc.add_incoming(upd_pc, LL.block)
+            pc.add_incoming(upd_pc, LL.block)
             
             for reg_b, assn_reg in zip(regs, state.assn_regs):
                 reg_b.add_incoming(assn_reg, LL.block)
-    # dispatch_switch.set_weights(dispatch_weights)
+    dispatch_switch.set_weights(dispatch_weights)
 
 
 GEvalFType = ir.FunctionType(void, [

@@ -28,7 +28,6 @@ class MinimalBinaryArithProgram(BaseExecutableProgram):
         B, C = a.shape
         
         bc = [
-            1, 0,  # load tensor infos
             2, 0,  # ldg f1 a
             8, 0,  # mov f0 f1
             2, 1,  # ldg f1 b
@@ -51,7 +50,6 @@ class MinimalFMAProgram(BaseExecutableProgram):
         B, C = a.shape
         
         bc = [
-            1, 0,  # load tensor infos
             2, 0,  # ldg f1 a
             8, 0,  # mov f0 f1
             2, 2,  # ldg f1 c
@@ -74,7 +72,6 @@ class MinimalInplaceNegProgram(BaseExecutableProgram):
         B, C = arg.shape
         
         bc = [
-            1, 0,  # load tensor infos
             2, 0,  # ldg f1 a
             8, 0,  # mov f0 f1
             23, 0,  # neg f0
