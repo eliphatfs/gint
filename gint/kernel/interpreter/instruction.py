@@ -7,7 +7,6 @@ class EInsnAttrs(Flag):
     Nothing = 0
     NoReturn = 1
     Unlikely = 2
-    Operand = 4
 
 
 class Instruction:

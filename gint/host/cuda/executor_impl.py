@@ -36,7 +36,7 @@ class CudaExecutor(BaseExecutor):
         
         if cacheline is None:
             pd = program.get_program(*args, **extra_kwargs)
-            _, dcode = check_cuda_error(cuda.cuMemAlloc((len(pd.program) + 32) * 4))
+            _, dcode = check_cuda_error(cuda.cuMemAlloc(len(pd.program) * 4))
             check_cuda_error(cuda.cuMemcpyHtoD(dcode, pd.program, len(pd.program) * 4))
             _, hinfo = check_cuda_error(cuda.cuMemAllocHost(ctypes.sizeof(HTensorInfo)))
             _, dinfo = check_cuda_error(cuda.cuMemAlloc(ctypes.sizeof(HTensorInfo)))

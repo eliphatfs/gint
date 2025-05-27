@@ -91,16 +91,17 @@ def build_main_loop(LL: PlatformIRBuilder):
     
     entry_bb = LL.block
     dispatch_bb = LL.append_basic_block("dispatch")
+    # back_bb = LL.append_basic_block("back")
     undef_bb = LL.append_basic_block("unreachable")
     
     LL.position_at_end(entry_bb)
-    
-    pc_block_store = LL.alloca(i32.as_pointer(1))
     entry_pc = LL.bitcast(LL.arg(0), i32.as_pointer(1))
-    LL.store(entry_pc, pc_block_store)
-    entry_icache = LL.load(LL.gep(entry_pc, [LL.lane_id()], inbounds=True))
+    # entry_insn = LL.load(code)
+    # entry_next_pc = i32(0)
 
     state = InterpreterState([init for name, init in ispec.flat_reg_inits()], i32(0), ispec)
+    # issue LoadTensorInfos() once?
+    # not yet because we don't see improvements in runtime, while reg wasted
     LoadTensorInfos().emit(LL, state, ispec)
     post_entry_bb = LL.block
     
@@ -111,27 +112,13 @@ def build_main_loop(LL: PlatformIRBuilder):
     for reg, assn_reg in zip(regs, state.assn_regs):
         reg.add_incoming(assn_reg, post_entry_bb)
     
-    pc_in_pre = LL.phi(i32)
-    pc_in_pre.add_incoming(i32(0), post_entry_bb)
-    icache_pre = LL.phi(i32)
-    icache_pre.add_incoming(entry_icache, post_entry_bb)
+    # cur_insn = LL.phi(ir.VectorType(i32, 2))
+    pc = LL.phi(i32.as_pointer(1))
+    # cur_insn.add_incoming(entry_insn, post_entry_bb)
+    pc.add_incoming(entry_pc, post_entry_bb)
+    opcode = LL.load(pc)
     
-    icache_pre_block = LL.block
-    with LL.if_then(LL.icmp_unsigned('>=', pc_in_pre, LL.warp_size()), likely=False):
-        pc_block = LL.load(pc_block_store)
-        pc_block = LL.gep(pc_block, [LL.and_(pc_in_pre, LL.xor(LL.sub(LL.warp_size(), i32(1)), i32(-1)))], inbounds=True)
-        icache_upd = LL.load(LL.gep(pc_block, [LL.lane_id()], inbounds=True))
-        pc_in_upd = LL.and_(pc_in_pre, LL.sub(LL.warp_size(), i32(1)))
-        icache_upd_block = LL.block
-        LL.store(pc_block, pc_block_store)
-    pc_in = LL.phi(i32)
-    pc_in.add_incoming(pc_in_upd, icache_upd_block)
-    pc_in.add_incoming(pc_in_pre, icache_pre_block)
-    icache = LL.phi(i32)
-    icache.add_incoming(icache_upd, icache_upd_block)
-    icache.add_incoming(icache_pre, icache_pre_block)
-    opcode = LL.warp_broadcast_lane(icache, pc_in)
-    
+    # next_insn = LL.load(LL.gep(code, [next_pc], inbounds=True))
     dispatch_switch = LL.switch(opcode, undef_bb)
     dispatch_weights = [1]
 
@@ -140,26 +127,22 @@ def build_main_loop(LL: PlatformIRBuilder):
     
     # all insts below. in: dispatch, dom: dispatch, entry
     for opid, insn in enumerate(insns):
-        attrs = insn.attrs()
         insn_bb = LL.append_basic_block(insn.__class__.__name__)
         LL.position_at_end(insn_bb)
-        if attrs & EInsnAttrs.Operand:
-            cur_operand = LL.warp_broadcast_lane(icache, LL.add(pc_in, i32(1)))  # must be in icache
-        else:
-            cur_operand = None
-        upd_pc = LL.add(pc_in, i32(2))
+        cur_operand = LL.load(LL.gep(pc, [i32(1)], inbounds=True))
         state = InterpreterState(regs, cur_operand, ispec)
         insn.emit(LL, state, ispec)
         dispatch_switch.add_case(opid, insn_bb)
+        attrs = insn.attrs()
         if attrs & EInsnAttrs.Unlikely:
             dispatch_weights.append(1)
         else:
             dispatch_weights.append(10)
         if not (attrs & EInsnAttrs.NoReturn):
             # TODO: dynamic control flow
+            upd_pc = LL.gep(pc, [i32(2)], inbounds=True)
             LL.branch(dispatch_bb)
-            pc_in_pre.add_incoming(upd_pc, LL.block)
-            icache_pre.add_incoming(icache, LL.block)
+            pc.add_incoming(upd_pc, LL.block)
             
             for reg_b, assn_reg in zip(regs, state.assn_regs):
                 reg_b.add_incoming(assn_reg, LL.block)
