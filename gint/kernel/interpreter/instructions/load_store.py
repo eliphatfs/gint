@@ -1,6 +1,6 @@
 from ..state import InterpreterState, InterpreterStateSpec
 from ...platforms.platform import PlatformIRBuilder
-from ..instruction import Instruction
+from ..instruction import Instruction, EInsnAttrs
 from ...platforms.common import *
 
 
@@ -124,6 +124,9 @@ class _LoadStoreGlobalBase(Instruction):
                 base_ptr = LL.gep(base_ptr, [ilp_s], inbounds=True)
         if self.mode == 'load':
             state[ispec.rf1] = fs
+
+    def attrs(self):
+        return EInsnAttrs.Operand
 
 
 class LoadGlobalF32(_LoadStoreGlobalBase):

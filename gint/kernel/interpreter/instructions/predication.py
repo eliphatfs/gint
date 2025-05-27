@@ -1,7 +1,7 @@
 from functools import partial
 from ..state import InterpreterState, InterpreterStateSpec, RegisterSetSpec
 from ...platforms.platform import PlatformIRBuilder
-from ..instruction import Instruction
+from ..instruction import Instruction, EInsnAttrs
 from ...platforms.common import *
 
 
@@ -53,6 +53,9 @@ class FApprox(Instruction):
             LL.uitofp(LL.fcmp_ordered('<', LL.intrinsic('llvm.fabs.f32', f32, [LL.fsub(f0, f1)]), eps), f32)
             for f0, f1 in zip(state[ispec.rf1], state[ispec.rf2])
         ]
+
+    def attrs(self):
+        return EInsnAttrs.Operand
 
 
 class Select(Instruction):
