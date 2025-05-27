@@ -19,7 +19,6 @@ class InterpreterStateSpec:
     rf1: RegisterSetSpec
     rf2: RegisterSetSpec
     rf3: RegisterSetSpec
-    rb0: RegisterSetSpec
     rss: RegisterSetSpec
     rof: RegisterSetSpec
     
@@ -27,7 +26,7 @@ class InterpreterStateSpec:
         self.flat_reg_inits()  # check bases are right
     
     def flat_reg_inits(self) -> list[tuple[str, ir.Constant]]:
-        sets = [self.rf0, self.rf1, self.rf2, self.rf3, self.rb0, self.rss, self.rof]
+        sets = [self.rf0, self.rf1, self.rf2, self.rf3, self.rss, self.rof]
         flat = []
         for s in sets:
             assert s.base == len(flat), s.name
@@ -42,9 +41,8 @@ def get_spec(ilp: int = 4) -> InterpreterStateSpec:
         RegisterSetSpec('rf1', ilp * 1, ilp, f32, f32(ir.Undefined)),
         RegisterSetSpec('rf2', ilp * 2, ilp, f32, f32(ir.Undefined)),
         RegisterSetSpec('rf3', ilp * 3, ilp, f32, f32(ir.Undefined)),
-        RegisterSetSpec('rb0', ilp * 4, ilp, i1, i1(ir.Undefined)),
-        RegisterSetSpec('rss', ilp * 5 + 0, 5, i32, i32(ir.Undefined)),  # ilp and warp stride and limit; ilp thread offset contribution stride
-        RegisterSetSpec('rof', ilp * 5 + 5, 1, p_i8g, p_i8g(ir.Undefined)),  # block offset
+        RegisterSetSpec('rss', ilp * 4 + 0, 5, i32, i32(ir.Undefined)),  # ilp and warp stride and limit; ilp thread offset contribution stride
+        RegisterSetSpec('rof', ilp * 4 + 5, 1, p_i8g, p_i8g(ir.Undefined)),  # block offset
     ]
     return InterpreterStateSpec(
         ilp=ilp,

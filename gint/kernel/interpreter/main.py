@@ -10,6 +10,7 @@ from .instructions.move import *
 from .instructions.immediate import *
 from .instructions.reduction import *
 from .instructions.special import *
+from .instructions.predication import *
 from .state import InterpreterState, get_spec
 from .structs import TensorInfo
 
@@ -67,7 +68,15 @@ insns: list[Instruction] = [
     StoreGlobalF16(),
     LoadGlobalBF16(),
     StoreGlobalBF16(),
-    LoadGlobalU8()
+    LoadGlobalU8(),
+    FGe(),
+    FGt(),
+    FLe(),
+    FLt(),
+    FEq(),
+    FNe(),
+    FApprox(),
+    Select(),
 ]
 
 ILP = 8

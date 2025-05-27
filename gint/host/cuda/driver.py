@@ -1,7 +1,7 @@
 import atexit
 import ctypes
 import cuda.bindings.driver as cuda
-from typing import Callable, List, Tuple, Union
+from typing import Callable, List, Tuple, Union, Optional
 
 
 class CudaDriverError(RuntimeError):
@@ -139,6 +139,16 @@ def ptx_link(driver_ctx: DriverContext, ptx_source_bytes: bytes, fn_name: bytes,
             print(f"Linker Info Log:\n{info_log_str}")
 
     err, module = cuda.cuModuleLoadData(cubin_out) # Pass the cubin handle directly
+    check_cuda_error(err)
+    driver_ctx.deferred(lambda: check_cuda_error(cuda.cuModuleUnload(module)))
+
+    err, func = cuda.cuModuleGetFunction(module, fn_name)
+    check_cuda_error(err)
+    return func
+
+
+def fatbin_load(driver_ctx: DriverContext, fatbin: bytes, fn_name: bytes) -> cuda.CUfunction:
+    err, module = cuda.cuModuleLoadData(fatbin) # Pass the cubin handle directly
     check_cuda_error(err)
     driver_ctx.deferred(lambda: check_cuda_error(cuda.cuModuleUnload(module)))
 

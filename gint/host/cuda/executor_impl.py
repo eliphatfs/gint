@@ -1,17 +1,19 @@
 import os
+import lzma
 import ctypes
 import cuda.bindings.driver as cuda
 from typing import Sequence
 from ...kernel.interpreter.structs import HTensorInfo
 from ..executor import BaseExecutor, BaseExecutableProgram, TensorInterface
-from .driver import read_ptx, current_context, ptx_link, launch_kernel, check_cuda_error
+from .driver import current_context, fatbin_load, launch_kernel, check_cuda_error
 
 
 class CudaExecutor(BaseExecutor):
     
     def __init__(self) -> None:
         self.func_cache = {}
-        self.ptx = read_ptx(os.path.join(os.path.dirname(os.path.abspath(__file__)), "gint.ptx"))
+        with lzma.open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "gint.fatbin.xz")) as fi:
+            self.fatbin = fi.read()
 
     def warp_size(self) -> int:
         return 32
@@ -19,7 +21,7 @@ class CudaExecutor(BaseExecutor):
     def geval_func_handle(self):
         dctx = current_context()
         if dctx not in self.func_cache:
-            self.func_cache[dctx] = ptx_link(dctx, self.ptx, b'geval')
+            self.func_cache[dctx] = fatbin_load(dctx, self.fatbin, b'geval')
         return dctx, self.func_cache[dctx]
 
     def execute(self, program: BaseExecutableProgram, args: Sequence[TensorInterface], grid_dim: int, **extra_kwargs):

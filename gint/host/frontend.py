@@ -238,3 +238,43 @@ def stg_f0_bf16(offset, arg_i):
 @_bc
 def ldg_f1_u8(offset, arg_i):
     return [52, 16 * offset + arg_i]
+
+
+@_bc
+def fge_f0_f1_f2():
+    return [53, 0]
+
+
+@_bc
+def fgt_f0_f1_f2():
+    return [54, 0]
+
+
+@_bc
+def fle_f0_f1_f2():
+    return [55, 0]
+
+
+@_bc
+def flt_f0_f1_f2():
+    return [56, 0]
+
+
+@_bc
+def feq_f0_f1_f2():
+    return [57, 0]
+
+
+@_bc
+def fne_f0_f1_f2():
+    return [58, 0]
+
+
+@_bc
+def fapprox_f0_f1_f2(eps: float):
+    return [59, numpy.float32(eps).view(numpy.int32)]
+
+
+@_bc
+def select_f0_f0_f1_f2():
+    return [60, 0]
