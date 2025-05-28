@@ -96,9 +96,9 @@ class NVPTXIRBuilder(PlatformIRBuilder):
     def special_unary(self, value: ir.Value, op: EUnarySpecialOp) -> ir.Value:
         intrinsic_map = {
             EUnarySpecialOp.Sqrt: '__nv_sqrtf',
-            EUnarySpecialOp.Sin: '__nv_sinf',
-            EUnarySpecialOp.Cos: '__nv_cosf',
-            EUnarySpecialOp.Tan: '__nv_tanf',
+            EUnarySpecialOp.Sin: '__nv_fast_sinf',
+            EUnarySpecialOp.Cos: '__nv_fast_cosf',
+            EUnarySpecialOp.Tan: '__nv_fast_tanf',
             EUnarySpecialOp.ArcSin: '__nv_asinf',
             EUnarySpecialOp.ArcCos: '__nv_acosf',
             EUnarySpecialOp.ArcTan: '__nv_atanf',
