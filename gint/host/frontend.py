@@ -176,12 +176,12 @@ def fatan_f0():
 
 
 @_bc
-def fatan2_f0():
+def fatan2_f0_f1():
     return [40, 0]
 
 
 @_bc
-def fpow_f0():
+def fpow_f0_f1():
     return [41, 0]
 
 
