@@ -33,6 +33,9 @@ class PlatformIRBuilder(ir.IRBuilder):
     def warp_allreduce_f32(self, value: ir.Value, op: EReducePrimitiveOp) -> ir.Value:
         raise NotImplementedError
     
+    def warp_sync(self) -> None:
+        raise NotImplementedError
+    
     def special_unary(self, value: ir.Value, op: EUnarySpecialOp) -> ir.Value:
         raise NotImplementedError
     

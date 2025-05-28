@@ -19,6 +19,9 @@ class NVPTXIRBuilder(PlatformIRBuilder):
     
     def smem_addrspace(self) -> int:
         return 3
+
+    def warp_sync(self) -> None:
+        self.intrinsic('llvm.nvvm.bar.warp.sync', void, [i32(-1)])
     
     def read_sreg(self, name: str) -> ir.Value:
         return self.intrinsic(f'llvm.nvvm.read.ptx.sreg.{name}', i32, [])

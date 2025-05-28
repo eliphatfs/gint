@@ -18,10 +18,8 @@ class LoadTensorInfos(Instruction):
     
     def emit(self, LL: PlatformIRBuilder, state: InterpreterState, ispec: InterpreterStateSpec):
         lane_id = LL.lane_id()
-        before_block = LL.block
         rt_ofs = i32(0)
         with LL.if_then(LL.icmp_signed('<', lane_id, LL.arg(2))):
-            if_block = LL.block
             base_ptr, b_strides, b_sizes, b_tofs_stride, t_stride, t_size, elm_sz = [
                 LL.load(LL.gep(LL.arg(1), [i32(0), i32(eid), lane_id], inbounds=True))
                 for eid in range(7)
@@ -46,30 +44,11 @@ class LoadTensorInfos(Instruction):
                 base_ptr = LL.gep(base_ptr, [LL.mul(LL.mul(LL.zext(bs, i64), LL.zext(idx, i64)), LL.zext(elm_sz, i64))], inbounds=True)
                 rt_ofs = LL.add(rt_ofs, LL.mul(idx, btofss))
             t_size = LL.sub(t_size, rt_ofs)
-        rts = LL.phi(i32)
-        rts.add_incoming(t_stride, if_block)
-        rts.add_incoming(i32(0), before_block)
-        rtsz = LL.phi(i32)
-        rtsz.add_incoming(t_size, if_block)
-        rtsz.add_incoming(i32(0), before_block)
-        ilps = LL.phi(i32)
-        ilps.add_incoming(ilp_s, if_block)
-        ilps.add_incoming(i32(0), before_block)
-        ilpsz = LL.phi(i32)
-        ilpsz.add_incoming(ilp_sz, if_block)
-        ilpsz.add_incoming(i32(0), before_block)
-        ptr = LL.phi(p_i8)
-        ptr.add_incoming(base_ptr, if_block)
-        ptr.add_incoming(p_i8(None), before_block)
-        itofss = LL.phi(i32)
-        itofss.add_incoming(ilp_ofs_stride, if_block)
-        itofss.add_incoming(i32(0), before_block)
-        
-        with LL.if_then(LL.icmp_signed('<', lane_id, i32(8))):
             smem_base = state.smem_base
             smem_base = LL.bitcast(smem_base, BlockTensorInfo.as_pointer(LL.smem_addrspace()))
-            for eid, val in enumerate([ptr, ilps, ilpsz, rts, rtsz, itofss]):
+            for eid, val in enumerate([base_ptr, ilp_s, ilp_sz, t_stride, t_size, ilp_ofs_stride]):
                 LL.store(val, LL.gep(smem_base, [i32(0), i32(eid), lane_id], inbounds=True))
+        LL.warp_sync()
 
 
 class _LoadStoreGlobalBase(Instruction):
