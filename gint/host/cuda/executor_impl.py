@@ -45,7 +45,7 @@ class CudaExecutor(BaseExecutor):
                 best_time = this_time
         return best_warps
 
-    def execute(self, program: BaseExecutableProgram, args: Sequence[TensorInterface], grid_dim: int, **extra_kwargs):
+    def execute(self, program: BaseExecutableProgram, args: Sequence[TensorInterface], grid_dim: int, cuda_stream: int = 0, **extra_kwargs):
         dctx, cufunc, concurrencies, num_sm = self.geval_func_handle()
         
         if not hasattr(program, '_cu'):
@@ -90,6 +90,10 @@ class CudaExecutor(BaseExecutor):
         
         for i, t in enumerate(args):
             ti.base_ptr[i] = t.base_ptr
-        check_cuda_error(cuda.cuMemcpyHtoDAsync(dinfo, ctypes.addressof(ti), ctypes.sizeof(ti), 0))
+        custream = cuda.CUstream(cuda_stream)
+        if check_cuda_error(cuda.cuStreamIsCapturing(custream))[1] == cuda.CUstreamCaptureStatus.CU_STREAM_CAPTURE_STATUS_ACTIVE:
+            check_cuda_error(cuda.cuMemcpyHtoD(dinfo, ctypes.addressof(ti), ctypes.sizeof(ti)))
+        else:
+            check_cuda_error(cuda.cuMemcpyHtoDAsync(dinfo, ctypes.addressof(ti), ctypes.sizeof(ti), custream))
         best_warps = self.heuristic_best_warps(grid_dim, concurrencies, num_sm)
-        launch_kernel(cufunc, dcode, dinfo, nargs, grid_dim, grid_dim=cdiv(grid_dim, best_warps), block_dim=(32, best_warps, 1), smem_bytes=SMEM_PER_WARP * best_warps)
+        launch_kernel(cufunc, dcode, dinfo, nargs, grid_dim, grid_dim=cdiv(grid_dim, best_warps), block_dim=(32, best_warps, 1), smem_bytes=SMEM_PER_WARP * best_warps, stream=custream)
