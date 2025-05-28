@@ -24,7 +24,7 @@ class NVPTXIRBuilder(PlatformIRBuilder):
         return self.read_sreg("tid.x")
     
     def block_idx_x(self) -> ir.Value:
-        return self.read_sreg("ctaid.x")
+        return self.add(self.mul(self.read_sreg("ctaid.x"), self.read_sreg('ntid.y')), self.read_sreg('tid.y'))
 
     def warp_size(self) -> ir.Value:
         return i32(32)

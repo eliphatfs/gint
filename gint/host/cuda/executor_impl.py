@@ -6,6 +6,7 @@ from typing import Sequence
 from ...kernel.interpreter.structs import HTensorInfo
 from ..executor import BaseExecutor, BaseExecutableProgram, TensorInterface
 from .driver import current_context, fatbin_load, launch_kernel, check_cuda_error
+from ..utils import cdiv
 
 
 class CudaExecutor(BaseExecutor):
@@ -21,11 +22,32 @@ class CudaExecutor(BaseExecutor):
     def geval_func_handle(self):
         dctx = current_context()
         if dctx not in self.func_cache:
-            self.func_cache[dctx] = fatbin_load(dctx, self.fatbin, b'geval')
-        return dctx, self.func_cache[dctx]
+            cufunc = fatbin_load(dctx, self.fatbin, b'geval')
+            concurrencies = []
+            for num_warps in [1, 2, 4]:
+                _, blocks = check_cuda_error(cuda.cuOccupancyMaxActiveBlocksPerMultiprocessor(cufunc, num_warps * 32, 0))
+                concurrency = blocks * num_warps
+                concurrencies.append((num_warps, concurrency))
+            _, device = check_cuda_error(cuda.cuCtxGetDevice())
+            _, num_sm = check_cuda_error(cuda.cuDeviceGetAttribute(cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device))
+            self.func_cache[dctx] = dctx, cufunc, concurrencies, num_sm
+        return self.func_cache[dctx]
+    
+    def heuristic_best_warps(self, num_blocks, concurrencies, num_sm):
+        best_warps = 1
+        best_time = 1e30
+        for num_warps, concurrency in concurrencies:
+            if num_blocks % num_warps == 0:
+                launched_blocks = num_blocks // num_warps
+                waves = cdiv(launched_blocks, concurrency * num_sm)
+                this_time = waves * num_warps / (concurrency ** 0.5)
+                if this_time < best_time:
+                    best_warps = num_warps
+                    best_time = this_time
+        return best_warps
 
     def execute(self, program: BaseExecutableProgram, args: Sequence[TensorInterface], grid_dim: int, **extra_kwargs):
-        dctx, cufunc = self.geval_func_handle()
+        dctx, cufunc, concurrencies, num_sm = self.geval_func_handle()
         
         if not hasattr(program, '_cu'):
             program._cu = {}
@@ -70,4 +92,5 @@ class CudaExecutor(BaseExecutor):
         for i, t in enumerate(args):
             ti.base_ptr[i] = t.base_ptr
         check_cuda_error(cuda.cuMemcpyHtoDAsync(dinfo, ctypes.addressof(ti), ctypes.sizeof(ti), 0))
-        launch_kernel(cufunc, dcode, dinfo, nargs, grid_dim=grid_dim, block_dim=32)
+        best_warps = self.heuristic_best_warps(grid_dim, concurrencies, num_sm)
+        launch_kernel(cufunc, dcode, dinfo, nargs, grid_dim=(grid_dim // best_warps, 1, 1), block_dim=(32, best_warps, 1))
