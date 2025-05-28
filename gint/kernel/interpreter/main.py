@@ -96,12 +96,9 @@ def build_main_loop(LL: PlatformIRBuilder):
     
     LL.position_at_end(entry_bb)
     entry_pc = LL.bitcast(LL.arg(0), i32.as_pointer(1))
-    # entry_insn = LL.load(code)
-    # entry_next_pc = i32(0)
+    entry_opcode = LL.load(entry_pc)
 
     state = InterpreterState([init for name, init in ispec.flat_reg_inits()], i32(0), ispec)
-    # issue LoadTensorInfos() once?
-    # not yet because we don't see improvements in runtime, while reg wasted
     LoadTensorInfos().emit(LL, state, ispec)
     post_entry_bb = LL.block
     
@@ -112,13 +109,11 @@ def build_main_loop(LL: PlatformIRBuilder):
     for reg, assn_reg in zip(regs, state.assn_regs):
         reg.add_incoming(assn_reg, post_entry_bb)
     
-    # cur_insn = LL.phi(ir.VectorType(i32, 2))
     pc = LL.phi(i32.as_pointer(1))
-    # cur_insn.add_incoming(entry_insn, post_entry_bb)
     pc.add_incoming(entry_pc, post_entry_bb)
-    opcode = LL.load(pc)
+    opcode = LL.phi(i32)
+    opcode.add_incoming(entry_opcode, post_entry_bb)
     
-    # next_insn = LL.load(LL.gep(code, [next_pc], inbounds=True))
     dispatch_switch = LL.switch(opcode, undef_bb)
     dispatch_weights = [1]
 
@@ -129,7 +124,11 @@ def build_main_loop(LL: PlatformIRBuilder):
     for opid, insn in enumerate(insns):
         insn_bb = LL.append_basic_block(insn.__class__.__name__)
         LL.position_at_end(insn_bb)
+        
         cur_operand = LL.load(LL.gep(pc, [i32(1)], inbounds=True))
+        upd_pc = LL.gep(pc, [i32(2)], inbounds=True)
+        upd_opcode = LL.load(upd_pc)
+        
         state = InterpreterState(regs, cur_operand, ispec)
         insn.emit(LL, state, ispec)
         dispatch_switch.add_case(opid, insn_bb)
@@ -140,8 +139,8 @@ def build_main_loop(LL: PlatformIRBuilder):
             dispatch_weights.append(10)
         if not (attrs & EInsnAttrs.NoReturn):
             # TODO: dynamic control flow
-            upd_pc = LL.gep(pc, [i32(2)], inbounds=True)
             LL.branch(dispatch_bb)
+            opcode.add_incoming(upd_opcode, LL.block)
             pc.add_incoming(upd_pc, LL.block)
             
             for reg_b, assn_reg in zip(regs, state.assn_regs):
