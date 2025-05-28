@@ -40,3 +40,12 @@ class FMulImm(Instruction):
     def emit(self, LL: PlatformIRBuilder, state: InterpreterState, ispec: InterpreterStateSpec):
         operand = LL.bitcast(state.operand, f32)
         state[ispec.rf0] = [LL.fmul(x, operand) for x in state[ispec.rf0]]
+
+
+class FMAImm(Instruction):
+    
+    def emit(self, LL: PlatformIRBuilder, state: InterpreterState, ispec: InterpreterStateSpec):
+        operand = LL.bitcast(state.operand, ir.VectorType(f16, 2))
+        mul = LL.fpext(LL.extract_element(operand, i32(0)), f32)
+        add = LL.fpext(LL.extract_element(operand, i32(1)), f32)
+        state[ispec.rf0] = [LL.fma(x, mul, add) for x in state[ispec.rf0]]

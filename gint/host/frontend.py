@@ -288,3 +288,11 @@ def add_f0_imm(val: float):
 @_bc
 def mul_f0_imm(val: float):
     return [62, numpy.float32(val).view(numpy.int32)]
+
+
+@_bc
+def fma_f0_imm(mul: float, add: float):
+    """
+    note: the immediate values have only half precision
+    """
+    return [63, numpy.array([mul, add], dtype=numpy.float16).view(numpy.int32).item()]

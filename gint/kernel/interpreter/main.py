@@ -79,6 +79,7 @@ insns: list[Instruction] = [
     Select(),
     FAddImm(),
     FMulImm(),
+    FMAImm(),
 ]
 
 ILP = 8
