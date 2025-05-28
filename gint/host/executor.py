@@ -64,7 +64,8 @@ class TensorInterface:
         ptr, ro = cai['data']
         assert cai_version >= 2, cai_version
         endian, typechr, nbytes = typestr[0], typestr[1], int(typestr[2:])
-        assert endian == '<', 'gint does not support big endian yet'
+        assert endian in '<|', 'gint does not support big endian yet'
+        # < little, | irrelevant
         assert not ro, 'gint does not support readonly'
         strides_bytes = cai.get('strides')
         if strides_bytes:
