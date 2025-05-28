@@ -47,6 +47,68 @@ def vector_expr2(x: TensorInterface, y: TensorInterface, ILP: int, WARP: int, BL
     return [ProgramTensorInfo(4, arg.strides[0], C, [arg.strides[0] * block], [cdiv(C, block)], [block]) for arg in (x, y)]
 
 
+@bytecode
+def meaningless_execute_everything(x: TensorInterface, x_f16: TensorInterface, x_bf16: TensorInterface, x_u8: TensorInterface, ILP: int, WARP: int):
+    nop()
+    ldg_f1_float(0, x)
+    stg_f0_float(0, x)
+    add_f0_f1()
+    for i in range(4):
+        for j in range(4):
+            if i != j:
+                movf(i, j)
+    mul_f0_f1()
+    fma_f0_f1_f2()
+    sub_f0_f1()
+    rsub_f0_f1()
+    div_f0_f1()
+    rdiv_f0_f1()
+    neg_f0()
+    for i in range(4):
+        immf(i, 1.0)
+    warp_allreduce_sum_f0()
+    warp_allreduce_max_f0()
+    warp_allreduce_min_f0()
+    warp_allreduce_prod_f0()
+    frem_f0_f1()
+    fsqrt_f0()
+    fsin_f0()
+    fcos_f0()
+    ftan_f0()
+    fasin_f0()
+    facos_f0()
+    fatan_f0()
+    fatan2_f0_f1()
+    fpow_f0_f1()
+    fexp_f0()
+    fexp2_f0()
+    flog_f0()
+    flog2_f0()
+    frsqrt_f0()
+    ferf_f0()
+    ldg_f1_half(0, x_f16)
+    stg_f0_half(0, x_f16)
+    ldg_f1_bf16(0, x_bf16)
+    stg_f0_bf16(0, x_bf16)
+    ldg_f1_u8(0, x_u8)
+    fge_f0_f1_f2()
+    fgt_f0_f1_f2()
+    fle_f0_f1_f2()
+    flt_f0_f1_f2()
+    feq_f0_f1_f2()
+    fne_f0_f1_f2()
+    fapprox_f0_f1_f2(0.01)
+    select_f0_f0_f1_f2()
+    add_f0_imm(1.0)
+    mul_f0_imm(1.0)
+    return [
+        ProgramTensorInfo(4, x.strides[0], 32, [x.strides[0]], [0], [1]),
+        ProgramTensorInfo(2, x_f16.strides[0], 32, [x_f16.strides[0]], [0], [1]),
+        ProgramTensorInfo(2, x_bf16.strides[0], 32, [x_bf16.strides[0]], [0], [1]),
+        ProgramTensorInfo(1, x_u8.strides[0], 32, [x_u8.strides[0]], [0], [1]),
+    ]
+
+
 class TestFrontendExpression(unittest.TestCase):
     
     def test_expr_1(self):
@@ -69,3 +131,11 @@ class TestFrontendExpression(unittest.TestCase):
             vector_expr2(x, y, grid_dim=cdiv(cdiv(z, 256), ILP), BLOCK=256)
             y_ref = x ** 2 * (3 - 2 * x)
             torch.testing.assert_close(y, y_ref)
+
+    def test_meaningless_everything(self):
+        torch.manual_seed(42)
+        x = torch.rand(32, device='cuda', dtype=torch.float32)
+        x_f16 = torch.rand(32, device='cuda', dtype=torch.float16)
+        x_bf16 = torch.rand(32, device='cuda', dtype=torch.bfloat16)
+        x_u8 = (torch.rand(32, device='cuda', dtype=torch.bfloat16) * 255).byte()
+        meaningless_execute_everything(x, x_f16, x_bf16, x_u8, grid_dim=1)
