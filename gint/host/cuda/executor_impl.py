@@ -27,8 +27,7 @@ class CudaExecutor(BaseExecutor):
             concurrencies = []
             for num_warps in [1, 2, 4]:
                 _, blocks = check_cuda_error(cuda.cuOccupancyMaxActiveBlocksPerMultiprocessor(cufunc, num_warps * 32, SMEM_PER_WARP * num_warps))
-                concurrency = blocks * num_warps
-                concurrencies.append((num_warps, concurrency))
+                concurrencies.append((num_warps, blocks))
             _, device = check_cuda_error(cuda.cuCtxGetDevice())
             _, num_sm = check_cuda_error(cuda.cuDeviceGetAttribute(cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device))
             self.func_cache[dctx] = dctx, cufunc, concurrencies, num_sm
@@ -40,7 +39,7 @@ class CudaExecutor(BaseExecutor):
         for num_warps, concurrency in concurrencies:
             launched_blocks = cdiv(num_blocks, num_warps)
             waves = cdiv(launched_blocks, concurrency * num_sm)
-            this_time = waves * num_warps / (concurrency ** 0.5)
+            this_time = waves * (concurrency * num_warps) ** 0.5
             if this_time < best_time:
                 best_warps = num_warps
                 best_time = this_time
