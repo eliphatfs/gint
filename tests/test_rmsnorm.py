@@ -121,14 +121,13 @@ def rmsnorm(x: TensorInterface, y: TensorInterface, w: TensorInterface, ILP: int
         movf(2, 1)  # r, x[c:c+32], x[c:c+32], 0
         fma_f0_f1_f2()
     warp_allreduce_sum_f0()
-    immf(1, 1 / H)
-    mul_f0_f1()
+    mul_f0_imm(1 / H)
     frsqrt_f0()
-    immf(1, 1e-5)
-    add_f0_f1()
+    add_f0_imm(1e-5)
     movf(3, 0)
     for c in range(0, H, WARP):
-        movf(0, 3)  # rstd, x[c: c+32], 0, rstd
+        if c > 0:
+            movf(0, 3)  # rstd, x[c: c+32], 0, rstd
         ldg_f1_bf16(c, x)  # rstd, x[c:c+32], 0, rstd
         mul_f0_f1()
         ldg_f1_bf16(c, w)  # r * x, w, 0, rstd

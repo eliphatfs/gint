@@ -278,3 +278,13 @@ def fapprox_f0_f1_f2(eps: float):
 @_bc
 def select_f0_f0_f1_f2():
     return [60, 0]
+
+
+@_bc
+def add_f0_imm(val: float):
+    return [61, numpy.float32(val).view(numpy.int32)]
+
+
+@_bc
+def mul_f0_imm(val: float):
+    return [62, numpy.float32(val).view(numpy.int32)]

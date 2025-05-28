@@ -26,3 +26,17 @@ class LoadF3Imm(Instruction):
     
     def emit(self, LL: PlatformIRBuilder, state: InterpreterState, ispec: InterpreterStateSpec):
         state[ispec.rf3] = [LL.bitcast(state.operand, f32)] * ispec.ilp
+
+
+class FAddImm(Instruction):
+    
+    def emit(self, LL: PlatformIRBuilder, state: InterpreterState, ispec: InterpreterStateSpec):
+        operand = LL.bitcast(state.operand, f32)
+        state[ispec.rf0] = [LL.fadd(x, operand) for x in state[ispec.rf0]]
+
+
+class FMulImm(Instruction):
+    
+    def emit(self, LL: PlatformIRBuilder, state: InterpreterState, ispec: InterpreterStateSpec):
+        operand = LL.bitcast(state.operand, f32)
+        state[ispec.rf0] = [LL.fmul(x, operand) for x in state[ispec.rf0]]

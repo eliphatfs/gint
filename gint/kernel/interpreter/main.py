@@ -77,6 +77,8 @@ insns: list[Instruction] = [
     FNe(),
     FApprox(),
     Select(),
+    FAddImm(),
+    FMulImm(),
 ]
 
 ILP = 8
