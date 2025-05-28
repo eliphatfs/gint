@@ -4,7 +4,7 @@ from ..platforms.common import *
 
 
 TensorInfo = ir.LiteralStructType([
-    ir.ArrayType(p_i8g, 8),  # tensor base, need reinterpret cast (llir bitcast) before loading
+    ir.ArrayType(p_i8, 8),  # tensor base, need reinterpret cast (llir bitcast) before loading
     ir.ArrayType(ir.VectorType(i32, 4), 8),  # block strides, lowest dim share with ilp
     ir.ArrayType(ir.VectorType(i32, 4), 8),  # block shapes, lowest dim div by ilp
     ir.ArrayType(ir.VectorType(i32, 4), 8),  # contribution strides of block to thread offset, lowest dim share with ilp

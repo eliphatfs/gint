@@ -17,13 +17,19 @@ class NVPTXIRBuilder(PlatformIRBuilder):
         entry_bb = geval.append_basic_block("entry")
         return NVPTXIRBuilder(entry_bb)
     
+    def smem_addrspace(self) -> int:
+        return 3
+    
     def read_sreg(self, name: str) -> ir.Value:
         return self.intrinsic(f'llvm.nvvm.read.ptx.sreg.{name}', i32, [])
     
     def thread_idx_x(self) -> ir.Value:
         return self.read_sreg("tid.x")
     
-    def block_idx_x(self) -> ir.Value:
+    def thread_idx_y(self) -> ir.Value:
+        return self.read_sreg("tid.y")
+    
+    def logical_program_idx(self) -> ir.Value:
         return self.add(self.mul(self.read_sreg("ctaid.x"), self.read_sreg('ntid.y')), self.read_sreg('tid.y'))
 
     def warp_size(self) -> ir.Value:

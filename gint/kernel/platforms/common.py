@@ -59,4 +59,3 @@ bf16 = BFloat16Type()
 void = ir.VoidType()
 
 p_i8 = i8.as_pointer()
-p_i8g = i8.as_pointer(1)

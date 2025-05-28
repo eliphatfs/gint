@@ -3,6 +3,7 @@ import lzma
 import ctypes
 import cuda.bindings.driver as cuda
 from typing import Sequence
+from ...kernel.interpreter.main import SMEM_PER_WARP
 from ...kernel.interpreter.structs import HTensorInfo
 from ..executor import BaseExecutor, BaseExecutableProgram, TensorInterface
 from .driver import current_context, fatbin_load, launch_kernel, check_cuda_error
@@ -25,7 +26,7 @@ class CudaExecutor(BaseExecutor):
             cufunc = fatbin_load(dctx, self.fatbin, b'geval')
             concurrencies = []
             for num_warps in [1, 2, 4]:
-                _, blocks = check_cuda_error(cuda.cuOccupancyMaxActiveBlocksPerMultiprocessor(cufunc, num_warps * 32, 0))
+                _, blocks = check_cuda_error(cuda.cuOccupancyMaxActiveBlocksPerMultiprocessor(cufunc, num_warps * 32, SMEM_PER_WARP * num_warps))
                 concurrency = blocks * num_warps
                 concurrencies.append((num_warps, concurrency))
             _, device = check_cuda_error(cuda.cuCtxGetDevice())
@@ -37,13 +38,12 @@ class CudaExecutor(BaseExecutor):
         best_warps = 1
         best_time = 1e30
         for num_warps, concurrency in concurrencies:
-            if num_blocks % num_warps == 0:
-                launched_blocks = num_blocks // num_warps
-                waves = cdiv(launched_blocks, concurrency * num_sm)
-                this_time = waves * num_warps / (concurrency ** 0.5)
-                if this_time < best_time:
-                    best_warps = num_warps
-                    best_time = this_time
+            launched_blocks = cdiv(num_blocks, num_warps)
+            waves = cdiv(launched_blocks, concurrency * num_sm)
+            this_time = waves * num_warps / (concurrency ** 0.5)
+            if this_time < best_time:
+                best_warps = num_warps
+                best_time = this_time
         return best_warps
 
     def execute(self, program: BaseExecutableProgram, args: Sequence[TensorInterface], grid_dim: int, **extra_kwargs):
@@ -93,4 +93,4 @@ class CudaExecutor(BaseExecutor):
             ti.base_ptr[i] = t.base_ptr
         check_cuda_error(cuda.cuMemcpyHtoDAsync(dinfo, ctypes.addressof(ti), ctypes.sizeof(ti), 0))
         best_warps = self.heuristic_best_warps(grid_dim, concurrencies, num_sm)
-        launch_kernel(cufunc, dcode, dinfo, nargs, grid_dim=(grid_dim // best_warps, 1, 1), block_dim=(32, best_warps, 1))
+        launch_kernel(cufunc, dcode, dinfo, nargs, grid_dim, grid_dim=cdiv(grid_dim, best_warps), block_dim=(32, best_warps, 1), smem_bytes=SMEM_PER_WARP * best_warps)

@@ -6,10 +6,16 @@ from .common import *
 
 class PlatformIRBuilder(ir.IRBuilder):
     
+    def smem_addrspace(self) -> int:
+        raise NotImplementedError
+    
     def thread_idx_x(self) -> ir.Value:
         raise NotImplementedError
     
-    def block_idx_x(self) -> ir.Value:
+    def thread_idx_y(self) -> ir.Value:
+        raise NotImplementedError
+    
+    def logical_program_idx(self) -> ir.Value:
         raise NotImplementedError
 
     def warp_size(self) -> ir.Value:

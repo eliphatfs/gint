@@ -80,6 +80,7 @@ insns: list[Instruction] = [
 ]
 
 ILP = 8
+SMEM_PER_WARP = 8 * 4 * (2 + 5)
 
 
 def build_main_loop(LL: PlatformIRBuilder):
@@ -89,16 +90,27 @@ def build_main_loop(LL: PlatformIRBuilder):
     # come back from instructions directly to dispatch. phi-in local vars
     ispec = get_spec(ILP)
     
+    # declare dynamic smem
+    smem_base = ir.GlobalVariable(LL.module, ir.ArrayType(i8, 0), name='dynamic_smem', addrspace=3)
+    smem_base.linkage = 'external'
+    smem_base.align = 16
+    
+    smem_base = LL.gep(smem_base, [i32(0), LL.mul(i32(SMEM_PER_WARP), LL.thread_idx_y())])
+    
     entry_bb = LL.block
     dispatch_bb = LL.append_basic_block("dispatch")
     # back_bb = LL.append_basic_block("back")
     undef_bb = LL.append_basic_block("unreachable")
     
     LL.position_at_end(entry_bb)
-    entry_pc = LL.bitcast(LL.arg(0), i32.as_pointer(1))
+    entry_pc = LL.bitcast(LL.arg(0), i32.as_pointer())
     entry_opcode = LL.load(entry_pc)
+    
+    # early exit warps beyond user scheduling
+    with LL.if_then(LL.icmp_unsigned('>=', LL.logical_program_idx(), LL.arg(3)), False):
+        LL.ret_void()
 
-    state = InterpreterState([init for name, init in ispec.flat_reg_inits()], i32(0), ispec)
+    state = InterpreterState([init for name, init in ispec.flat_reg_inits()], i32(0), ispec, smem_base)
     LoadTensorInfos().emit(LL, state, ispec)
     post_entry_bb = LL.block
     
@@ -109,7 +121,7 @@ def build_main_loop(LL: PlatformIRBuilder):
     for reg, assn_reg in zip(regs, state.assn_regs):
         reg.add_incoming(assn_reg, post_entry_bb)
     
-    pc = LL.phi(i32.as_pointer(1))
+    pc = LL.phi(i32.as_pointer())
     pc.add_incoming(entry_pc, post_entry_bb)
     opcode = LL.phi(i32)
     opcode.add_incoming(entry_opcode, post_entry_bb)
@@ -129,7 +141,7 @@ def build_main_loop(LL: PlatformIRBuilder):
         upd_pc = LL.gep(pc, [i32(2)], inbounds=True)
         upd_opcode = LL.load(upd_pc)
         
-        state = InterpreterState(regs, cur_operand, ispec)
+        state = InterpreterState(regs, cur_operand, ispec, smem_base)
         insn.emit(LL, state, ispec)
         dispatch_switch.add_case(opid, insn_bb)
         attrs = insn.attrs()
@@ -149,9 +161,10 @@ def build_main_loop(LL: PlatformIRBuilder):
 
 
 GEvalFType = ir.FunctionType(void, [
-    i32.as_pointer(1),  # code
-    TensorInfo.as_pointer(1),  # tensor info
-    i32  # num of tensors
+    i32.as_pointer(),  # code
+    TensorInfo.as_pointer(),  # tensor info
+    i32,  # num of tensors
+    i32,  # logical grid dim before dividing warps
 ])
 
 

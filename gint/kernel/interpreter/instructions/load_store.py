@@ -4,19 +4,29 @@ from ..instruction import Instruction
 from ...platforms.common import *
 
 
+BlockTensorInfo = ir.LiteralStructType([
+    ir.ArrayType(p_i8, 8),  # ptr with block offset
+    ir.ArrayType(i32, 8),  # ilp stride
+    ir.ArrayType(i32, 8),  # ilp size
+    ir.ArrayType(i32, 8),  # thread stride
+    ir.ArrayType(i32, 8),  # thread size
+    ir.ArrayType(i32, 8),  # ilp contribution stride to thread offset
+])
+
+
 class LoadTensorInfos(Instruction):
     
     def emit(self, LL: PlatformIRBuilder, state: InterpreterState, ispec: InterpreterStateSpec):
         lane_id = LL.lane_id()
         before_block = LL.block
         rt_ofs = i32(0)
-        with LL.if_then(LL.icmp_signed('<', lane_id, LL.arg(2)), likely=False):
+        with LL.if_then(LL.icmp_signed('<', lane_id, LL.arg(2))):
             if_block = LL.block
             base_ptr, b_strides, b_sizes, b_tofs_stride, t_stride, t_size, elm_sz = [
                 LL.load(LL.gep(LL.arg(1), [i32(0), i32(eid), lane_id], inbounds=True))
                 for eid in range(7)
             ]
-            bidx = LL.block_idx_x()
+            bidx = LL.logical_program_idx()
             rbidx = bidx
             for i in range(4):
                 bs = LL.extract_element(b_strides, i32(i))
@@ -48,14 +58,18 @@ class LoadTensorInfos(Instruction):
         ilpsz = LL.phi(i32)
         ilpsz.add_incoming(ilp_sz, if_block)
         ilpsz.add_incoming(i32(0), before_block)
-        ptr = LL.phi(p_i8g)
+        ptr = LL.phi(p_i8)
         ptr.add_incoming(base_ptr, if_block)
-        ptr.add_incoming(p_i8g(None), before_block)
+        ptr.add_incoming(p_i8(None), before_block)
         itofss = LL.phi(i32)
         itofss.add_incoming(ilp_ofs_stride, if_block)
         itofss.add_incoming(i32(0), before_block)
-        state[ispec.rof][0] = ptr
-        state[ispec.rss] = [ilps, ilpsz, rts, rtsz, itofss]
+        
+        with LL.if_then(LL.icmp_signed('<', lane_id, i32(8))):
+            smem_base = state.smem_base
+            smem_base = LL.bitcast(smem_base, BlockTensorInfo.as_pointer(LL.smem_addrspace()))
+            for eid, val in enumerate([ptr, ilps, ilpsz, rts, rtsz, itofss]):
+                LL.store(val, LL.gep(smem_base, [i32(0), i32(eid), lane_id], inbounds=True))
 
 
 class _LoadStoreGlobalBase(Instruction):
@@ -88,19 +102,15 @@ class _LoadStoreGlobalBase(Instruction):
     def emit(self, LL: PlatformIRBuilder, state: InterpreterState, ispec: InterpreterStateSpec):
         operand = state.operand
         load_i = LL.and_(operand, i32(0xf))
+        
+        smem_base = state.smem_base
+        smem_base = LL.bitcast(smem_base, BlockTensorInfo.as_pointer(LL.smem_addrspace()))
+        base_ptr = LL.load(LL.gep(smem_base, [i32(0), i32(0), load_i], inbounds=True))
+        base_ptr = LL.bitcast(base_ptr, self.source_dtype.as_pointer())
         idx_t = LL.lshr(operand, i32(4))
-        base_ptr = LL.warp_broadcast_lane_b64_as_2xi32(state[ispec.rof][0], load_i)
-        base_ptr = LL.bitcast(base_ptr, self.source_dtype.as_pointer(1))
         
+        ilp_s, ilp_sz, t_s, t_sz, i_tofs_s = [LL.load(LL.gep(smem_base, [i32(0), i32(eid), load_i], inbounds=True)) for eid in range(1, 6)]
         t_base = LL.add(idx_t, LL.thread_idx_x())
-        
-        ilps, ilpsz, rts, rtsz, itofss = state[ispec.rss]
-        t_sz = LL.warp_broadcast_lane(rtsz, load_i)
-        t_s = LL.warp_broadcast_lane(rts, load_i)
-        
-        ilp_s = LL.warp_broadcast_lane(ilps, load_i)
-        ilp_sz = LL.warp_broadcast_lane(ilpsz, load_i)
-        i_tofs_s = LL.warp_broadcast_lane(itofss, load_i)
         
         base_ptr = LL.gep(base_ptr, [LL.mul(t_s, t_base)], inbounds=True)
         fs = []

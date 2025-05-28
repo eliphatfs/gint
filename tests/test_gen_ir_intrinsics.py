@@ -37,13 +37,17 @@ class TestGenIRIntrinsicsNVPTX(unittest.TestCase):
         expected = numpy.zeros([4, 64], dtype=numpy.int32)
         for i in range(4):
             expected[i] = i
-        self._helper_test_sreg(expected.reshape(-1).tolist(), lambda LL: LL.block_idx_x())
+        self._helper_test_sreg(expected.reshape(-1).tolist(), lambda LL: LL.logical_program_idx())
 
     def test_sreg_tidx(self):
         expected = numpy.zeros([4, 64], dtype=numpy.int32)
         for i in range(64):
             expected[:, i] = i
         self._helper_test_sreg(expected.reshape(-1).tolist(), lambda LL: LL.thread_idx_x())
+
+    def test_sreg_tidy(self):
+        expected = numpy.zeros([4, 64], dtype=numpy.int32)
+        self._helper_test_sreg(expected.reshape(-1).tolist(), lambda LL: LL.thread_idx_y())
 
     def test_sreg_warpsize(self):
         expected = numpy.zeros([4, 64], dtype=numpy.int32)
@@ -75,12 +79,12 @@ class TestGenIRIntrinsicsNVPTX(unittest.TestCase):
             expected[i, 32:] = warp2
         self._helper_test_sreg(
             expected.reshape(-1).tolist(),
-            lambda LL: LL.fptosi(LL.warp_allreduce_f32(LL.sitofp(LL.add(LL.block_idx_x(), LL.thread_idx_x()), f32), op), i32)
+            lambda LL: LL.fptosi(LL.warp_allreduce_f32(LL.sitofp(LL.add(LL.logical_program_idx(), LL.thread_idx_x()), f32), op), i32)
         )
 
     def _helper_test_sreg(self, expected: list[int], get_fn: Callable[[NVPTXIRBuilder], ir.Value]):
         LL = NVPTXIRBuilder.create_kernel_module(ir.FunctionType(void, [i32.as_pointer()]), "test_sreg")
-        global_tid = LL.add(LL.mul(LL.block_idx_x(), i32(64)), LL.thread_idx_x())
+        global_tid = LL.add(LL.mul(LL.logical_program_idx(), i32(64)), LL.thread_idx_x())
         LL.store(get_fn(LL), LL.gep(LL.arg(0), [global_tid]))
         LL.ret_void()
         

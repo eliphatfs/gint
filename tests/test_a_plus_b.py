@@ -61,7 +61,7 @@ class BatchAddProgram:
         check_cuda_error(cuda.cuMemcpyHtoD(da, a, B1 * C * 4))
         check_cuda_error(cuda.cuMemcpyHtoD(db, b, B2 * C * 4))
         check_cuda_error(cuda.cuMemcpyHtoDAsync(dinfo, hinfo, ctypes.sizeof(ti), 0))
-        check_cuda_error(launch_kernel(self.intp, self.dcode, dinfo, 3, grid_dim=(h.shape[0] + ILP - 1) // ILP, block_dim=32, sync=True))
+        check_cuda_error(launch_kernel(self.intp, self.dcode, dinfo, 3, (h.shape[0] + ILP - 1) // ILP, grid_dim=(h.shape[0] + ILP - 1) // ILP, block_dim=32, sync=True))
         check_cuda_error(cuda.cuMemcpyDtoH(c, dc, B1 * C * 4))
         check_cuda_error(cuda.cuMemFree(da))
         check_cuda_error(cuda.cuMemFree(db))

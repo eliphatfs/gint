@@ -60,7 +60,7 @@ class TestInterpretAPB(unittest.TestCase):
     
     def test_batch_a_plus_b(self):
         batch_add_prog = BatchAddProgram()
-        for s in [1, 4, 6, 31, 32, 1000, 200000]:
+        for s in [1, 4, 6, 31, 32, 1000, 9999, 200000]:
             for p in [1, 16, 18, 32, 64, 256]:
                 torch.manual_seed(42)
                 a = torch.randn(s, p, device='cuda', dtype=torch.float32)
