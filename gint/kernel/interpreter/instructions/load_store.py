@@ -89,7 +89,7 @@ class _LoadStoreGlobalBase(Instruction):
         idx_t = LL.lshr(operand, i32(4))
         
         ilp_s, ilp_sz, t_s, t_sz, i_tofs_s = [LL.load(LL.gep(smem_base, [i32(0), i32(eid), load_i], inbounds=True)) for eid in range(1, 6)]
-        t_base = LL.add(idx_t, LL.thread_idx_x())
+        t_base = LL.add(idx_t, LL.lane_id())
         
         base_ptr = LL.gep(base_ptr, [LL.mul(t_s, t_base)], inbounds=True)
         fs = []
