@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from collections.abc import Hashable
 from typing import Any, Union, Optional, Sequence
 
-# from ..kernel.interpreter.main import ILP as _ILP
+from ..kernel.interpreter.main import REG_WIDTH
 
 
 @dataclass
@@ -90,7 +90,7 @@ def _convert_arg(arg):
 
 class BaseExecutableProgram(object):
     
-    # ILP = _ILP
+    REGW = REG_WIDTH
     
     def get_program(self, *args: TensorInterface, **extra_kwargs) -> ProgramData:
         raise NotImplementedError()

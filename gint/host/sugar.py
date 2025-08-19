@@ -31,19 +31,19 @@ class SugarProgram(BaseExecutableProgram):
             return super().cache_policy(*args, **extra_kwargs)
     
     def get_program(self, *args: TensorInterface, **extra_kwargs) -> ProgramData:
-        bc, tis = self.func(*args, ILP=self.ILP, WARP=self.executor_warp_size(), **extra_kwargs)
+        bc, tis = self.func(*args, REGW=self.REGW, WARP=self.executor_warp_size(), **extra_kwargs)
         return ProgramData(numpy.array(bc, dtype=numpy.int32).reshape(-1), tis)
     
 
 def _bytecode(func: SugarCallable, cache_policy: CachePolicyCallable) -> SugarDeviceCallable:
     
     @functools.wraps(func)
-    def sugar_wrapper(*args, ILP: int, WARP: int, **extra_kwargs):
+    def sugar_wrapper(*args, REGW: int, WARP: int, **extra_kwargs):
         global _f
         with _flock:
             try:
                 _f[0] = FrontendState(args)
-                tis = func(*args, ILP=ILP, WARP=WARP, **extra_kwargs)
+                tis = func(*args, REGW=REGW, WARP=WARP, **extra_kwargs)
                 return _f[0].bc, tis
             finally:
                 _f[0] = None
