@@ -12,7 +12,7 @@ class Halt(Instruction):
         return EInsnAttrs.NoReturn
 
 
-class Nop(Instruction):
+class Nop(DefaultControlInstruction):
     
     def emit(self, LL: PlatformIRBuilder, state: StackMachineState):
         pass

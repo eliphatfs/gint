@@ -7,7 +7,14 @@ from .instructions.load_tensor_infos import emit_load_tensor_infos
 from .state import StackMachineState, InvalidStateException
 from .structs import TensorInfo
 
+from .instructions.arith import *
 from .instructions.control import *
+from .instructions.immediate import *
+from .instructions.load_store import *
+from .instructions.move import *
+from .instructions.predication import *
+from .instructions.reduction import *
+from .instructions.special import *
 
 
 MAX_STACK = 8
@@ -18,6 +25,59 @@ SMEM_PER_WARP = 8 * 4 * (2 + 5)
 INSNS: dict[type[Instruction], int] = {
     Halt: 0,
     Nop: 1,
+    FAdd: 2,
+    FMul: 3,
+    FMA: 4,
+    FSub: 5,
+    FRSub: 6,
+    FNeg: 7,
+    FDiv: 8,
+    FRDiv: 9,
+    FRem: 10,
+    LoadImm: 11,
+    FAddImm: 12,
+    FMulImm: 13,
+    FMAImm: 14,
+    LoadGlobalF32: 15,
+    StoreGlobalF32: 16,
+    LoadGlobalF16: 17,
+    StoreGlobalF16: 18,
+    LoadGlobalBF16: 19,
+    StoreGlobalBF16: 20,
+    LoadGlobalU8: 21,
+    Pop: 22,
+    Pop2: 23,
+    Dup: 24,
+    DupX1: 25,
+    DupX2: 26,
+    Dup2: 27,
+    FGt: 28,
+    FLt: 29,
+    FGe: 30,
+    FLe: 31,
+    FEq: 32,
+    FNe: 33,
+    FApprox: 34,
+    Select: 35,
+    WarpAllReduceSum: 36,
+    WarpAllReduceMax: 37,
+    WarpAllReduceMin: 38,
+    WarpAllReduceProd: 39,
+    FSqrt: 40,
+    FSin: 41,
+    FCos: 42,
+    FTan: 43,
+    FArcSin: 44,
+    FArcCos: 45,
+    FArcTan: 46,
+    FArcTan2: 47,
+    FPow: 48,
+    FExp: 49,
+    FExp2: 50,
+    FLog: 51,
+    FLog2: 52,
+    FRSqrt: 53,
+    FErf: 54,
 }
 
 

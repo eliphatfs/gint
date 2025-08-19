@@ -1,94 +1,47 @@
-from ..state import InterpreterState, InterpreterStateSpec
+from ..state import StackMachineState
 from ...platforms.platform import PlatformIRBuilder
-from ..instruction import Instruction
+from ..instruction import DefaultControlInstruction
 from ...platforms.common import *
 
 
-# Mov A B: read B write A
-
-class MovF1F0(Instruction):
+class Pop(DefaultControlInstruction):
     
-    def emit(self, LL: PlatformIRBuilder, state: InterpreterState, ispec: InterpreterStateSpec):
-        state[ispec.rf1] = list(state[ispec.rf0])
+    def emit(self, LL: PlatformIRBuilder, state: StackMachineState):
+        state.pop()
 
 
-class MovF2F0(Instruction):
+class Pop2(DefaultControlInstruction):
     
-    def emit(self, LL: PlatformIRBuilder, state: InterpreterState, ispec: InterpreterStateSpec):
-        state[ispec.rf2] = list(state[ispec.rf0])
+    def emit(self, LL: PlatformIRBuilder, state: StackMachineState):
+        state.pop().pop()
 
 
-class MovF3F0(Instruction):
+class Dup(DefaultControlInstruction):
     
-    def emit(self, LL: PlatformIRBuilder, state: InterpreterState, ispec: InterpreterStateSpec):
-        state[ispec.rf3] = list(state[ispec.rf0])
+    def emit(self, LL: PlatformIRBuilder, state: StackMachineState):
+        state.push(state.peek())
 
 
-class MovF0F1(Instruction):
+class DupX1(DefaultControlInstruction):
     
-    def emit(self, LL: PlatformIRBuilder, state: InterpreterState, ispec: InterpreterStateSpec):
-        state[ispec.rf0] = list(state[ispec.rf1])
+    def emit(self, LL: PlatformIRBuilder, state: StackMachineState):
+        v1 = state.peek()
+        v2 = state.peek(1)
+        state.pop().pop().push(v1).push(v2).push(v1)
 
 
-class MovF2F1(Instruction):
+class DupX2(DefaultControlInstruction):
     
-    def emit(self, LL: PlatformIRBuilder, state: InterpreterState, ispec: InterpreterStateSpec):
-        state[ispec.rf2] = list(state[ispec.rf1])
+    def emit(self, LL: PlatformIRBuilder, state: StackMachineState):
+        v1 = state.peek()
+        v2 = state.peek(1)
+        v3 = state.peek(2)
+        state.pop().pop().pop().push(v1).push(v3).push(v2).push(v1)
 
 
-class MovF3F1(Instruction):
+class Dup2(DefaultControlInstruction):
     
-    def emit(self, LL: PlatformIRBuilder, state: InterpreterState, ispec: InterpreterStateSpec):
-        state[ispec.rf3] = list(state[ispec.rf1])
-
-
-class MovF0F2(Instruction):
-    
-    def emit(self, LL: PlatformIRBuilder, state: InterpreterState, ispec: InterpreterStateSpec):
-        state[ispec.rf0] = list(state[ispec.rf2])
-
-
-class MovF1F2(Instruction):
-    
-    def emit(self, LL: PlatformIRBuilder, state: InterpreterState, ispec: InterpreterStateSpec):
-        state[ispec.rf1] = list(state[ispec.rf2])
-
-
-class MovF3F2(Instruction):
-    
-    def emit(self, LL: PlatformIRBuilder, state: InterpreterState, ispec: InterpreterStateSpec):
-        state[ispec.rf3] = list(state[ispec.rf2])
-
-
-class MovF0F3(Instruction):
-    
-    def emit(self, LL: PlatformIRBuilder, state: InterpreterState, ispec: InterpreterStateSpec):
-        state[ispec.rf0] = list(state[ispec.rf3])
-
-
-class MovF1F3(Instruction):
-    
-    def emit(self, LL: PlatformIRBuilder, state: InterpreterState, ispec: InterpreterStateSpec):
-        state[ispec.rf1] = list(state[ispec.rf3])
-
-
-class MovF2F3(Instruction):
-    
-    def emit(self, LL: PlatformIRBuilder, state: InterpreterState, ispec: InterpreterStateSpec):
-        state[ispec.rf2] = list(state[ispec.rf3])
-
-
-all_moves = [
-    MovF1F0(),
-    MovF2F0(),
-    MovF3F0(),
-    MovF0F1(),
-    MovF2F1(),
-    MovF3F1(),
-    MovF0F2(),
-    MovF1F2(),
-    MovF3F2(),
-    MovF0F3(),
-    MovF1F3(),
-    MovF2F3(),
-]
+    def emit(self, LL: PlatformIRBuilder, state: StackMachineState):
+        v1 = state.peek()
+        v2 = state.peek(1)
+        state.push(v2).push(v1)

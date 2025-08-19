@@ -1,64 +1,73 @@
 from functools import partial
-from ..state import InterpreterState, InterpreterStateSpec, RegisterSetSpec
+from ..state import StackMachineState
 from ...platforms.platform import PlatformIRBuilder
-from ..instruction import Instruction
+from ..instruction import DefaultControlInstruction, DefaultControlOperandInstruction
 from ...platforms.common import *
 
 
-def emit_set_cmp(state: InterpreterState, LL: PlatformIRBuilder, fn, ispec: InterpreterStateSpec, *rss: RegisterSetSpec):
-    state[ispec.rf0] = [LL.uitofp(fn(*args), f32) for args in zip(*[state[rs] for rs in rss])]
+def emit_set_cmp(state: StackMachineState, LL: PlatformIRBuilder, fn, *rss: int):
+    assert set(rss) == set(range(len(rss)))
+    res = [LL.uitofp(fn(*args), f32) for args in zip(*[state.peek(rs) for rs in rss])]
+    for _ in rss:
+        state.pop()
+    state.push(res)
 
 
-class FGt(Instruction):
+class FGt(DefaultControlInstruction):
         
-    def emit(self, LL: PlatformIRBuilder, state: InterpreterState, ispec: InterpreterStateSpec):
-        emit_set_cmp(state, LL, partial(LL.fcmp_ordered, '>'), ispec, ispec.rf1, ispec.rf2)
+    def emit(self, LL: PlatformIRBuilder, state: StackMachineState):
+        emit_set_cmp(state, LL, partial(LL.fcmp_ordered, '>'), 0, 1)
 
 
-class FLt(Instruction):
+class FLt(DefaultControlInstruction):
         
-    def emit(self, LL: PlatformIRBuilder, state: InterpreterState, ispec: InterpreterStateSpec):
-        emit_set_cmp(state, LL, partial(LL.fcmp_ordered, '<'), ispec, ispec.rf1, ispec.rf2)
+    def emit(self, LL: PlatformIRBuilder, state: StackMachineState):
+        emit_set_cmp(state, LL, partial(LL.fcmp_ordered, '<'), 0, 1)
 
 
-class FGe(Instruction):
+class FGe(DefaultControlInstruction):
         
-    def emit(self, LL: PlatformIRBuilder, state: InterpreterState, ispec: InterpreterStateSpec):
-        emit_set_cmp(state, LL, partial(LL.fcmp_ordered, '>='), ispec, ispec.rf1, ispec.rf2)
+    def emit(self, LL: PlatformIRBuilder, state: StackMachineState):
+        emit_set_cmp(state, LL, partial(LL.fcmp_ordered, '>='), 0, 1)
 
 
-class FLe(Instruction):
+class FLe(DefaultControlInstruction):
         
-    def emit(self, LL: PlatformIRBuilder, state: InterpreterState, ispec: InterpreterStateSpec):
-        emit_set_cmp(state, LL, partial(LL.fcmp_ordered, '<='), ispec, ispec.rf1, ispec.rf2)
+    def emit(self, LL: PlatformIRBuilder, state: StackMachineState):
+        emit_set_cmp(state, LL, partial(LL.fcmp_ordered, '<='), 0, 1)
 
 
-class FEq(Instruction):
+class FEq(DefaultControlInstruction):
         
-    def emit(self, LL: PlatformIRBuilder, state: InterpreterState, ispec: InterpreterStateSpec):
-        emit_set_cmp(state, LL, partial(LL.fcmp_ordered, '=='), ispec, ispec.rf1, ispec.rf2)
+    def emit(self, LL: PlatformIRBuilder, state: StackMachineState):
+        emit_set_cmp(state, LL, partial(LL.fcmp_ordered, '=='), 0, 1)
 
 
-class FNe(Instruction):
+class FNe(DefaultControlInstruction):
         
-    def emit(self, LL: PlatformIRBuilder, state: InterpreterState, ispec: InterpreterStateSpec):
-        emit_set_cmp(state, LL, partial(LL.fcmp_unordered, '!='), ispec, ispec.rf1, ispec.rf2)
+    def emit(self, LL: PlatformIRBuilder, state: StackMachineState):
+        emit_set_cmp(state, LL, partial(LL.fcmp_unordered, '!='), 0, 1)
 
 
-class FApprox(Instruction):
+class FApprox(DefaultControlOperandInstruction):
     
-    def emit(self, LL: PlatformIRBuilder, state: InterpreterState, ispec: InterpreterStateSpec):
-        eps = LL.bitcast(state.operand, f32)
-        state[ispec.rf0] = [
+    def emit(self, LL: PlatformIRBuilder, state: StackMachineState):
+        eps = LL.bitcast(self.op, f32)
+        s0 = state.peek()
+        s1 = state.peek(1)
+        state.pop().pop().push([
             LL.uitofp(LL.fcmp_ordered('<', LL.intrinsic('llvm.fabs.f32', f32, [LL.fsub(f0, f1)]), eps), f32)
-            for f0, f1 in zip(state[ispec.rf1], state[ispec.rf2])
-        ]
+            for f0, f1 in zip(s0, s1)
+        ])
 
 
-class Select(Instruction):
+class Select(DefaultControlInstruction):
     
-    def emit(self, LL: PlatformIRBuilder, state: InterpreterState, ispec: InterpreterStateSpec):
-        state[ispec.rf0] = [
+    def emit(self, LL: PlatformIRBuilder, state: StackMachineState):
+        s0 = state.peek()
+        s1 = state.peek(1)
+        s2 = state.peek(2)
+        state.pop().pop().pop().push([
             LL.select(LL.fcmp_ordered('>', b0, f32(0.0)), f0, f1)
-            for b0, f0, f1 in zip(state[ispec.rf0], state[ispec.rf1], state[ispec.rf2])
-        ]
+            for b0, f0, f1 in zip(s0, s1, s2)
+        ])

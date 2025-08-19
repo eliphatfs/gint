@@ -1,34 +1,27 @@
-from ..state import InterpreterState, InterpreterStateSpec, RegisterSetSpec
+from ..state import StackMachineState
 from ...platforms.platform import PlatformIRBuilder
-from ..instruction import Instruction, EInsnAttrs
+from ..instruction import DefaultControlInstruction, EInsnAttrs
 from ...platforms.common import *
 
-# portable special functions only for now
-# do we add platform-functions like rsqrt?
 
-def emit_set_special_unary(state: InterpreterState, LL: PlatformIRBuilder, ispec: InterpreterStateSpec, op: EUnarySpecialOp, *rss: RegisterSetSpec):
-    state[ispec.rf0] = [LL.special_unary(x, op) for x, in zip(*[state[rs] for rs in rss])]
-
-
-def emit_set_special_binary(state: InterpreterState, LL: PlatformIRBuilder, ispec: InterpreterStateSpec, op: EBinarySpecialOp, *rss: RegisterSetSpec):
-    state[ispec.rf0] = [LL.special_binary(a, b, op) for a, b in zip(*[state[rs] for rs in rss])]
-
-
-class _UnarySpecialBase(Instruction):
+class _UnarySpecialBase(DefaultControlInstruction):
     op: EUnarySpecialOp
     
-    def emit(self, LL: PlatformIRBuilder, state: InterpreterState, ispec: InterpreterStateSpec):
-        emit_set_special_unary(state, LL, ispec, self.op, ispec.rf0)
+    def emit(self, LL: PlatformIRBuilder, state: StackMachineState):
+        reg = state.peek()
+        state.pop().push([LL.special_unary(x, self.op) for x in reg])
     
     def attrs(self):
         return EInsnAttrs.Unlikely
 
 
-class _BinarySpecialBase(Instruction):
+class _BinarySpecialBase(DefaultControlInstruction):
     op: EBinarySpecialOp
     
-    def emit(self, LL: PlatformIRBuilder, state: InterpreterState, ispec: InterpreterStateSpec):
-        emit_set_special_binary(state, LL, ispec, self.op, ispec.rf0, ispec.rf1)
+    def emit(self, LL: PlatformIRBuilder, state: StackMachineState):
+        r0 = state.peek()
+        r1 = state.peek(1)
+        state.pop().pop().push([LL.special_binary(a, b, self.op) for a, b in zip(r0, r1)])
     
     def attrs(self):
         return EInsnAttrs.Unlikely

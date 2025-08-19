@@ -1,16 +1,16 @@
-from ..state import InterpreterState, InterpreterStateSpec
+from ..state import StackMachineState
 from ...platforms.platform import PlatformIRBuilder
-from ..instruction import Instruction
+from ..instruction import DefaultControlInstruction
 from ...platforms.common import *
 
 
-class _WarpAllReduceBase(Instruction):
+class _WarpAllReduceBase(DefaultControlInstruction):
     op: EReducePrimitiveOp
     
-    def emit(self, LL: PlatformIRBuilder, state: InterpreterState, ispec: InterpreterStateSpec):
-        state[ispec.rf0] = list([
-            LL.warp_allreduce_f32(x, self.op)
-            for x in state[ispec.rf0]
+    def emit(self, LL: PlatformIRBuilder, state: StackMachineState):
+        reg = state.peek()
+        state.pop().push([
+            LL.warp_allreduce_f32(x, self.op) for x in reg
         ])
 
 

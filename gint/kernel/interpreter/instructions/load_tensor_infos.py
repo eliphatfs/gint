@@ -1,6 +1,5 @@
 from ..state import StackMachineState
 from ...platforms.platform import PlatformIRBuilder
-from ..instruction import Instruction
 from ...platforms.common import *
 
 
@@ -33,11 +32,11 @@ def emit_load_tensor_infos(LL: PlatformIRBuilder, state: StackMachineState):
                 ilp_s = bs
                 ilp_sz = sz
                 ilp_ofs_stride = btofss
-                sz = LL.udiv(LL.add(sz, i32(state.width - 1)), i32(state.width))  # ceil div
+                sz = LL.udiv(LL.add(sz, i32(state.reg_width - 1)), i32(state.reg_width))  # ceil div
             idx = LL.urem(rbidx, sz)
             rbidx = LL.udiv(rbidx, sz)
             if i == 0:
-                idx = LL.mul(idx, i32(state.width))
+                idx = LL.mul(idx, i32(state.reg_width))
                 ilp_sz = LL.sub(ilp_sz, idx)
             base_ptr = LL.gep(base_ptr, [LL.mul(LL.mul(LL.zext(bs, i64), LL.zext(idx, i64)), LL.zext(elm_sz, i64))], inbounds=True)
             rt_ofs = LL.add(rt_ofs, LL.mul(idx, btofss))

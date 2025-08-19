@@ -1,51 +1,36 @@
-from ..state import InterpreterState, InterpreterStateSpec
+from ..state import StackMachineState
 from ...platforms.platform import PlatformIRBuilder
-from ..instruction import Instruction
+from ..instruction import DefaultControlOperandInstruction
 from ...platforms.common import *
 
 
-class LoadF0Imm(Instruction):
+class LoadImm(DefaultControlOperandInstruction):
     
-    def emit(self, LL: PlatformIRBuilder, state: InterpreterState, ispec: InterpreterStateSpec):
-        state[ispec.rf0] = [LL.bitcast(state.operand, f32)] * ispec.ilp
+    def emit(self, LL: PlatformIRBuilder, state: StackMachineState):
+        state.push([LL.bitcast(self.op, f32)] * state.reg_width)
 
 
-class LoadF1Imm(Instruction):
+class FAddImm(DefaultControlOperandInstruction):
     
-    def emit(self, LL: PlatformIRBuilder, state: InterpreterState, ispec: InterpreterStateSpec):
-        state[ispec.rf1] = [LL.bitcast(state.operand, f32)] * ispec.ilp
+    def emit(self, LL: PlatformIRBuilder, state: StackMachineState):
+        spx = state.peek()
+        operand = LL.bitcast(self.op, f32)
+        state.pop().push([LL.fadd(x, operand) for x in spx])
 
 
-class LoadF2Imm(Instruction):
+class FMulImm(DefaultControlOperandInstruction):
     
-    def emit(self, LL: PlatformIRBuilder, state: InterpreterState, ispec: InterpreterStateSpec):
-        state[ispec.rf2] = [LL.bitcast(state.operand, f32)] * ispec.ilp
+    def emit(self, LL: PlatformIRBuilder, state: StackMachineState):
+        spx = state.peek()
+        operand = LL.bitcast(self.op, f32)
+        state.pop().push([LL.fmul(x, operand) for x in spx])
 
 
-class LoadF3Imm(Instruction):
+class FMAImm(DefaultControlOperandInstruction):
     
-    def emit(self, LL: PlatformIRBuilder, state: InterpreterState, ispec: InterpreterStateSpec):
-        state[ispec.rf3] = [LL.bitcast(state.operand, f32)] * ispec.ilp
-
-
-class FAddImm(Instruction):
-    
-    def emit(self, LL: PlatformIRBuilder, state: InterpreterState, ispec: InterpreterStateSpec):
-        operand = LL.bitcast(state.operand, f32)
-        state[ispec.rf0] = [LL.fadd(x, operand) for x in state[ispec.rf0]]
-
-
-class FMulImm(Instruction):
-    
-    def emit(self, LL: PlatformIRBuilder, state: InterpreterState, ispec: InterpreterStateSpec):
-        operand = LL.bitcast(state.operand, f32)
-        state[ispec.rf0] = [LL.fmul(x, operand) for x in state[ispec.rf0]]
-
-
-class FMAImm(Instruction):
-    
-    def emit(self, LL: PlatformIRBuilder, state: InterpreterState, ispec: InterpreterStateSpec):
-        operand = LL.bitcast(state.operand, ir.VectorType(f16, 2))
+    def emit(self, LL: PlatformIRBuilder, state: StackMachineState):
+        operand = LL.bitcast(self.op, ir.VectorType(f16, 2))
         mul = LL.fpext(LL.extract_element(operand, i32(0)), f32)
         add = LL.fpext(LL.extract_element(operand, i32(1)), f32)
-        state[ispec.rf0] = [LL.fma(x, mul, add) for x in state[ispec.rf0]]
+        spx = state.peek()
+        state.pop().push([LL.fma(x, mul, add) for x in spx])

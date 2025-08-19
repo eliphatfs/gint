@@ -43,3 +43,18 @@ class Instruction:
 
     def attrs(self):
         return EInsnAttrs.Nothing
+
+
+class DefaultControlInstruction(Instruction):
+    
+    def emit_self(self):
+        self.update_pc()
+        return self.emit(self.LL, self.state)
+
+
+class DefaultControlOperandInstruction(Instruction):
+    
+    def emit_self(self):
+        self.op = self.operand()
+        self.update_pc()
+        return self.emit(self.LL, self.state)
