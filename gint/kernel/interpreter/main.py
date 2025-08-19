@@ -78,6 +78,7 @@ INSNS: dict[type[Instruction], int] = {
     FLog2: 52,
     FRSqrt: 53,
     FErf: 54,
+    Swap: 55,
 }
 
 

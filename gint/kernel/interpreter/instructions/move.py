@@ -45,3 +45,11 @@ class Dup2(DefaultControlInstruction):
         v1 = state.peek()
         v2 = state.peek(1)
         state.push(v2).push(v1)
+
+
+class Swap(DefaultControlInstruction):
+    
+    def emit(self, LL: PlatformIRBuilder, state: StackMachineState):
+        v1 = state.peek()
+        v2 = state.peek(1)
+        state.pop().pop().push(v1).push(v2)

@@ -257,3 +257,7 @@ def frsqrt():
 @_bc
 def ferf():
     return [FErf, 0]
+
+@_bc
+def swap():
+    return [Swap, 0]
