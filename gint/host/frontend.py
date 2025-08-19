@@ -3,7 +3,6 @@ import functools
 from threading import Lock
 from typing import Optional, Sequence
 from .executor import TensorInterface
-from ..kernel.interpreter.main import ILP
 
 
 class FrontendState(object):
