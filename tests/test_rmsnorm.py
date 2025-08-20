@@ -109,29 +109,28 @@ def generalized_rms_norm(x_stat: torch.Tensor, x_normed: torch.Tensor, dim: List
 
 
 @bytecode
-def rmsnorm(x: TensorInterface, y: TensorInterface, w: TensorInterface, ILP: int, WARP: int):
+def rmsnorm(x: TensorInterface, y: TensorInterface, w: TensorInterface, REGW: int, WARP: int):
     # x: B, NH, T, H
     assert x.shape == y.shape
     B, NH, T, H = x.shape
     assert (H,) == tuple(w.shape)
     
     # compute sum of head
+    fpush(0.0)  # r
     for c in range(0, H, WARP):
-        ldg_f1_bf16(c, x)  # r, x[c:c+32], 0, 0
-        movf(2, 1)  # r, x[c:c+32], x[c:c+32], 0
-        fma_f0_f1_f2()
-    warp_allreduce_sum_f0()
-    fma_f0_imm(1 / H, 1e-5)
-    frsqrt_f0()
-    movf(3, 0)
+        fldg_bf16(c, x)  # r, x[c:c+32]
+        dup()  # r, x[c:c+32], x[c:c+32]
+        fma()  # r + x**2
+    warp_allreduce_fsum()
+    fmaimm(1 / H, 1e-5)
+    frsqrt()
     for c in range(0, H, WARP):
-        if c > 0:
-            movf(0, 3)  # rstd, x[c: c+32], 0, rstd
-        ldg_f1_bf16(c, x)  # rstd, x[c:c+32], 0, rstd
-        mul_f0_f1()
-        ldg_f1_bf16(c, w)  # r * x, w, 0, rstd
-        mul_f0_f1()
-        stg_f0_bf16(c, y)
+        dup()  # rstd, rstd
+        fldg_bf16(c, x)  # rstd, rstd, x[c:c+32]
+        fmul()  # rstd, r * x
+        fldg_bf16(c, w)  # rstd, r * x, w
+        fmul()  # rstd, r * x * w
+        fstg_bf16(c, y)  # rstd
     halt()
     return (
         [ProgramTensorInfo(2, a.strides[-1], H, list(a.strides[:3]), [B, NH, T], [0, 0, 0]) for a in (x, y)]
@@ -150,7 +149,7 @@ class TestRMSNorm(unittest.TestCase):
                         x = torch.randn(b, t, nh, h, device='cuda', dtype=torch.bfloat16).transpose(1, 2) * 1.5 + 0.5
                         y = torch.empty_like(x)
                         w = torch.rand(h, device='cuda', dtype=torch.bfloat16)
-                        rmsnorm(x, y, w, grid_dim=b * nh * cdiv(t, ILP))
+                        rmsnorm(x, y, w, grid_dim=b * nh * cdiv(t, REG_WIDTH))
                         y_ref = torch.nn.functional.rms_norm(x, (h,), w, eps=1e-5)
                         torch.testing.assert_close(y, y_ref)
 
@@ -160,6 +159,6 @@ class TestRMSNorm(unittest.TestCase):
         x = (torch.randn(b, t, nh, h, dtype=torch.bfloat16) * 1.5 + 0.5).cuda().transpose(1, 2)
         y = torch.empty_like(x)
         w = torch.rand(h, device='cuda', dtype=torch.bfloat16)
-        rmsnorm(x, y, w, grid_dim=b * nh * cdiv(t, ILP))
+        rmsnorm(x, y, w, grid_dim=b * nh * cdiv(t, REG_WIDTH))
         generalized_rms_norm(x, x, [3], w, 1e-5)
         torch.nn.functional.rms_norm(x, (h,), w, eps=1e-5)

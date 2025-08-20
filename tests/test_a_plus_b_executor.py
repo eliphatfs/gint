@@ -1,7 +1,7 @@
 import numpy
 import torch
 import unittest
-from gint.kernel.interpreter.main import ILP
+from gint.kernel.interpreter.main import REG_WIDTH
 from gint.host.executor import BaseExecutableProgram, ProgramData, ProgramTensorInfo, TensorInterface
 from gint.host.utils import cdiv
 
@@ -17,11 +17,10 @@ class BatchAddProgram(BaseExecutableProgram):
         bc = []
         for i in range(0, C, 32):
             bc.extend([
-                2, 16 * i,  # ldg f1 a[i: i + 32]
-                8, 0,  # mov f0 f1
-                2, 16 * i + 1,  # ldg f1 b[i: i + 32]
-                4, 0,  # fadd f0 f1
-                3, 16 * i + 2,  # stg f0 c[i: i + 32]
+                15, 16 * i,  # ldg f1 a[i: i + 32]
+                15, 16 * i + 1,  # ldg f1 b[i: i + 32]
+                2, 0,  # fadd f0 f1
+                16, 16 * i + 2,  # stg f0 c[i: i + 32]
             ])
         bc.extend([0, 0])  # halt
         return ProgramData(
@@ -42,11 +41,10 @@ class VectorAddProgram(BaseExecutableProgram):
         block = 256
         for i in range(0, block, 32):
             bc.extend([
-                2, 16 * i,  # ldg f1 a[i: i + 32]
-                8, 0,  # mov f0 f1
-                2, 16 * i + 1,  # ldg f1 b[i: i + 32]
-                4, 0,  # fadd f0 f1
-                3, 16 * i + 2,  # stg f0 c[i: i + 32]
+                15, 16 * i,  # ldg f1 a[i: i + 32]
+                15, 16 * i + 1,  # ldg f1 b[i: i + 32]
+                2, 0,  # fadd f0 f1
+                16, 16 * i + 2,  # stg f0 c[i: i + 32]
             ])
         bc.extend([0, 0])  # halt
         
@@ -66,7 +64,7 @@ class TestInterpretAPB(unittest.TestCase):
                 a = torch.randn(s, p, device='cuda', dtype=torch.float32)
                 b = torch.randn(s, p, device='cuda', dtype=torch.float32)
                 c = torch.empty(s, p, device='cuda', dtype=torch.float32)
-                batch_add_prog(a, b, c, grid_dim=(s + ILP - 1) // ILP)
+                batch_add_prog(a, b, c, grid_dim=(s + REG_WIDTH - 1) // REG_WIDTH)
                 c_ref = a + b
                 torch.testing.assert_close(c, c_ref)
 
@@ -77,7 +75,7 @@ class TestInterpretAPB(unittest.TestCase):
             a = torch.randn(s, device='cuda', dtype=torch.float32)
             b = torch.randn(s, device='cuda', dtype=torch.float32)
             c = torch.empty(s, device='cuda', dtype=torch.float32)
-            vector_add_prog(a, b, c, grid_dim=cdiv(cdiv(s, 256), ILP))
+            vector_add_prog(a, b, c, grid_dim=cdiv(cdiv(s, 256), REG_WIDTH))
             c_ref = a + b
             torch.testing.assert_close(c, c_ref)
     
@@ -88,5 +86,5 @@ class TestInterpretAPB(unittest.TestCase):
             a = torch.randn(s, dtype=torch.float32).cuda()
             b = torch.randn(s, dtype=torch.float32).cuda()
             c = torch.empty(s, device='cuda', dtype=torch.float32)
-            vector_add_prog(a, b, c, grid_dim=cdiv(cdiv(s, 256), ILP))
+            vector_add_prog(a, b, c, grid_dim=cdiv(cdiv(s, 256), REG_WIDTH))
             _ = a + b

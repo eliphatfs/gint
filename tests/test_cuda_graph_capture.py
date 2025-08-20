@@ -5,7 +5,7 @@ from gint.host.frontend import *
 
 
 @bytecode
-def vector_expr2(x: TensorInterface, y: TensorInterface, ILP: int, WARP: int, BLOCK: int):
+def vector_expr2(x: TensorInterface, y: TensorInterface, REGW: int, WARP: int, BLOCK: int):
     # implements cubic easing function x ** 2 * (3 - 2 * x)
     assert x.shape == y.shape
     for arg in (x, y):
@@ -13,16 +13,13 @@ def vector_expr2(x: TensorInterface, y: TensorInterface, ILP: int, WARP: int, BL
     C, = x.shape
     block = BLOCK
     for i in range(0, block, WARP):
-        ldg_f1_float(i, x)
-        immf(0, 3.0)  # 3, x, 0, 0
-        immf(2, -2.0)  # 3, x, -2, 0
-        fma_f0_f1_f2()  # 3 - 2x, x, -2, 0
-        movf(3, 0)  # 3 - 2x, x, -2, 3 - 2x
-        movf(0, 1)  # x, x, -2, 3 - 2x
-        mul_f0_f1()  # x ** 2, x, -2, 3 - 2x
-        movf(1, 3)  # x ** 2, 3 - 2x
-        mul_f0_f1()
-        stg_f0_float(i, y)
+        fldg(i, x)  # x
+        dup()  # x, x
+        dup()  # x, x, x
+        fmaimm(-2.0, 3.0)  # x, x, 3 - 2x
+        fmul()  # x, x * (3 - 2x)
+        fmul()  # x ** 2 * (3 - 2 * x)
+        fstg(i, y)
     halt()
     return [ProgramTensorInfo(4, arg.strides[0], C, [arg.strides[0] * block], [cdiv(C, block)], [block]) for arg in (x, y)]
 
@@ -31,7 +28,7 @@ def cubic_ease(x: torch.Tensor):
     orig_shape = x.shape
     x = x.view(-1)
     y = torch.empty_like(x)
-    vector_expr2(x, y, grid_dim=cdiv(cdiv(len(x), 256), ILP), BLOCK=256, cuda_stream=torch.cuda.current_stream().cuda_stream)
+    vector_expr2(x, y, grid_dim=cdiv(cdiv(len(x), 256), REG_WIDTH), BLOCK=256, cuda_stream=torch.cuda.current_stream().cuda_stream)
     y_ref = x ** 2 * (3 - 2 * x)
     return y_ref.view(orig_shape), y.view(orig_shape)
 

@@ -2,7 +2,7 @@ import numpy
 import torch
 import unittest
 from typing import Callable
-from gint.kernel.interpreter.main import ILP
+from gint.kernel.interpreter.main import REG_WIDTH
 from gint.host.executor import BaseExecutableProgram, ProgramData, ProgramTensorInfo, TensorInterface
 from gint.host.utils import cdiv
 
@@ -13,12 +13,12 @@ class MinimalBinaryArithProgram(BaseExecutableProgram):
         super().__init__()
         self.op = op
         self.op_map = {
-            'add': 4,
-            'mul': 17,
-            'sub': 19,
-            'rsub': 20,
-            'div': 21,
-            'rdiv': 22,
+            'add': 2,
+            'mul': 3,
+            'sub': 5,
+            'rsub': 6,
+            'div': 8,
+            'rdiv': 9,
         }
     
     def get_program(self, a: TensorInterface, b: TensorInterface, c: TensorInterface) -> ProgramData:
@@ -28,11 +28,10 @@ class MinimalBinaryArithProgram(BaseExecutableProgram):
         B, C = a.shape
         
         bc = [
-            2, 0,  # ldg f1 a
-            8, 0,  # mov f0 f1
-            2, 1,  # ldg f1 b
-            self.op_map[self.op], 0,  # the arith f0 = f0 () f1
-            3, 2,  # stg f0 c
+            15, 1,  # ldg b (b)
+            15, 0,  # ldg a (b a)
+            self.op_map[self.op], 0,  # the arith (res)
+            16, 2,  # stg c ()
             0, 0,  # halt
         ]
         return ProgramData(
@@ -50,13 +49,11 @@ class MinimalFMAProgram(BaseExecutableProgram):
         B, C = a.shape
         
         bc = [
-            2, 0,  # ldg f1 a
-            8, 0,  # mov f0 f1
-            2, 2,  # ldg f1 c
-            9, 0,  # mov f2 f1
-            2, 1,  # ldg f1 b
-            18, 0,  # fma f0 f1 f2
-            3, 3,  # stg f0 d
+            15, 0,  # ldg f1 a
+            15, 1,  # ldg f1 b
+            15, 2,  # ldg f1 c
+            4, 0,  # fma f0 f1 f2
+            16, 3,  # stg f0 d
             0, 0,  # halt
         ]
         return ProgramData(
@@ -72,10 +69,9 @@ class MinimalInplaceNegProgram(BaseExecutableProgram):
         B, C = arg.shape
         
         bc = [
-            2, 0,  # ldg f1 a
-            8, 0,  # mov f0 f1
-            23, 0,  # neg f0
-            3, 0,  # stg f0 a
+            15, 0,  # ldg a
+            7, 0,  # neg
+            16, 0,  # stg a
             0, 0,  # halt
         ]
         return ProgramData(
@@ -92,7 +88,7 @@ class TestBasicNonBinaryArithmetics(unittest.TestCase):
             torch.manual_seed(42)
             a = torch.rand(s, 32, device='cuda', dtype=torch.float32) + 1e-6
             a_ref = -a
-            prog(a, grid_dim=cdiv(s, ILP))
+            prog(a, grid_dim=cdiv(s, REG_WIDTH))
             torch.testing.assert_close(a, a_ref)
     
     def test_fma(self):
@@ -103,7 +99,7 @@ class TestBasicNonBinaryArithmetics(unittest.TestCase):
             b = torch.rand(s, 32, device='cuda', dtype=torch.float32) + 1e-6
             c = torch.rand(s, 32, device='cuda', dtype=torch.float32) + 1e-6
             d = torch.empty(s, 32, device='cuda', dtype=torch.float32)
-            prog(a, b, c, d, grid_dim=cdiv(s, ILP))
+            prog(a, b, c, d, grid_dim=cdiv(s, REG_WIDTH))
             d_ref = a + b * c
             torch.testing.assert_close(d, d_ref)
 
@@ -117,7 +113,7 @@ class TestBasicBinaryArithmetics(unittest.TestCase):
             a = torch.rand(s, 32, device='cuda', dtype=torch.float32) + 1e-6
             b = torch.rand(s, 32, device='cuda', dtype=torch.float32) + 1e-6
             c = torch.empty(s, 32, device='cuda', dtype=torch.float32)
-            prog(a, b, c, grid_dim=cdiv(s, ILP))
+            prog(a, b, c, grid_dim=cdiv(s, REG_WIDTH))
             c_ref = ref_lambda(a, b)
             torch.testing.assert_close(c, c_ref)
     

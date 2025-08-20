@@ -27,9 +27,10 @@ def _bc(func):
         else:
             argmap = f.fn_args_map
             result = func(
-                *(INSNS.get(x, argmap.get(id(x), x)) for x in args)
+                *(argmap.get(id(x), x) for x in args)
             )
-            f.bc.append(result)
+            insns_local = INSNS
+            f.bc.append([insns_local.get(x, x) for x in result])
             return result
 
     return _api_wrapper

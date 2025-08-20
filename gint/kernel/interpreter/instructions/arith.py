@@ -27,7 +27,7 @@ class FMul(DefaultControlInstruction):
 class FMA(DefaultControlInstruction):
     
     def emit(self, LL: PlatformIRBuilder, state: StackMachineState):
-        emit_set_arith(state, LL.fma, 2, 1, 0)
+        emit_set_arith(state, LL.fma, 0, 1, 2)
 
 
 class FSub(DefaultControlInstruction):

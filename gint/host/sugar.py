@@ -10,7 +10,7 @@ class CachePolicyCallable(Protocol):
 
 
 class SugarCallable(Protocol):
-    def __call__(self, *args: TensorInterface, ILP: int, WARP: int, **extra_kwargs) -> list[ProgramTensorInfo]: ...
+    def __call__(self, *args: TensorInterface, REGW: int, WARP: int, **extra_kwargs) -> list[ProgramTensorInfo]: ...
 
 
 class SugarDeviceCallable(Protocol):

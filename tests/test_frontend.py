@@ -5,27 +5,28 @@ from gint.host.frontend import *
 
 
 @bytecode
-def basic_expr1(a: TensorInterface, b: TensorInterface, c: TensorInterface, ILP: int, WARP: int):
+def basic_expr1(a: TensorInterface, b: TensorInterface, c: TensorInterface, REGW: int, WARP: int):
     assert a.shape == b.shape == c.shape
     for arg in (a, b, c):
         assert arg.typestr == 'f4'
     B, C = a.shape
     for i in range(0, C, WARP):
-        ldg_f1_float(i, a)
-        movf(0, 1)
-        ldg_f1_float(i, b)
-        add_f0_f1()
-        add_f0_f1()
-        div_f0_f1()
-        sub_f0_f1()
-        neg_f0()
-        stg_f0_float(i, c)
+        fldg(i, b)
+        dup()  # b, b
+        dup2()  # b, b, b, b
+        fldg(i, a)  # b, b, b, b, a
+        fadd()  # b, b, b, a + b
+        fadd()  # b, b, a + b + b
+        fdiv()  # b, (a + b + b) / b
+        fsub()  # (a + b + b) / b - b
+        fneg()  # -((a + b + b) / b - b)
+        fstg(i, c)
     halt()
     return [ProgramTensorInfo(arg.elm_size, arg.strides[1], C, [arg.strides[0]], [B], [0]) for arg in (a, b, c)]
 
 
 @bytecode
-def vector_expr2(x: TensorInterface, y: TensorInterface, ILP: int, WARP: int, BLOCK: int):
+def vector_expr2(x: TensorInterface, y: TensorInterface, REGW: int, WARP: int, BLOCK: int):
     # implements cubic easing function x ** 2 * (3 - 2 * x)
     assert x.shape == y.shape
     for arg in (x, y):
@@ -33,74 +34,100 @@ def vector_expr2(x: TensorInterface, y: TensorInterface, ILP: int, WARP: int, BL
     C, = x.shape
     block = BLOCK
     for i in range(0, block, WARP):
-        ldg_f1_float(i, x)
-        immf(0, 3.0)  # 3, x, 0, 0
-        immf(2, -2.0)  # 3, x, -2, 0
-        fma_f0_f1_f2()  # 3 - 2x, x, -2, 0
-        movf(3, 0)  # 3 - 2x, x, -2, 3 - 2x
-        movf(0, 1)  # x, x, -2, 3 - 2x
-        mul_f0_f1()  # x ** 2, x, -2, 3 - 2x
-        movf(1, 3)  # x ** 2, 3 - 2x
-        mul_f0_f1()
-        stg_f0_float(i, y)
+        fldg(i, x)  # x
+        dup()  # x, x
+        dup()  # x, x, x
+        fmaimm(-2.0, 3.0)  # x, x, 3 - 2x
+        fmul()  # x, x * (3 - 2x)
+        fmul()  # x ** 2 * (3 - 2 * x)
+        fstg(i, y)
     halt()
     return [ProgramTensorInfo(4, arg.strides[0], C, [arg.strides[0] * block], [cdiv(C, block)], [block]) for arg in (x, y)]
 
 
 @bytecode
-def meaningless_execute_everything(x: TensorInterface, x_f16: TensorInterface, x_bf16: TensorInterface, x_u8: TensorInterface, ILP: int, WARP: int):
-    nop()
-    ldg_f1_float(0, x)
-    stg_f0_float(0, x)
-    add_f0_f1()
-    for i in range(4):
-        for j in range(4):
-            if i != j:
-                movf(i, j)
-    mul_f0_f1()
-    fma_f0_f1_f2()
-    sub_f0_f1()
-    rsub_f0_f1()
-    div_f0_f1()
-    rdiv_f0_f1()
-    neg_f0()
-    for i in range(4):
-        immf(i, 1.0)
-    warp_allreduce_sum_f0()
-    warp_allreduce_max_f0()
-    warp_allreduce_min_f0()
-    warp_allreduce_prod_f0()
-    frem_f0_f1()
-    fsqrt_f0()
-    fsin_f0()
-    fcos_f0()
-    ftan_f0()
-    fasin_f0()
-    facos_f0()
-    fatan_f0()
-    fatan2_f0_f1()
-    fpow_f0_f1()
-    fexp_f0()
-    fexp2_f0()
-    flog_f0()
-    flog2_f0()
-    frsqrt_f0()
-    ferf_f0()
-    ldg_f1_half(0, x_f16)
-    stg_f0_half(0, x_f16)
-    ldg_f1_bf16(0, x_bf16)
-    stg_f0_bf16(0, x_bf16)
-    ldg_f1_u8(0, x_u8)
-    fge_f0_f1_f2()
-    fgt_f0_f1_f2()
-    fle_f0_f1_f2()
-    flt_f0_f1_f2()
-    feq_f0_f1_f2()
-    fne_f0_f1_f2()
-    fapprox_f0_f1_f2(0.01)
-    select_f0_f0_f1_f2()
-    add_f0_imm(1.0)
-    mul_f0_imm(1.0)
+def meaningless_execute_everything(x: TensorInterface, x_f16: TensorInterface, x_bf16: TensorInterface, x_u8: TensorInterface, REGW: int, WARP: int):
+    nop()  # 0
+    fldg(0, x)  # 1
+    dup()  # 2
+    dup2()  # 4
+    fstg(0, x)  # 3
+    fadd()  # 2
+    dup2()  # 4
+    fmul()  # 3
+    fsub()  # 2
+    frsub()  # 1
+    dup()  # 2
+    dup2()  # 4
+    fdiv()  # 3
+    frdiv()  # 2
+    fneg()  # 2
+    pop2()  # 0
+    fpush(1.0)  # 1
+    fpush(1.0)  # 2
+    fpush(1.0)  # 3
+    warp_allreduce_fmax()
+    warp_allreduce_fmin()
+    warp_allreduce_fsum()
+    warp_allreduce_fprod()  # 3
+    frem()  # 2
+    pop()  # 1
+    fsqrt()  # 1
+    fpush(1.0)
+    fsin()
+    fcos()
+    ftan()
+    fpush(1.0)  # 2
+    fasin()
+    fpush(1.0)  # 3
+    facos()
+    fpush(1.0)  # 4
+    fatan()
+    pop2()  # 2
+    pop2()  # 0
+    fpush(1.0)  # 1
+    fexp()
+    fexp2()
+    fpush(1.0)  # 2
+    flog()
+    flog2()
+    pop2()
+    fpush(1.0)  # 1
+    ferf()
+    fpush(1.0)  # 2
+    frsqrt()
+    pop2()  # 0
+    fpush(1.0)
+    fpush(2.0)
+    fatan2()
+    pop()
+    fpush(1.0)  # 1
+    dup()  # 2
+    dupx1()  # 3
+    dupx2()  # 4
+    fpow()  # 3
+    fge()  # 2
+    fgt()  # 1
+    dup()
+    dup2()  # 4
+    dup2()  # 6
+    dup2()  # 8
+    fle()  # 7
+    flt()  # 6
+    fne()  # 5
+    feq()  # 4
+    fapprox(0.1)  # 3
+    fselect()  # 1
+    fldg_f16(0, x_f16)  # 2
+    fstg_f16(0, x_f16)  # 1
+    fldg_bf16(0, x_bf16)  # 2
+    fstg_bf16(0, x_bf16)  # 1
+    fldg_u8(0, x_u8)  # 2
+    faddimm(1.0)
+    fmulimm(1.0)
+    fmaimm(1.0, 1.0)
+    pop2()
+    halt()
     return [
         ProgramTensorInfo(4, x.strides[0], 32, [x.strides[0]], [0], [1]),
         ProgramTensorInfo(2, x_f16.strides[0], 32, [x_f16.strides[0]], [0], [1]),
@@ -118,7 +145,7 @@ class TestFrontendExpression(unittest.TestCase):
                 a = torch.rand(s, p, device='cuda', dtype=torch.float32) + 1e-6
                 b = torch.rand(s, p, device='cuda', dtype=torch.float32) + 1e-6
                 c = torch.empty(s, p, device='cuda', dtype=torch.float32)
-                basic_expr1(a, b, c, grid_dim=cdiv(s, ILP))
+                basic_expr1(a, b, c, grid_dim=cdiv(s, REG_WIDTH))
                 c_ref = -((a + b + b) / b - b)
                 torch.testing.assert_close(c, c_ref)
 
@@ -128,7 +155,7 @@ class TestFrontendExpression(unittest.TestCase):
             torch.manual_seed(42)
             x = torch.rand(z, device='cuda', dtype=torch.float32)
             y = torch.empty(z, device='cuda', dtype=torch.float32)
-            vector_expr2(x, y, grid_dim=cdiv(cdiv(z, 256), ILP), BLOCK=256)
+            vector_expr2(x, y, grid_dim=cdiv(cdiv(z, 256), REG_WIDTH), BLOCK=256)
             y_ref = x ** 2 * (3 - 2 * x)
             torch.testing.assert_close(y, y_ref)
 
