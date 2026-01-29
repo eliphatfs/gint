@@ -105,3 +105,77 @@ class StoreGlobalBF16(_LoadStoreGlobalBase):
 class LoadGlobalU8(_LoadStoreGlobalBase):
     source_dtype = i8
     mode = 'load'
+
+
+class _LoadStoreGlobalIndirectBase(DefaultControlOperandInstruction):
+    source_dtype: ir.Type = void
+    mode: str = None
+
+    def load_store(self, LL: PlatformIRBuilder, ptr, store_reg):
+        if self.mode == 'load':
+            if self.source_dtype == f32:
+                return LL.load(ptr)
+            raise TypeError("Unsupported type for indirect load", self.source_dtype)
+        elif self.mode == 'store':
+            if self.source_dtype == f32:
+                LL.store(store_reg, ptr)
+            else:
+                raise TypeError("Unsupported type for indirect store", self.source_dtype)
+        else:
+            raise ValueError("Unsupported mode", self.mode)
+
+    def emit(self, LL: PlatformIRBuilder, state: StackMachineState):
+        operand = self.op
+        load_i = LL.and_(operand, i32(0xf))
+        
+        smem_base = state.smem_base
+        smem_base = LL.bitcast(smem_base, BlockTensorInfo.as_pointer(LL.smem_addrspace()))
+        base_ptr = LL.load(LL.gep(smem_base, [i32(0), i32(0), load_i], inbounds=True))
+        
+        if isinstance(self.source_dtype, ir.IntType):
+            elm_sz_val = i32(self.source_dtype.width // 8)
+        elif isinstance(self.source_dtype, ir.HalfType):
+            elm_sz_val = i32(2)
+        elif isinstance(self.source_dtype, ir.FloatType):
+            elm_sz_val = i32(4)
+        elif isinstance(self.source_dtype, ir.DoubleType):
+            elm_sz_val = i32(8)
+        else:
+            # Fallback for BFloat16 or others if they have width or similar
+            elm_sz_val = i32(getattr(self.source_dtype, 'width', 32) // 8)
+        
+        # Get index from stack (top of stack)
+        indices_f32 = state.peek(0)
+        
+        # Get values if store (under the index)
+        values_f32 = state.peek(1) if self.mode == 'store' else None
+
+        # Pop from stack
+        state.pop()
+        if self.mode == 'store':
+            state.pop()
+
+        indices_i32 = [LL.bitcast(idx, i32) for idx in indices_f32]
+        
+        results = []
+        for i in range(state.reg_width):
+            offset = LL.mul(LL.zext(indices_i32[i], i64), LL.zext(elm_sz_val, i64))
+            ptr = LL.gep(base_ptr, [offset], inbounds=True)
+            ptr = LL.bitcast(ptr, self.source_dtype.as_pointer())
+            
+            val = self.load_store(LL, ptr, values_f32[i] if values_f32 else None)
+            if self.mode == 'load':
+                results.append(val)
+        
+        if self.mode == 'load':
+            state.push(results)
+
+
+class LoadGlobalF32Indirect(_LoadStoreGlobalIndirectBase):
+    source_dtype = f32
+    mode = 'load'
+
+
+class StoreGlobalF32Indirect(_LoadStoreGlobalIndirectBase):
+    source_dtype = f32
+    mode = 'store'

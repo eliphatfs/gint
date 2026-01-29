@@ -34,3 +34,28 @@ class FMAImm(DefaultControlOperandInstruction):
         add = LL.fpext(LL.extract_element(operand, i32(1)), f32)
         spx = state.peek()
         state.pop().push([LL.fma(x, mul, add) for x in spx])
+
+
+class LoadImm4F(DefaultControlOperandInstruction):
+    """Load 4 int8 packed in i32 operand, cast each to f32"""
+    def emit(self, LL: PlatformIRBuilder, state: StackMachineState):
+        vals = []
+        for i in range(4):
+            # Extract i-th byte (little endian: byte 0 is LSB)
+            v_i8 = LL.trunc(LL.lshr(self.op, i32(8 * i)), i8)
+            v_f32 = LL.sitofp(v_i8, f32)
+            vals.append(v_f32)
+        state.push(vals)
+
+
+class LoadImm4I(DefaultControlOperandInstruction):
+    """Load 4 int8 packed in i32 operand, cast each to i32 and bitcast to f32"""
+    def emit(self, LL: PlatformIRBuilder, state: StackMachineState):
+        vals = []
+        for i in range(4):
+            # Extract i-th byte
+            v_i8 = LL.trunc(LL.lshr(self.op, i32(8 * i)), i8)
+            v_i32 = LL.sext(v_i8, i32)
+            v_f32 = LL.bitcast(v_i32, f32)
+            vals.append(v_f32)
+        state.push(vals)

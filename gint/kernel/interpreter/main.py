@@ -8,6 +8,7 @@ from .state import StackMachineState, InvalidStateException
 from .structs import TensorInfo
 
 from .instructions.arith import *
+from .instructions.arith_int import *
 from .instructions.control import *
 from .instructions.immediate import *
 from .instructions.load_store import *
@@ -79,6 +80,20 @@ INSNS: dict[type[Instruction], int] = {
     FRSqrt: 53,
     FErf: 54,
     Swap: 55,
+    IAdd: 56,
+    IMul: 57,
+    ISub: 58,
+    IDiv: 59,
+    IRem: 60,
+    IShl: 61,
+    IShr: 62,
+    IAnd: 63,
+    IOr: 64,
+    IXor: 65,
+    LoadGlobalF32Indirect: 66,
+    StoreGlobalF32Indirect: 67,
+    LoadImm4F: 68,
+    LoadImm4I: 69,
 }
 
 
