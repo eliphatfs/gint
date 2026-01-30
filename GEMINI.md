@@ -28,3 +28,17 @@ The frontend (in `gint/host/frontend.py`) provides a Pythonic way to define GPU 
 
 ### Data Model
 - **`TensorInfo` (Device)** / **`HTensorInfo` (Host)**: Shared structure for passing tensor metadata, including base pointers and complex stride/shape information for multi-dimensional data access.
+
+### Testing
+
+The project uses python unittest, not pytest. Run all tests by
+
+```bash
+python run_tests.py
+```
+
+Or run specific file as
+
+```bash
+python run_tests.py tests.test_arith_basic
+```
