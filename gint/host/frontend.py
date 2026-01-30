@@ -1,6 +1,6 @@
 import numpy
 import functools
-from threading import Lock
+from contextvars import ContextVar
 from typing import Optional, Sequence
 from .executor import TensorInterface
 from ..kernel.interpreter.main import *
@@ -14,14 +14,13 @@ class FrontendState(object):
         self.fn_args_map = {id(x): i for i, x in enumerate(fn_args)}
 
 
-_flock = Lock()
-_f: list[Optional[FrontendState]] = [None]
+_frontend_state: ContextVar[Optional[FrontendState]] = ContextVar("_frontend_state", default=None)
 
 
 def _bc(func):
     @functools.wraps(func)
     def _api_wrapper(*args):
-        f = _f[0]
+        f = _frontend_state.get()
         if f is None:
             return func(*args)
         else:

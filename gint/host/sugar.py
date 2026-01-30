@@ -1,7 +1,7 @@
 import numpy
 import functools
 from typing import Callable, Protocol, Hashable, Optional
-from .frontend import FrontendState, _f, _flock
+from .frontend import FrontendState, _frontend_state
 from .executor import BaseExecutableProgram, ProgramData, ProgramTensorInfo, TensorInterface
 
 
@@ -39,14 +39,13 @@ def _bytecode(func: SugarCallable, cache_policy: CachePolicyCallable) -> SugarDe
     
     @functools.wraps(func)
     def sugar_wrapper(*args, REGW: int, WARP: int, **extra_kwargs):
-        global _f
-        with _flock:
-            try:
-                _f[0] = FrontendState(args)
-                tis = func(*args, REGW=REGW, WARP=WARP, **extra_kwargs)
-                return _f[0].bc, tis
-            finally:
-                _f[0] = None
+        token = _frontend_state.set(FrontendState(args))
+        try:
+            tis = func(*args, REGW=REGW, WARP=WARP, **extra_kwargs)
+            f = _frontend_state.get()
+            return f.bc, tis
+        finally:
+            _frontend_state.reset(token)
     
     return SugarProgram(sugar_wrapper, cache_policy)
 
