@@ -136,9 +136,48 @@ def meaningless_execute_everything(x: TensorInterface, x_f16: TensorInterface, x
     ]
 
 
+@bytecode
+def indirect_arith_test(a, b, c, data, indices, out_load, out_store, REGW: int, WARP: int):
+    # Integer arith: a + b -> c
+    fldg(0, a)
+    fldg(0, b)
+    iadd()
+    fstg(0, c)
+    
+    # Indirect load: data[indices] -> out_load
+    fldg(0, indices)
+    fldg_ind(data)
+    fstg(0, out_load)
+    
+    # Indirect store: out_load -> indices -> out_store
+    fldg(0, out_load)
+    fldg(0, indices)
+    fstg_ind(out_store)
+    
+    halt()
+    return [ProgramTensorInfo(4, arg.strides[-1] if arg.ndim > 0 else 0, arg.shape[-1] if arg.ndim > 0 else 1, list(arg.strides[:-1]), list(arg.shape[:-1]), [0]*max(0, arg.ndim-1)) for arg in (a, b, c, data, indices, out_load, out_store)]
+
+
+@bytecode
+def packed_imm_test(packed_f_out, packed_i_out, REGW: int, WARP: int):
+    # Packed Imm F -> packed_f_out
+    fpush4(0x04030201) # [1.0, 2.0, 3.0, 4.0]
+    ipush4(0x03020100) # [0, 1, 2, 3] indices
+    fstg_ind(packed_f_out)
+    
+    # Packed Imm I -> packed_i_out
+    ipush4(0x40302010) # [16, 32, 48, 64]
+    ipush4(0x03020100) # [0, 1, 2, 3] indices
+    fstg_ind(packed_i_out)
+    
+    halt()
+    return [ProgramTensorInfo(4, arg.strides[-1] if arg.ndim > 0 else 0, arg.shape[-1] if arg.ndim > 0 else 1, list(arg.strides[:-1]), list(arg.shape[:-1]), [0]*max(0, arg.ndim-1)) for arg in (packed_f_out, packed_i_out)]
+
+
 class TestFrontendExpression(unittest.TestCase):
     
     def test_expr_1(self):
+        # ... (lines 173-182)
         for s in [1, 4, 6, 31, 32, 1000, 200000]:
             for p in [1, 16, 18, 32, 64, 256]:
                 torch.manual_seed(42)
@@ -151,6 +190,7 @@ class TestFrontendExpression(unittest.TestCase):
 
 
     def test_expr_2(self):
+        # ... (lines 185-191)
         for z in [1, 5, 16, 17, 31, 32, 33, 1023, 1024, 10000000]:
             torch.manual_seed(42)
             x = torch.rand(z, device='cuda', dtype=torch.float32)
@@ -166,3 +206,51 @@ class TestFrontendExpression(unittest.TestCase):
         x_bf16 = torch.rand(32, device='cuda', dtype=torch.bfloat16)
         x_u8 = (torch.rand(32, device='cuda', dtype=torch.bfloat16) * 255).byte()
         meaningless_execute_everything(x, x_f16, x_bf16, x_u8, grid_dim=1)
+
+    def test_indirect_and_integer(self):
+        a_int = torch.randint(0, 100, (1, 32), dtype=torch.int32, device='cuda')
+        b_int = torch.randint(0, 100, (1, 32), dtype=torch.int32, device='cuda')
+        c_int = torch.empty((1, 32), dtype=torch.int32, device='cuda')
+        data = torch.rand(100, device='cuda', dtype=torch.float32)
+        indices = torch.randint(0, 100, (1, 32), dtype=torch.int32, device='cuda')
+        out_load = torch.empty((1, 32), device='cuda', dtype=torch.float32)
+        out_store = torch.zeros(100, device='cuda', dtype=torch.float32)
+        
+        indirect_arith_test(
+            a_int.view(torch.float32), 
+            b_int.view(torch.float32), 
+            c_int.view(torch.float32), 
+            data.view(1, 100), 
+            indices.view(torch.float32), 
+            out_load, 
+            out_store.view(1, 100),
+            grid_dim=1
+        )
+        
+        torch.testing.assert_close(c_int, a_int + b_int)
+        torch.testing.assert_close(out_load, data[indices.long()])
+        
+        # Verify indirect store
+        ref_store = torch.zeros(100, device='cuda', dtype=torch.float32)
+        ref_store[indices.long()] = out_load
+        torch.testing.assert_close(out_store, ref_store)
+        
+    def test_packed_imm(self):
+        packed_f_out = torch.zeros(100, device='cuda', dtype=torch.float32)
+        packed_i_out = torch.zeros(100, device='cuda', dtype=torch.int32)
+        
+        packed_imm_test(
+            packed_f_out.view(1, 100),
+            packed_i_out.view(torch.float32).view(1, 100),
+            grid_dim=1
+        )
+        
+        # Verify packed imm f
+        ref_packed_f = torch.zeros(100, device='cuda', dtype=torch.float32)
+        ref_packed_f[0:4] = torch.tensor([1.0, 2.0, 3.0, 4.0], device='cuda')
+        torch.testing.assert_close(packed_f_out, ref_packed_f)
+        
+        # Verify packed imm i
+        ref_packed_i = torch.zeros(100, device='cuda', dtype=torch.int32)
+        ref_packed_i[0:4] = torch.tensor([16, 32, 48, 64], device='cuda', dtype=torch.int32)
+        torch.testing.assert_close(packed_i_out, ref_packed_i)

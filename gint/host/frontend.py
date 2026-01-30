@@ -259,5 +259,61 @@ def ferf():
     return [FErf, 0]
 
 @_bc
+def iadd():
+    return [IAdd, 0]
+
+@_bc
+def imul():
+    return [IMul, 0]
+
+@_bc
+def isub():
+    return [ISub, 0]
+
+@_bc
+def idiv():
+    return [IDiv, 0]
+
+@_bc
+def irem():
+    return [IRem, 0]
+
+@_bc
+def ishl():
+    return [IShl, 0]
+
+@_bc
+def ishr():
+    return [IShr, 0]
+
+@_bc
+def iand():
+    return [IAnd, 0]
+
+@_bc
+def ior():
+    return [IOr, 0]
+
+@_bc
+def ixor():
+    return [IXor, 0]
+
+@_bc
+def fldg_ind(arg_i):
+    return [LoadGlobalF32Indirect, arg_i]
+
+@_bc
+def fstg_ind(arg_i):
+    return [StoreGlobalF32Indirect, arg_i]
+
+@_bc
+def fpush4(packed_val: int):
+    return [LoadImm4F, packed_val]
+
+@_bc
+def ipush4(packed_val: int):
+    return [LoadImm4I, packed_val]
+
+@_bc
 def swap():
     return [Swap, 0]

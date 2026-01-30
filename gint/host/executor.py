@@ -33,6 +33,10 @@ class TensorInterface:
     shape: tuple[int, ...]
     strides: tuple[int, ...]  # in elements, not bytes
     assert sys.byteorder == 'little', 'gint does not support big endian yet'
+
+    @property
+    def ndim(self):
+        return len(self.shape)
     
     @property
     def typestr(self):
@@ -78,6 +82,7 @@ class TensorInterface:
                 strides.append(prod)
                 prod *= s
             strides = tuple(reversed(strides))
+        assert len(shape) == len(strides), (shape, strides, "shape and strides must have the same ndim")
         return TensorInterface(typechr, nbytes, ptr, shape, strides)
 
 
