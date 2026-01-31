@@ -79,6 +79,22 @@ class TestConductorBackend(unittest.TestCase):
         torch.testing.assert_close(actual_x, expected_x)
         torch.testing.assert_close(actual_y, expected_y)
 
+    def test_many_ops_one_subgraph(self):
+        # 16 tensors total if all were outputs, but only 2 external (1 input, 1 output)
+        # Should fit in one subgraph now.
+        @torch.compile(backend="gint_test")
+        def fn(x):
+            res = x
+            for _ in range(14):
+                res = res + 1.0
+            return res + 1.0
+            
+        x = torch.randn(1024, device='cuda')
+        expected = fn.__wrapped__(x)
+        actual = fn(x)
+        
+        torch.testing.assert_close(actual, expected)
+
 if __name__ == "__main__":
     if torch.cuda.is_available():
         unittest.main()
