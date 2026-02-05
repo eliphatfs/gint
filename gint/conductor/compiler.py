@@ -6,7 +6,7 @@ This module handles the conversion of PyTorch FX graphs into gint bytecode progr
 
 import torch
 import numpy as np
-from typing import List, Dict, Any, Callable, Set, Optional
+from typing import List, Dict, Any, Callable, Set, Optional, Union
 from torch.fx import GraphModule, Node
 
 from ..host.executor import (
@@ -89,7 +89,7 @@ class GraphPartitioner:
             
             if not supported or shape is None:
                 if current_nodes:
-                    subgraphs.append(current_nodes)
+                    subgraphs.append(self._schedule_subgraph(current_nodes))
                     current_nodes = []
                     current_shape = None
                 continue
@@ -100,11 +100,12 @@ class GraphPartitioner:
             
             if can_add:
                 potential = current_nodes + [node]
-                # Check Resource Limits (Tensors and Stack)
-                ext_tensors = self._get_required_global_tensors(potential)
+                # Scheduling pass for simulation
+                scheduled = self._schedule_subgraph(potential)
+                ext_tensors = self._get_required_global_tensors(scheduled)
                 if len(ext_tensors) > self.max_tensors:
                     can_add = False
-                elif not self._simulate_stack(potential):
+                elif not self._simulate_stack(scheduled):
                     can_add = False
             
             if can_add:
@@ -113,12 +114,261 @@ class GraphPartitioner:
                 current_nodes.append(node)
             else:
                 if current_nodes:
-                    subgraphs.append(current_nodes)
+                    subgraphs.append(self._schedule_subgraph(current_nodes))
                 current_nodes = [node]
                 current_shape = shape
         
         if current_nodes:
-            subgraphs.append(current_nodes)
+            subgraphs.append(self._schedule_subgraph(current_nodes))
+            
+        return subgraphs
+
+class ForestTraverser:
+    """
+    Expands a DAG into a forest and performs post-order traversal.
+    """
+    def __init__(self, nodes: List[Node]):
+        self.nodes = nodes
+        self.node_set = set(nodes)
+        
+    def get_schedule(self) -> List[Node]:
+        # We start from roots (nodes with no users in the subgraph OR external outputs)
+        roots = []
+        for node in self.nodes:
+            is_root = True
+            for user in node.users:
+                if user in self.node_set:
+                    is_root = False
+                    break
+            if is_root:
+                roots.append(node)
+                
+        visited = set()
+        schedule = []
+        
+        def visit(n: Node):
+            if n in visited or n not in self.node_set:
+                return
+            
+            # We want to visit children in input order. 
+            # For arithmetic ops, arg0 is usually the "base" and arg1 is "modifier".
+            # Stack machine for arg0 + arg1: visit arg0 (pushes arg0), visit arg1 (pushes arg1), emit Add.
+            # So child order should be left-to-right.
+            for arg in n.args:
+                if isinstance(arg, Node):
+                    visit(arg)
+            
+            visited.add(n)
+            schedule.append(n)
+            
+        for root in roots:
+            visit(root)
+            
+        return schedule
+
+class StackManager:
+    """
+    Manages a virtual stack and handles resurrection logic.
+    """
+    def __init__(self, max_stack: int, tensor_map: Dict[Node, int], bytecode: List, instr_consts: Dict[str, int]):
+        self.stack: List[Node] = []
+        self.max_stack = max_stack
+        self.tensor_map = tensor_map
+        self.bytecode = bytecode
+        self.INSNS = instr_consts
+        self.node_uses_left: Dict[Node, int] = {}
+
+    def set_subgraph_nodes(self, nodes: List[Node], graph_outputs: Set[Node]):
+        node_set = set(nodes)
+        self.node_uses_left = {}
+        for i, node in enumerate(nodes):
+            uses = 0
+            for user in node.users:
+                if user in node_set:
+                    uses += 1
+            # External users count as a use (will be stored)
+            is_ext_out = node in graph_outputs or any(u not in node_set for u in node.users)
+            if is_ext_out:
+                uses += 1
+            self.node_uses_left[node] = uses
+
+    def emit(self, op_type, imm=0):
+        self.bytecode.append([self.INSNS[op_type], imm])
+
+    def push(self, node: Node):
+        self.stack.append(node)
+        if len(self.stack) > self.max_stack:
+            raise RuntimeError("Stack overflow")
+
+    def pop(self) -> Node:
+        return self.stack.pop()
+
+    def handle_operand(self, arg: Union[Node, int, float]):
+        from ..kernel.interpreter.main import LoadGlobalF32, LoadImm, Swap, Dup, DupX1, DupX2
+        
+        if not isinstance(arg, Node):
+            val = np.float32(arg).view(np.int32).item()
+            self.emit(LoadImm, val)
+            self.stack.append(None) # Constant on stack
+            return
+
+        uses_left = self.node_uses_left.get(arg, 0)
+
+        if arg in self.stack:
+            depth = len(self.stack) - 1 - self.stack.index(arg)
+            if depth == 0:
+                # Top of stack. If needed later, duplicate it.
+                if uses_left > 1:
+                    self.emit(Dup)
+                    self.stack.append(arg)
+            elif depth == 1:
+                if arg in self.tensor_map:
+                    self.emit(LoadGlobalF32, (0 << 16) | self.tensor_map[arg])
+                    self.stack.append(arg)
+                else:
+                    self.emit(Swap)
+                    v_top = self.stack.pop()
+                    v_1 = self.stack.pop()
+                    self.stack.append(v_top) # other -> depth 1
+                    self.stack.append(v_1)   # arg -> top
+                    
+                    if uses_left > 1:
+                        # Resurrect: (other, arg) -> (arg, other, arg)
+                        self.emit(DupX1)
+                        # Sync virtual stack to: [..., arg, other, arg]
+                        v1 = self.stack.pop() # arg
+                        v2 = self.stack.pop() # other
+                        self.stack.append(v1) # arg
+                        self.stack.append(v2) # other
+                        self.stack.append(v1) # arg
+            else:
+                if arg in self.tensor_map:
+                    self.emit(LoadGlobalF32, (0 << 16) | self.tensor_map[arg])
+                    self.stack.append(arg)
+                else:
+                    raise RuntimeError(f"Node {arg.name} buried at depth {depth} and no global entry")
+        else:
+            if arg in self.tensor_map:
+                self.emit(LoadGlobalF32, (0 << 16) | self.tensor_map[arg])
+                self.stack.append(arg)
+            else:
+                raise RuntimeError(f"Node {arg.name} not on stack and no global entry")
+
+    def post_op(self, node: Node, is_ext_out: bool):
+        from ..kernel.interpreter.main import StoreGlobalF32, Dup, Pop
+        
+        uses = self.node_uses_left.get(node, 0)
+        in_global = node in self.tensor_map
+        
+        # Result is already on top of stack
+        if in_global:
+            if uses > 0:
+                # Need to keep it on stack for future internal uses
+                self.emit(Dup)
+                self.emit(StoreGlobalF32, (0 << 16) | self.tensor_map[node])
+            else:
+                # Last use (or only external output), just store it
+                self.emit(StoreGlobalF32, (0 << 16) | self.tensor_map[node])
+                self.stack.pop() # Popped by StoreGlobalF32
+        elif uses > 0:
+            # Stays on stack for consumers, not stored
+            pass
+        else:
+            self.emit(Pop)
+            self.stack.pop()
+
+    def simulate_only(self, node: Node, is_ext_out: bool):
+        # Dummy simulation for partitioner
+        node_args = [a for a in node.args if isinstance(a, Node)]
+        for arg in node_args:
+            if arg in self.stack:
+                self.stack.remove(arg)
+            else:
+                pass # Load simulation handled by max_stack check in caller
+        self.stack.append(node)
+        uses = self.node_uses_left.get(node, 0)
+        if is_ext_out or uses <= 0:
+            self.stack.pop()
+
+class GraphPartitioner:
+    """
+    Partitions an FX graph into subgraphs compatible with gint.
+    """
+    
+    SUPPORTED_OPS = {
+        torch.ops.aten.add.Tensor,
+        torch.ops.aten.sub.Tensor,
+        torch.ops.aten.mul.Tensor,
+        torch.ops.aten.div.Tensor,
+    }
+
+    def __init__(self, gm: GraphModule, max_tensors: int = 8, max_stack: int = 8):
+        self.gm = gm
+        self.max_tensors = max_tensors
+        self.max_stack = max_stack
+        
+        self.graph_outputs = set()
+        for node in self.gm.graph.nodes:
+            if node.op == 'output':
+                for arg in node.args:
+                    if isinstance(arg, Node):
+                        self.graph_outputs.add(arg)
+                    elif isinstance(arg, (list, tuple)):
+                        for a in arg:
+                            if isinstance(a, Node):
+                                self.graph_outputs.add(a)
+
+    def _get_shape(self, node: Node) -> Optional[torch.Size]:
+        if 'tensor_meta' in node.meta:
+            return node.meta['tensor_meta'].shape
+        if 'val' in node.meta and hasattr(node.meta['val'], 'shape'):
+            return node.meta['val'].shape
+        return None
+
+    def partition(self) -> List[List[Node]]:
+        subgraphs = []
+        current_nodes = []
+        current_shape = None
+        
+        for node in self.gm.graph.nodes:
+            if node.op in ('placeholder', 'output'):
+                continue
+                
+            supported = node.op == 'call_function' and node.target in self.SUPPORTED_OPS
+            shape = self._get_shape(node) if supported else None
+            
+            if not supported or shape is None:
+                if current_nodes:
+                    subgraphs.append(ForestTraverser(current_nodes).get_schedule())
+                    current_nodes = []
+                    current_shape = None
+                continue
+                
+            can_add = True
+            if current_shape is not None and shape != current_shape:
+                can_add = False
+            
+            if can_add:
+                potential = current_nodes + [node]
+                scheduled = ForestTraverser(potential).get_schedule()
+                ext_tensors = self._get_required_global_tensors(scheduled)
+                if len(ext_tensors) > self.max_tensors:
+                    can_add = False
+                elif not self._simulate_stack(scheduled):
+                    can_add = False
+            
+            if can_add:
+                if current_shape is None:
+                    current_shape = shape
+                current_nodes.append(node)
+            else:
+                if current_nodes:
+                    subgraphs.append(ForestTraverser(current_nodes).get_schedule())
+                current_nodes = [node]
+                current_shape = shape
+        
+        if current_nodes:
+            subgraphs.append(ForestTraverser(current_nodes).get_schedule())
             
         return subgraphs
 
@@ -126,62 +376,28 @@ class GraphPartitioner:
         node_set = set(nodes)
         required = set()
         for i, node in enumerate(nodes):
-            # Inputs from outside
             for arg in node.args:
                 if isinstance(arg, Node) and arg not in node_set:
                     required.add(arg)
             
-            # Outputs (external or multi-use)
-            is_ext_out = False
-            if node in self.graph_outputs:
-                is_ext_out = True
-            else:
-                for user in node.users:
-                    if user not in node_set:
-                        is_ext_out = True
-                        break
-            
+            is_ext_out = node in self.graph_outputs or any(u not in node_set for u in node.users)
             uses_in_sub = [u for u in node.users if u in nodes[i+1:]]
             if is_ext_out or len(uses_in_sub) > 1:
                 required.add(node)
         return required
 
     def _simulate_stack(self, nodes: List[Node]) -> bool:
-        stack = [] # List of Nodes
+        from ..kernel.interpreter.main import INSNS
+        sm = StackManager(self.max_stack, {}, [], INSNS)
+        sm.set_subgraph_nodes(nodes, self.graph_outputs)
+        
         node_set = set(nodes)
-        
-        # Policy: 
-        # - Load if not top.
-        # - Store if multi-use or external.
-        # - Keep on stack if single-use by NEXT.
-        
-        for i, node in enumerate(nodes):
-            args = [a for a in node.args if isinstance(a, Node)]
-            # Load phase
-            for arg in args:
-                if not (stack and stack[-1] == arg):
-                    stack.append(arg)
-                else:
-                    # Arg is at top, will be consumed
-                    stack.pop()
-            
-            if len(stack) > self.max_stack: return False
-            
-            # Op consumes any newly loaded args too?
-            # Actually, opacity in simulation: peak is before OP if many loads.
-            # Pop and push result
-            stack.append(node)
-            if len(stack) > self.max_stack: return False
-            
-            # Determine if node stays on stack
+        for node in nodes:
             is_ext_out = node in self.graph_outputs or any(u not in node_set for u in node.users)
-            uses_in_sub = [u for u in node.users if u in nodes[i+1:]]
-            
-            # If not kept on stack, pop it (simulating Store)
-            keep_on_stack = len(uses_in_sub) == 1 and i+1 < len(nodes) and nodes[i+1] in uses_in_sub and not is_ext_out
-            if not keep_on_stack:
-                stack.pop()
-                
+            try:
+                sm.simulate_only(node, is_ext_out)
+            except RuntimeError:
+                return False
         return True
 
 class GintCompiler:
@@ -239,78 +455,52 @@ class GintCompiler:
 
     def _compile_subgraph(self, nodes: List[Node]) -> GintCompiledSubgraph:
         from ..kernel.interpreter.main import (
-            INSNS, LoadGlobalF32, LoadImm, StoreGlobalF32, 
-            FAdd, FMul, FRSub, FRDiv, Halt, Dup, Pop
+            INSNS, Halt, FAdd, FMul, FRSub, FRDiv, FSub, FDiv
         )
         bytecode = []
         
         node_set = set(nodes)
-        partitioner = GraphPartitioner(self.gm) # Reuse logic
+        partitioner = GraphPartitioner(self.gm)
         global_nodes = sorted(list(partitioner._get_required_global_tensors(nodes)), key=lambda n: n.name if hasattr(n, 'name') else str(id(n)))
         tensor_map = {node: i for i, node in enumerate(global_nodes)}
         
-        # Identify external inputs specifically for execute_wrapper
-        inputs = [n for n in global_nodes if n not in node_set]
+        sm = StackManager(max_stack=8, tensor_map=tensor_map, bytecode=bytecode, instr_consts=INSNS)
+        sm.set_subgraph_nodes(nodes, partitioner.graph_outputs)
         
-        def emit(op_type, imm=0):
-            bytecode.append([INSNS[op_type], imm])
-
-        stack = [] # Simulating gint stack content
-        
-        for i, node in enumerate(nodes):
-            # 1. Prepare Arguments
-            for arg in node.args:
-                if isinstance(arg, Node):
-                    if stack and stack[-1] == arg:
-                        # Top of stack, use it
-                        stack.pop()
-                    else:
-                        # Load from global storage
-                        if arg in tensor_map:
-                            emit(LoadGlobalF32, 16 * 0 + tensor_map[arg])
-                        else:
-                            raise RuntimeError(f"Required node {arg} not found in global storage")
-                elif isinstance(arg, (int, float)):
-                    val = np.float32(arg).view(np.int32).item()
-                    emit(LoadImm, val)
+        for node in nodes:
+            # 1. Handle Operands
+            node_args = node.args
+            for arg in node_args:
+                sm.handle_operand(arg)
+                if isinstance(arg, Node) and arg in node_set:
+                    sm.node_uses_left[arg] -= 1
             
             # 2. Emit Operation
             target = node.target
             if target == torch.ops.aten.add.Tensor:
-                emit(FAdd)
+                sm.emit(FAdd)
             elif target == torch.ops.aten.mul.Tensor:
-                emit(FMul)
+                sm.emit(FMul)
             elif target == torch.ops.aten.sub.Tensor:
-                emit(FRSub)
+                sm.emit(FRSub)
             elif target == torch.ops.aten.div.Tensor:
-                emit(FRDiv)
+                sm.emit(FRDiv)
             
-            # 3. Post-op: Handle result
+            # 3. Handle Result
             is_ext_out = node in partitioner.graph_outputs or any(u not in node_set for u in node.users)
-            uses_in_sub = [u for u in node.users if u in nodes[i+1:]]
             
-            # If used by next node only, and NOT an external output, keep on stack.
-            # Otherwise, Store it.
-            keep_on_stack = len(uses_in_sub) == 1 and i+1 < len(nodes) and nodes[i+1] in uses_in_sub and not is_ext_out
+            # Update virtual stack
+            num_stack_ops = 0
+            for a in node_args:
+                if isinstance(a, (Node, int, float)):
+                    num_stack_ops += 1
+            for _ in range(num_stack_ops):
+                sm.stack.pop()
+            sm.stack.append(node)
             
-            if is_ext_out or len(uses_in_sub) > 1:
-                if keep_on_stack:
-                    emit(Dup)
-                    emit(StoreGlobalF32, 16 * 0 + tensor_map[node])
-                    stack.append(node)
-                else:
-                    emit(StoreGlobalF32, 16 * 0 + tensor_map[node])
-                    # No longer on stack (Store pops)
-            elif keep_on_stack:
-                stack.append(node)
-            else:
-                # Not used or used multiple times but not next (should be handled by Store above)
-                # If not stored and not kept, we pop it to keep stack clean if it's dead.
-                # In functional graphs, this shouldn't really happen for intermediates unless they are unused.
-                if not uses_in_sub and not is_ext_out:
-                    emit(Pop)
+            sm.post_op(node, is_ext_out)
 
-        emit(Halt)
+        sm.emit(Halt)
         
         # Calculate numel
         numel = 0
@@ -328,7 +518,10 @@ class GintCompiler:
             for _ in range(len(global_nodes))
         ]
             
-        return GintCompiledSubgraph(bytecode, tensor_infos, len(inputs))
+        from ..host.debug import dump_bytecode
+        dump_bytecode(bytecode, f"tmp/sg.gint")
+        return GintCompiledSubgraph(bytecode, tensor_infos, len([n for n in global_nodes if n not in node_set]))
+
 
     def _execute_gint_subgraph(self, sg_id: int, nodes: List[Node], compiled: GintCompiledSubgraph, node_results: Dict[Node, torch.Tensor]):
         node_set = set(nodes)
