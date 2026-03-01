@@ -122,8 +122,10 @@ def rmsnorm(x: TensorInterface, y: TensorInterface, w: TensorInterface, REGW: in
         dup()  # r, x[c:c+32], x[c:c+32]
         fma()  # r + x**2
     warp_allreduce_fsum()
+    # compute mean from sum, add epsilon and take reciprocal sqrt
     fmaimm(1 / H, 1e-5)
     frsqrt()
+    # RMS normalize and apply linear transformation
     for c in range(0, H, WARP):
         dup()  # rstd, rstd
         fldg_bf16(c, x)  # rstd, rstd, x[c:c+32]
