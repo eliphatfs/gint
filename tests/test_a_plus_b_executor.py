@@ -2,7 +2,7 @@ import numpy
 import torch
 import unittest
 from gint.kernel.interpreter.main import REG_WIDTH
-from gint.host.executor import BaseExecutableProgram, ProgramData, ProgramTensorInfo, TensorInterface
+from gint.host.executor import BaseExecutableProgram, ProgramData, ProgramTensorInfo, TensorInterface, ThreadIdx, Offset, WidthIdx
 from gint.host.utils import cdiv
 
 
@@ -25,7 +25,9 @@ class BatchAddProgram(BaseExecutableProgram):
         bc.extend([0, 0])  # halt
         return ProgramData(
             numpy.array(bc, dtype=numpy.int32),
-            [ProgramTensorInfo(4, arg.strides[1], C, [arg.strides[0]], [B], [0]) for arg in (a, b, c)]
+            [ProgramTensorInfo(4, arg.strides[1], arg.strides[0], arg.strides[1], b2w_size=cdiv(B, self.REGW), constraints=[
+                Offset + ThreadIdx < C, WidthIdx < B
+            ]) for arg in (a, b, c)]
         )
 
 

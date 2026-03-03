@@ -20,7 +20,7 @@ from .instructions.special import *
 
 MAX_STACK = 8
 REG_WIDTH = 4
-SMEM_PER_WARP = 8 * 4 * (2 + 5)
+SMEM_PER_WARP = 8 * (4 * (2 + 5) + 6)
 
 
 INSNS: dict[type[Instruction], int] = {

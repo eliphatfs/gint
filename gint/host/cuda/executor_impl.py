@@ -68,21 +68,51 @@ class CudaExecutor(BaseExecutor):
             ti = HTensorInfo.from_address(int(hinfo))
             
             for i, t in enumerate(pd.input_infos):
-                rev_bs = t.block_strides[::-1]
-                rev_bsz = t.block_sizes[::-1]
-                rev_btofss = t.block_thread_offset_strides[::-1]
+                ti.elm_size[i] = t.elm_size
+                rev_bs = t.b_strides[::-1]
+                rev_bsz = t.b_sizes[::-1]
+                assert len(rev_bs) == len(rev_bsz) <= 4, "At most 4 block axes supported!"
                 for j in range(4):
                     if j < len(rev_bsz):
-                        ti.b_stride[i][j] = rev_bs[j]
-                        ti.b_size[i][j] = rev_bsz[j]
-                        ti.bt_ofs_stride[i][j] = rev_btofss[j]
+                        ti.b_strides[i][j] = rev_bs[j]
+                        ti.b_sizes[i][j] = rev_bsz[j]
                     else:
-                        ti.b_stride[i][j] = 0
-                        ti.b_size[i][j] = 1
-                        ti.bt_ofs_stride[i][j] = 0
-                ti.t_stride[i] = t.thread_stride
-                ti.t_size[i] = t.thread_size
-                ti.elm_size[i] = t.elm_size
+                        ti.b_strides[i][j] = 0
+                        ti.b_sizes[i][j] = 1
+                ti.b2t_stride[i] = t.b2t_stride
+                ti.b2t_size[i] = t.b2t_size
+                ti.b2w_stride[i] = t.b2w_stride
+                ti.b2w_size[i] = t.b2w_size
+                ti.t_stride[i] = t.t_stride
+                ti.w_stride[i] = t.w_stride
+                ti.o_stride[i] = t.o_stride
+                if len(t.constraints) > 0:
+                    ti.c1_size[i] = t.constraints[0].size
+                    ti.c1_ww[i] = t.constraints[0].term.wt_width
+                    ti.c1_wt[i] = t.constraints[0].term.wt_thread
+                    ti.c1_wo[i] = t.constraints[0].term.wt_offset
+                    assert 0 <= t.constraints[0].term.wt_width <= 255
+                    assert 0 <= t.constraints[0].term.wt_thread <= 255
+                    assert 0 <= t.constraints[0].term.wt_offset <= 255
+                else:
+                    ti.c1_size[i] = 1
+                    ti.c1_ww[i] = 0
+                    ti.c1_wt[i] = 0
+                    ti.c1_wo[i] = 0
+                if len(t.constraints) > 1:
+                    ti.c2_size[i] = t.constraints[1].size
+                    ti.c2_ww[i] = t.constraints[1].term.wt_width
+                    ti.c2_wt[i] = t.constraints[1].term.wt_thread
+                    ti.c2_wo[i] = t.constraints[1].term.wt_offset
+                    assert 0 <= t.constraints[1].term.wt_width <= 255
+                    assert 0 <= t.constraints[1].term.wt_thread <= 255
+                    assert 0 <= t.constraints[1].term.wt_offset <= 255
+                else:
+                    ti.c2_size[i] = 1
+                    ti.c2_ww[i] = 0
+                    ti.c2_wt[i] = 0
+                    ti.c2_wo[i] = 0
+                assert len(t.constraints) <= 2, "At most 2 constraints supported!"
         
         dcode, dinfo, ti, nargs = cacheline
         if len(args) != nargs:

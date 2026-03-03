@@ -1,22 +1,59 @@
 import sys
 import numpy
-from dataclasses import dataclass
 from collections.abc import Hashable
+from dataclasses import dataclass, field
 from typing import Any, Union, Optional, Sequence
 
 from ..kernel.interpreter.main import REG_WIDTH
 
 
+class ConstraintTerm(object):
+    def __init__(self, wt_thread, wt_offset, wt_width):
+        self.wt_thread = wt_thread
+        self.wt_offset = wt_offset
+        self.wt_width = wt_width
+
+    def __add__(self, other: "ConstraintTerm"):
+        return ConstraintTerm(self.wt_thread + other.wt_thread, self.wt_offset + other.wt_offset, self.wt_width + other.wt_width)
+
+    def __mul__(self, other: int):
+        return ConstraintTerm(self.wt_thread * other, self.wt_offset * other, self.wt_width * other)
+
+    def __lt__(self, other: int):
+        return Constraint(self, other)
+
+    def __le__(self, other: int):
+        return Constraint(self, other + 1)
+
+
+class Constraint(object):
+    def __init__(self, term: ConstraintTerm, size: int):
+        self.term = term
+        self.size = size
+
+
+ThreadIdx = ConstraintTerm(1, 0, 0)
+WidthIdx = ConstraintTerm(0, 0, 1)
+Offset = ConstraintTerm(0, 1, 0)
+
+
 @dataclass
 class ProgramTensorInfo:
     elm_size: int
+
+    t_stride: int
+    w_stride: int
+    o_stride: int
+
+    b_strides: list[int] = field(default_factory=list)
+    b_sizes: list[int] = field(default_factory=list)
     
-    thread_stride: int
-    thread_size: int
-    
-    block_strides: list[int]
-    block_sizes: list[int]
-    block_thread_offset_strides: list[int]
+    b2t_stride: int = 0
+    b2t_size: int = 1
+    b2w_stride: int = REG_WIDTH
+    b2w_size: int = 1
+
+    constraints: list[Constraint] = field(default_factory=list)
 
 
 @dataclass

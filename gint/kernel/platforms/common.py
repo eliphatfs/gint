@@ -59,3 +59,4 @@ bf16 = BFloat16Type()
 void = ir.VoidType()
 
 p_i8 = i8.as_pointer()
+MAX_N_TENSORS = 8
