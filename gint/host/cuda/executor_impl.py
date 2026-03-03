@@ -88,30 +88,30 @@ class CudaExecutor(BaseExecutor):
                 ti.o_stride[i] = t.o_stride
                 if len(t.constraints) > 0:
                     ti.c1_size[i] = t.constraints[0].size
-                    ti.c1_ww[i] = t.constraints[0].term.wt_width
-                    ti.c1_wt[i] = t.constraints[0].term.wt_thread
-                    ti.c1_wo[i] = t.constraints[0].term.wt_offset
+                    ti.c1_w[i][0] = t.constraints[0].term.wt_width
+                    ti.c1_w[i][1] = t.constraints[0].term.wt_thread
+                    ti.c1_w[i][2] = t.constraints[0].term.wt_offset
                     assert 0 <= t.constraints[0].term.wt_width <= 65535
                     assert 0 <= t.constraints[0].term.wt_thread <= 65535
                     assert 0 <= t.constraints[0].term.wt_offset <= 65535
                 else:
                     ti.c1_size[i] = 1
-                    ti.c1_ww[i] = 0
-                    ti.c1_wt[i] = 0
-                    ti.c1_wo[i] = 0
+                    ti.c1_w[i][0] = 0
+                    ti.c1_w[i][1] = 0
+                    ti.c1_w[i][2] = 0
                 if len(t.constraints) > 1:
                     ti.c2_size[i] = t.constraints[1].size
-                    ti.c2_ww[i] = t.constraints[1].term.wt_width
-                    ti.c2_wt[i] = t.constraints[1].term.wt_thread
-                    ti.c2_wo[i] = t.constraints[1].term.wt_offset
+                    ti.c2_w[i][0] = t.constraints[1].term.wt_width
+                    ti.c2_w[i][1] = t.constraints[1].term.wt_thread
+                    ti.c2_w[i][2] = t.constraints[1].term.wt_offset
                     assert 0 <= t.constraints[1].term.wt_width <= 65535
                     assert 0 <= t.constraints[1].term.wt_thread <= 65535
                     assert 0 <= t.constraints[1].term.wt_offset <= 65535
                 else:
                     ti.c2_size[i] = 1
-                    ti.c2_ww[i] = 0
-                    ti.c2_wt[i] = 0
-                    ti.c2_wo[i] = 0
+                    ti.c2_w[i][0] = 0
+                    ti.c2_w[i][1] = 0
+                    ti.c2_w[i][2] = 0
                 assert len(t.constraints) <= 2, "At most 2 constraints supported!"
         
         dcode, dinfo, ti, nargs = cacheline

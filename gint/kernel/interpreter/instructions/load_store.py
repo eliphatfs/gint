@@ -44,8 +44,10 @@ class _LoadStoreGlobalBase(DefaultControlOperandInstruction):
         
         (t_stride, w_stride, o_stride,
          c1_size, c2_size,
-         c1_ww, c1_wt, c1_wo, c2_ww, c2_wt, c2_wo
-        ) = [LL.load(LL.gep(smem_base, [i32(0), i32(eid), load_i], inbounds=True)) for eid in range(1, 12)]
+         c1_w, c2_w
+        ) = [LL.load(LL.gep(smem_base, [i32(0), i32(eid), load_i], inbounds=True)) for eid in range(1, 8)]
+        c1_ww, c1_wt, c1_wo = LL.extract_element(c1_w, i32(0)), LL.extract_element(c1_w, i32(1)), LL.extract_element(c1_w, i32(2))
+        c2_ww, c2_wt, c2_wo = LL.extract_element(c2_w, i32(0)), LL.extract_element(c2_w, i32(1)), LL.extract_element(c2_w, i32(2))
         c1_ww, c1_wt, c1_wo, c2_ww, c2_wt, c2_wo = [LL.zext(x, i32) for x in [c1_ww, c1_wt, c1_wo, c2_ww, c2_wt, c2_wo]]
         tid = LL.lane_id()
         init_offset = LL.add(LL.mul(offset, o_stride), LL.mul(tid, t_stride))
@@ -147,8 +149,10 @@ class _LoadStoreGlobalIndirectBase(DefaultControlOperandInstruction):
 
         (t_stride, w_stride, o_stride,
          c1_size, c2_size,
-         c1_ww, c1_wt, c1_wo, c2_ww, c2_wt, c2_wo
-        ) = [LL.load(LL.gep(smem_base, [i32(0), i32(eid), load_i], inbounds=True)) for eid in range(1, 12)]
+         c1_w, c2_w
+        ) = [LL.load(LL.gep(smem_base, [i32(0), i32(eid), load_i], inbounds=True)) for eid in range(1, 8)]
+        c1_ww, c1_wt, c1_wo = LL.extract_element(c1_w, i32(0)), LL.extract_element(c1_w, i32(1)), LL.extract_element(c1_w, i32(2))
+        c2_ww, c2_wt, c2_wo = LL.extract_element(c2_w, i32(0)), LL.extract_element(c2_w, i32(1)), LL.extract_element(c2_w, i32(2))
         c1_ww, c1_wt, c1_wo, c2_ww, c2_wt, c2_wo = [LL.zext(x, i32) for x in [c1_ww, c1_wt, c1_wo, c2_ww, c2_wt, c2_wo]]
         tid = LL.lane_id()
         init_offset = LL.add(LL.mul(offset, o_stride), LL.mul(tid, t_stride))
