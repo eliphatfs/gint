@@ -12,12 +12,12 @@ BlockTensorInfo = ir.LiteralStructType([
 
     ir.ArrayType(i32, MAX_N_TENSORS),  # constraint 1 size
     ir.ArrayType(i32, MAX_N_TENSORS),  # constraint 2 size
-    ir.ArrayType(i8, MAX_N_TENSORS),  # constraint 1 width weight
-    ir.ArrayType(i8, MAX_N_TENSORS),  # constraint 1 thread weight
-    ir.ArrayType(i8, MAX_N_TENSORS),  # constraint 1 offset weight
-    ir.ArrayType(i8, MAX_N_TENSORS),  # constraint 2 width weight
-    ir.ArrayType(i8, MAX_N_TENSORS),  # constraint 2 thread weight
-    ir.ArrayType(i8, MAX_N_TENSORS),  # constraint 2 offset weight
+    ir.ArrayType(i16, MAX_N_TENSORS),  # constraint 1 width weight
+    ir.ArrayType(i16, MAX_N_TENSORS),  # constraint 1 thread weight
+    ir.ArrayType(i16, MAX_N_TENSORS),  # constraint 1 offset weight
+    ir.ArrayType(i16, MAX_N_TENSORS),  # constraint 2 width weight
+    ir.ArrayType(i16, MAX_N_TENSORS),  # constraint 2 thread weight
+    ir.ArrayType(i16, MAX_N_TENSORS),  # constraint 2 offset weight
 ])
 
 

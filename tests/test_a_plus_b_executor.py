@@ -52,7 +52,11 @@ class VectorAddProgram(BaseExecutableProgram):
         
         return ProgramData(
             numpy.array(bc, dtype=numpy.int32),
-            [ProgramTensorInfo(4, arg.strides[0], C, [arg.strides[0] * block], [cdiv(C, block)], [block]) for arg in (a, b, c)]
+            [ProgramTensorInfo(
+                4, arg.strides[0], arg.strides[0] * block, arg.strides[0],
+                b2w_size=cdiv(cdiv(C, block), self.REGW),
+                constraints=[ThreadIdx + Offset + WidthIdx * block < C]
+            ) for arg in (a, b, c)]
         )
 
 
@@ -76,7 +80,7 @@ class TestInterpretAPB(unittest.TestCase):
             torch.manual_seed(42)
             a = torch.randn(s, device='cuda', dtype=torch.float32)
             b = torch.randn(s, device='cuda', dtype=torch.float32)
-            c = torch.empty(s, device='cuda', dtype=torch.float32)
+            c = torch.zeros(s, device='cuda', dtype=torch.float32)
             vector_add_prog(a, b, c, grid_dim=cdiv(cdiv(s, 256), REG_WIDTH))
             c_ref = a + b
             torch.testing.assert_close(c, c_ref)

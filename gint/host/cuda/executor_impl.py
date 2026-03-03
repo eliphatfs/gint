@@ -91,9 +91,9 @@ class CudaExecutor(BaseExecutor):
                     ti.c1_ww[i] = t.constraints[0].term.wt_width
                     ti.c1_wt[i] = t.constraints[0].term.wt_thread
                     ti.c1_wo[i] = t.constraints[0].term.wt_offset
-                    assert 0 <= t.constraints[0].term.wt_width <= 255
-                    assert 0 <= t.constraints[0].term.wt_thread <= 255
-                    assert 0 <= t.constraints[0].term.wt_offset <= 255
+                    assert 0 <= t.constraints[0].term.wt_width <= 65535
+                    assert 0 <= t.constraints[0].term.wt_thread <= 65535
+                    assert 0 <= t.constraints[0].term.wt_offset <= 65535
                 else:
                     ti.c1_size[i] = 1
                     ti.c1_ww[i] = 0
@@ -104,9 +104,9 @@ class CudaExecutor(BaseExecutor):
                     ti.c2_ww[i] = t.constraints[1].term.wt_width
                     ti.c2_wt[i] = t.constraints[1].term.wt_thread
                     ti.c2_wo[i] = t.constraints[1].term.wt_offset
-                    assert 0 <= t.constraints[1].term.wt_width <= 255
-                    assert 0 <= t.constraints[1].term.wt_thread <= 255
-                    assert 0 <= t.constraints[1].term.wt_offset <= 255
+                    assert 0 <= t.constraints[1].term.wt_width <= 65535
+                    assert 0 <= t.constraints[1].term.wt_thread <= 65535
+                    assert 0 <= t.constraints[1].term.wt_offset <= 65535
                 else:
                     ti.c2_size[i] = 1
                     ti.c2_ww[i] = 0

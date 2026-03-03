@@ -50,6 +50,7 @@ BFloat16Type._create_instance()
 
 i1 = ir.IntType(1)  # bool
 i8 = ir.IntType(8)
+i16 = ir.IntType(16)
 i32 = ir.IntType(32)
 i64 = ir.IntType(64)
 f16 = ir.HalfType()

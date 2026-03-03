@@ -2,7 +2,7 @@ import numpy
 import functools
 from contextvars import ContextVar
 from typing import Optional, Sequence
-from .executor import TensorInterface
+from .executor import TensorInterface, WidthIdx, ThreadIdx, Offset
 from ..kernel.interpreter.main import *
 
 

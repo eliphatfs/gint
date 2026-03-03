@@ -19,12 +19,12 @@ TensorInfo = ir.LiteralStructType([
 
     ir.ArrayType(i32, MAX_N_TENSORS),  # constraint 1 size
     ir.ArrayType(i32, MAX_N_TENSORS),  # constraint 2 size
-    ir.ArrayType(i8, MAX_N_TENSORS),  # constraint 1 width weight
-    ir.ArrayType(i8, MAX_N_TENSORS),  # constraint 1 thread weight
-    ir.ArrayType(i8, MAX_N_TENSORS),  # constraint 1 offset weight
-    ir.ArrayType(i8, MAX_N_TENSORS),  # constraint 2 width weight
-    ir.ArrayType(i8, MAX_N_TENSORS),  # constraint 2 thread weight
-    ir.ArrayType(i8, MAX_N_TENSORS),  # constraint 2 offset weight
+    ir.ArrayType(i16, MAX_N_TENSORS),  # constraint 1 width weight
+    ir.ArrayType(i16, MAX_N_TENSORS),  # constraint 1 thread weight
+    ir.ArrayType(i16, MAX_N_TENSORS),  # constraint 1 offset weight
+    ir.ArrayType(i16, MAX_N_TENSORS),  # constraint 2 width weight
+    ir.ArrayType(i16, MAX_N_TENSORS),  # constraint 2 thread weight
+    ir.ArrayType(i16, MAX_N_TENSORS),  # constraint 2 offset weight
 ])
 
 
@@ -45,10 +45,10 @@ class HTensorInfo(ctypes.Structure):
 
         ("c1_size", ctypes.c_int32 * MAX_N_TENSORS),
         ("c2_size", ctypes.c_int32 * MAX_N_TENSORS),
-        ("c1_ww", ctypes.c_uint8 * MAX_N_TENSORS),
-        ("c1_wt", ctypes.c_uint8 * MAX_N_TENSORS),
-        ("c1_wo", ctypes.c_uint8 * MAX_N_TENSORS),
-        ("c2_ww", ctypes.c_uint8 * MAX_N_TENSORS),
-        ("c2_wt", ctypes.c_uint8 * MAX_N_TENSORS),
-        ("c2_wo", ctypes.c_uint8 * MAX_N_TENSORS),
+        ("c1_ww", ctypes.c_uint16 * MAX_N_TENSORS),
+        ("c1_wt", ctypes.c_uint16 * MAX_N_TENSORS),
+        ("c1_wo", ctypes.c_uint16 * MAX_N_TENSORS),
+        ("c2_ww", ctypes.c_uint16 * MAX_N_TENSORS),
+        ("c2_wt", ctypes.c_uint16 * MAX_N_TENSORS),
+        ("c2_wo", ctypes.c_uint16 * MAX_N_TENSORS),
     ]

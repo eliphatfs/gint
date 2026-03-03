@@ -135,8 +135,12 @@ def rmsnorm(x: TensorInterface, y: TensorInterface, w: TensorInterface, REGW: in
         fstg_bf16(c, y)  # rstd
     halt()
     return (
-        [ProgramTensorInfo(2, a.strides[-1], H, list(a.strides[:3]), [B, NH, T], [0, 0, 0]) for a in (x, y)]
-        + [ProgramTensorInfo(2, w.strides[-1], H, [0, 0, 0], [B, NH, T], [0, 0, 0])]
+        [ProgramTensorInfo(
+            2, a.strides[-1], a.strides[-2], a.strides[-1], list(a.strides[:2]), [B, NH], b2w_size=cdiv(T, REGW), constraints=[WidthIdx < T, ThreadIdx + Offset < H]
+        ) for a in (x, y)]
+        + [ProgramTensorInfo(
+            2, w.strides[-1], 0, w.strides[-1], [0, 0], [B, NH], b2w_size=cdiv(T, REGW), constraints=[WidthIdx < T, ThreadIdx + Offset < H]
+        )]
     )
 
 
