@@ -1,3 +1,4 @@
+from types import NotImplementedType
 from ..state import StackMachineState
 from ...platforms.platform import PlatformIRBuilder
 from ..instruction import DefaultControlOperandInstruction
@@ -32,6 +33,15 @@ class _LoadStoreGlobalBase(DefaultControlOperandInstruction):
         else:
             raise ValueError("Unsupported mode (need load or store)", self.mode)
 
+    def init_block(self, LL: PlatformIRBuilder, state: StackMachineState, load_i: ir.Value, smem_base: ir.Value):
+        raise NotImplementedError
+
+    def init_ptr_cond_state(self, LL: PlatformIRBuilder, state: StackMachineState, base_ptr: ir.Value, block: ir.Value, offset: ir.Value):
+        raise NotImplementedError
+
+    def advance_ptr_cond_state(self, LL: PlatformIRBuilder, state: StackMachineState, base_ptr: ir.Value, block: ir.Value, w: int, wstate: ir.Value):
+        raise NotImplementedError
+
     def emit(self, LL: PlatformIRBuilder, state: StackMachineState):
         operand = self.op
         load_i = LL.and_(operand, i32(0xf))
@@ -41,164 +51,168 @@ class _LoadStoreGlobalBase(DefaultControlOperandInstruction):
         base_ptr = LL.load(LL.gep(smem_base, [i32(0), i32(0), load_i], inbounds=True))
         base_ptr = LL.bitcast(base_ptr, self.source_dtype.as_pointer())
         offset = LL.lshr(operand, i32(4))
+
+        block = self.init_block(LL, state, load_i, smem_base)
+        base_ptr, cond_b, wstate = self.init_ptr_cond_state(LL, state, base_ptr, block, offset)
         
-        (t_stride, w_stride, o_stride,
-         c1_size, c2_size,
-         c1_w, c2_w
-        ) = [LL.load(LL.gep(smem_base, [i32(0), i32(eid), load_i], inbounds=True)) for eid in range(1, 8)]
-        c1_ww, c1_wt, c1_wo = LL.extract_element(c1_w, i32(0)), LL.extract_element(c1_w, i32(1)), LL.extract_element(c1_w, i32(2))
-        c2_ww, c2_wt, c2_wo = LL.extract_element(c2_w, i32(0)), LL.extract_element(c2_w, i32(1)), LL.extract_element(c2_w, i32(2))
-        c1_ww, c1_wt, c1_wo, c2_ww, c2_wt, c2_wo = [LL.zext(x, i32) for x in [c1_ww, c1_wt, c1_wo, c2_ww, c2_wt, c2_wo]]
-        tid = LL.lane_id()
-        init_offset = LL.add(LL.mul(offset, o_stride), LL.mul(tid, t_stride))
-        c1_cur = LL.add(LL.mul(offset, c1_wo), LL.mul(tid, c1_wt))
-        c2_cur = LL.add(LL.mul(offset, c2_wo), LL.mul(tid, c2_wt))
-        
-        base_ptr = LL.gep(base_ptr, [init_offset], inbounds=True)
-        fs = []
         spx = state.peek() if self.mode == 'store' else ([None] * state.reg_width)
-        for i in range(0, state.reg_width):
+        fs = []
+        for w in range(state.reg_width):
             before_cond = LL.block
-            cond_b = LL.and_(
-                LL.icmp_signed('<', c1_cur, c1_size),
-                LL.icmp_signed('<', c2_cur, c2_size)
-            )
             with LL.if_then(cond_b, likely=True):
-                # with LL.if_then(LL.icmp_signed('>', LL.logical_program_idx(), i32(49998))):
-                #     LL.printf("[b=%d t=%d w=%d] %d %d %d %d %d\n", LL.logical_program_idx(), tid, i32(i), c1_cur, c1_size, c2_cur, c2_size, LL.zext(cond_b, i32))
                 if_block = LL.block
-                load_val = self.load_store(LL, base_ptr, spx[i])
+                load_val = self.load_store(LL, base_ptr, spx[w])
             if self.mode == 'load':
                 # this dominates the final block
                 f = LL.phi(f32)
                 f.add_incoming(self.oob_value, before_cond)
                 f.add_incoming(load_val, if_block)
                 fs.append(f)
-            if i < state.reg_width - 1:
-                c1_cur = LL.add(c1_cur, c1_ww)
-                c2_cur = LL.add(c2_cur, c2_ww)
-                base_ptr = LL.gep(base_ptr, [w_stride], inbounds=True)
+            if w < state.reg_width - 1:
+                base_ptr, cond_b, wstate = self.advance_ptr_cond_state(LL, state, base_ptr, block, w, wstate)
         if self.mode == 'load':
             state.push(fs)
         else:
             state.pop()
 
 
-class LoadGlobalF32(_LoadStoreGlobalBase):
+class _LoadStoreGlobalBase1D(_LoadStoreGlobalBase):
+
+    def init_block(self, LL: PlatformIRBuilder, state: StackMachineState, load_i: ir.Value, smem_base: ir.Value):
+        (block_1) = [
+            LL.load(LL.gep(smem_base, [i32(0), i32(eid), load_i], inbounds=True))
+            for eid in [1]
+        ]
+        block_shape, block_stride = LL.extract_element(block_1, i32(0)), LL.extract_element(block_1, i32(1))
+        return block_shape, block_stride
+
+    def init_ptr_cond_state(self, LL: PlatformIRBuilder, state: StackMachineState, base_ptr: ir.Value, block: ir.Value, offset: ir.Value):
+        block_shape, block_stride = block
+        t = LL.lane_id()
+        init_offset_total = LL.add(t, offset)
+        base_ptr = LL.gep(base_ptr, [LL.mul(init_offset_total, block_stride)], inbounds=True)
+        return base_ptr, LL.icmp_signed('<', init_offset_total, block_shape), (init_offset_total, LL.mul(block_stride, LL.warp_size()))
+
+    def advance_ptr_cond_state(self, LL: PlatformIRBuilder, state: StackMachineState, base_ptr: ir.Value, block: ir.Value, w: int, wstate: ir.Value):
+        block_shape, _ = block
+        offset, w_stride = wstate
+        base_ptr = LL.gep(base_ptr, [w_stride], inbounds=True)
+        offset = LL.add(offset, LL.warp_size())
+        return base_ptr, LL.icmp_signed('<', offset, block_shape), (offset, w_stride)
+
+
+class _LoadStoreGlobalBase2DT(_LoadStoreGlobalBase):
+
+    def init_block(self, LL: PlatformIRBuilder, state: StackMachineState, load_i: ir.Value, smem_base: ir.Value):
+        (block_1, block_2, adv_offset) = [
+            LL.load(LL.gep(smem_base, [i32(0), i32(eid), load_i], inbounds=True))
+            for eid in [1, 2, 3]
+        ]
+        block_shape_1, block_stride_1 = LL.extract_element(block_1, i32(0)), LL.extract_element(block_1, i32(1))
+        block_shape_2, block_stride_2 = LL.extract_element(block_2, i32(0)), LL.extract_element(block_2, i32(1))
+        return block_shape_1, block_stride_1, block_shape_2, block_stride_2, adv_offset
+
+    def offsets_t_w(self, LL: PlatformIRBuilder, offset: ir.Value, adv_offset: ir.Value):
+        t = LL.lane_id()
+        offset_t = LL.add(t, offset)
+        init_offset_w = adv_offset
+        return offset_t, init_offset_w
+
+    def init_ptr_cond_state(self, LL: PlatformIRBuilder, state: StackMachineState, base_ptr: ir.Value, block: ir.Value, offset: ir.Value):
+        block_shape_1, block_stride_1, block_shape_2, block_stride_2, adv_offset = block
+        offset_t, init_offset_w = self.offsets_t_w(LL, offset, adv_offset)
+        base_ptr = LL.gep(
+            base_ptr,
+            [LL.add(
+                LL.mul(offset_t, block_stride_1),
+                LL.mul(init_offset_w, block_stride_2)
+            )], inbounds=True
+        )
+        t_cond = LL.icmp_signed('<', offset_t, block_shape_1)
+        return (
+            base_ptr,
+            LL.and_(
+                t_cond,
+                LL.icmp_signed('<', init_offset_w, block_shape_2)
+            ),
+            (t_cond, init_offset_w)
+        )
+
+    def advance_ptr_cond_state(self, LL: PlatformIRBuilder, state: StackMachineState, base_ptr: ir.Value, block: ir.Value, w: int, wstate: ir.Value):
+        block_shape_1, block_stride_1, block_shape_2, block_stride_2, adv_offset = block
+        t_cond, offset_w = wstate
+        base_ptr = LL.gep(base_ptr, [block_stride_2], inbounds=True)
+        offset_w = LL.add(offset_w, i32(1))
+        return (
+            base_ptr,
+            LL.and_(t_cond, LL.icmp_signed('<', offset_w, block_shape_2)),
+            (t_cond, offset_w)
+        )
+
+
+class _LoadStoreGlobalBase2DW(_LoadStoreGlobalBase):
+    def offsets_t_w(self, LL: PlatformIRBuilder, offset: ir.Value, adv_offset: ir.Value):
+        t = LL.lane_id()
+        offset_t = LL.add(t, adv_offset)
+        init_offset_w = offset
+        return offset_t, init_offset_w
+
+
+class LoadGlobal1DF32(_LoadStoreGlobalBase1D):
     source_dtype = f32
     mode = 'load'
 
 
-class StoreGlobalF32(_LoadStoreGlobalBase):
+class StoreGlobal1DF32(_LoadStoreGlobalBase1D):
     source_dtype = f32
     mode = 'store'
 
 
-class LoadGlobalF16(_LoadStoreGlobalBase):
+class LoadGlobal1DF16(_LoadStoreGlobalBase1D):
     source_dtype = f16
     mode = 'load'
 
 
-class StoreGlobalF16(_LoadStoreGlobalBase):
+class StoreGlobal1DF16(_LoadStoreGlobalBase1D):
     source_dtype = f16
     mode = 'store'
 
 
-class LoadGlobalBF16(_LoadStoreGlobalBase):
+class LoadGlobal1DBF16(_LoadStoreGlobalBase1D):
     source_dtype = bf16
     mode = 'load'
 
 
-class StoreGlobalBF16(_LoadStoreGlobalBase):
+class StoreGlobal1DBF16(_LoadStoreGlobalBase1D):
     source_dtype = bf16
     mode = 'store'
 
 
-class LoadGlobalU8(_LoadStoreGlobalBase):
+class LoadGlobal1DU8(_LoadStoreGlobalBase1D):
     source_dtype = i8
     mode = 'load'
 
 
-class _LoadStoreGlobalIndirectBase(DefaultControlOperandInstruction):
-    source_dtype: ir.Type = void
-    oob_value: ir.Constant = f32(0.0)
-    mode: str = None
+class _LoadStoreGlobalIndirect1D(_LoadStoreGlobalBase1D):
 
-    def load_store(self, LL: PlatformIRBuilder, ptr, store_reg):
-        if self.mode == 'load':
-            if self.source_dtype == f32:
-                return LL.load(ptr)
-            raise TypeError("Unsupported type for indirect load", self.source_dtype)
-        elif self.mode == 'store':
-            if self.source_dtype == f32:
-                LL.store(store_reg, ptr)
-            else:
-                raise TypeError("Unsupported type for indirect store", self.source_dtype)
-        else:
-            raise ValueError("Unsupported mode", self.mode)
-
-    def emit(self, LL: PlatformIRBuilder, state: StackMachineState):
-        operand = self.op
-        load_i = LL.and_(operand, i32(0xf))
-        
-        smem_base = state.smem_base
-        smem_base = LL.bitcast(smem_base, BlockTensorInfo.as_pointer(LL.smem_addrspace()))
-        base_ptr = LL.load(LL.gep(smem_base, [i32(0), i32(0), load_i], inbounds=True))
-        base_ptr = LL.bitcast(base_ptr, self.source_dtype.as_pointer())
-        offset = LL.lshr(operand, i32(4))
-
-        (t_stride, w_stride, o_stride,
-         c1_size, c2_size,
-         c1_w, c2_w
-        ) = [LL.load(LL.gep(smem_base, [i32(0), i32(eid), load_i], inbounds=True)) for eid in range(1, 8)]
-        c1_ww, c1_wt, c1_wo = LL.extract_element(c1_w, i32(0)), LL.extract_element(c1_w, i32(1)), LL.extract_element(c1_w, i32(2))
-        c2_ww, c2_wt, c2_wo = LL.extract_element(c2_w, i32(0)), LL.extract_element(c2_w, i32(1)), LL.extract_element(c2_w, i32(2))
-        c1_ww, c1_wt, c1_wo, c2_ww, c2_wt, c2_wo = [LL.zext(x, i32) for x in [c1_ww, c1_wt, c1_wo, c2_ww, c2_wt, c2_wo]]
-        tid = LL.lane_id()
-        init_offset = LL.add(LL.mul(offset, o_stride), LL.mul(tid, t_stride))
-        c1_cur = LL.add(LL.mul(offset, c1_wo), LL.mul(tid, c1_wt))
-        c2_cur = LL.add(LL.mul(offset, c2_wo), LL.mul(tid, c2_wt))
-        
-        base_ptr = LL.gep(base_ptr, [init_offset], inbounds=True)
-        fs = []
-
-        indices_f32 = state.peek(0)
-        spx = state.peek(1) if self.mode == 'store' else ([None] * state.reg_width)
+    def init_ptr_cond_state(self, LL: PlatformIRBuilder, state: StackMachineState, base_ptr: ir.Value, block: ir.Value, offset: ir.Value):
+        indices_f32 = state.peek()
         state.pop()
-        if self.mode == 'store':
-            state.pop()
+        return self.advance_ptr_cond_state(LL, state, base_ptr, block, 0, (base_ptr, indices_f32))
 
-        indices_i32 = [LL.bitcast(idx, i32) for idx in indices_f32]
-        for i in range(0, state.reg_width):
-            before_cond = LL.block
-            cond_b = LL.and_(
-                LL.icmp_signed('<', LL.add(c1_cur, LL.mul(indices_i32[i], c1_wo)), c1_size),
-                LL.icmp_signed('<', LL.add(c2_cur, LL.mul(indices_i32[i], c2_wo)), c2_size)
-            )
-            with LL.if_then(cond_b, likely=True):
-                if_block = LL.block
-                ptr = LL.gep(base_ptr, [LL.mul(indices_i32[i], o_stride)], inbounds=True)
-                load_val = self.load_store(LL, ptr, spx[i])
-            if self.mode == 'load':
-                # this dominates the final block
-                f = LL.phi(f32)
-                f.add_incoming(self.oob_value, before_cond)
-                f.add_incoming(load_val, if_block)
-                fs.append(f)
-            if i < state.reg_width - 1:
-                c1_cur = LL.add(c1_cur, c1_ww)
-                c2_cur = LL.add(c2_cur, c2_ww)
-                base_ptr = LL.gep(base_ptr, [w_stride], inbounds=True)
-        if self.mode == 'load':
-            state.push(fs)
+    def advance_ptr_cond_state(self, LL: PlatformIRBuilder, state: StackMachineState, base_ptr: ir.Value, block: ir.Value, w: int, wstate: ir.Value):
+        block_shape, block_stride = block
+        base_ptr, indices_f32 = wstate
+        offset = LL.bitcast(indices_f32[w], i32)
+        ptr = LL.gep(base_ptr, [LL.mul(offset, block_stride)], inbounds=True)
+        return ptr, LL.icmp_signed('<', offset, block_shape), (base_ptr, indices_f32)
 
 
-
-class LoadGlobalF32Indirect(_LoadStoreGlobalIndirectBase):
+class LoadGlobal1DF32Indirect(_LoadStoreGlobalIndirect1D):
     source_dtype = f32
     mode = 'load'
 
 
-class StoreGlobalF32Indirect(_LoadStoreGlobalIndirectBase):
+class StoreGlobal1DF32Indirect(_LoadStoreGlobalIndirect1D):
     source_dtype = f32
     mode = 'store'
