@@ -204,7 +204,7 @@ class StackManager:
         return self.stack.pop()
 
     def handle_operand(self, arg: Union[Node, int, float]):
-        from ..kernel.interpreter.main import LoadGlobalF32, LoadImm, Swap, Dup, DupX1, DupX2
+        from ..kernel.interpreter.main import LoadGlobal1DF32, LoadImm, Swap, Dup, DupX1, DupX2
         
         if not isinstance(arg, Node):
             val = np.float32(arg).view(np.int32).item()
@@ -223,7 +223,7 @@ class StackManager:
                     self.stack.append(arg)
             elif depth == 1:
                 if arg in self.tensor_map:
-                    self.emit(LoadGlobalF32, (0 << 16) | self.tensor_map[arg])
+                    self.emit(LoadGlobal1DF32, (0 << 16) | self.tensor_map[arg])
                     self.stack.append(arg)
                 else:
                     self.emit(Swap)
@@ -243,19 +243,19 @@ class StackManager:
                         self.stack.append(v1) # arg
             else:
                 if arg in self.tensor_map:
-                    self.emit(LoadGlobalF32, (0 << 16) | self.tensor_map[arg])
+                    self.emit(LoadGlobal1DF32, (0 << 16) | self.tensor_map[arg])
                     self.stack.append(arg)
                 else:
                     raise RuntimeError(f"Node {arg.name} buried at depth {depth} and no global entry")
         else:
             if arg in self.tensor_map:
-                self.emit(LoadGlobalF32, (0 << 16) | self.tensor_map[arg])
+                self.emit(LoadGlobal1DF32, (0 << 16) | self.tensor_map[arg])
                 self.stack.append(arg)
             else:
                 raise RuntimeError(f"Node {arg.name} not on stack and no global entry")
 
     def post_op(self, node: Node, is_ext_out: bool):
-        from ..kernel.interpreter.main import StoreGlobalF32, Dup, Pop
+        from ..kernel.interpreter.main import StoreGlobal1DF32, Dup, Pop
         
         uses = self.node_uses_left.get(node, 0)
         in_global = node in self.tensor_map
@@ -265,11 +265,11 @@ class StackManager:
             if uses > 0:
                 # Need to keep it on stack for future internal uses
                 self.emit(Dup)
-                self.emit(StoreGlobalF32, (0 << 16) | self.tensor_map[node])
+                self.emit(StoreGlobal1DF32, (0 << 16) | self.tensor_map[node])
             else:
                 # Last use (or only external output), just store it
-                self.emit(StoreGlobalF32, (0 << 16) | self.tensor_map[node])
-                self.stack.pop() # Popped by StoreGlobalF32
+                self.emit(StoreGlobal1DF32, (0 << 16) | self.tensor_map[node])
+                self.stack.pop() # Popped by StoreGlobal1DF32
         elif uses > 0:
             # Stays on stack for consumers, not stored
             pass
@@ -514,7 +514,15 @@ class GintCompiler:
         num_blocks = (numel + 31) // 32
         
         tensor_infos = [
-            ProgramTensorInfo(4, 1, numel, [32], [num_blocks], [32])
+            ProgramTensorInfo(
+                elm_size=4,
+                batch_strides=[],
+                batch_shape=[],
+                block_shape_stride_1=[numel, 1],
+                block_shape_stride_2=[1, 0],
+                block_grid_dims=[1, 1],
+                block_grid_steps=[32, 1]
+            )
             for _ in range(len(global_nodes))
         ]
             

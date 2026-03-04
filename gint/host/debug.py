@@ -2,9 +2,14 @@ import numpy as np
 from typing import List, Dict, Any
 from ..kernel.interpreter.main import (
     INSNS, Halt, LoadImm, FAddImm, FMulImm, FMAImm, 
-    LoadGlobalF32, StoreGlobalF32, LoadGlobalF16, StoreGlobalF16,
-    LoadGlobalBF16, StoreGlobalBF16, LoadGlobalU8, FApprox,
-    LoadImm4F, LoadImm4I
+    LoadGlobal1DF32, StoreGlobal1DF32, LoadGlobal1DF16, StoreGlobal1DF16,
+    LoadGlobal1DBF16, StoreGlobal1DBF16, LoadGlobal1DU8, FApprox,
+    LoadImm4F, LoadImm4I,
+    LoadGlobal2DTF32, StoreGlobal2DTF32, LoadGlobal2DTF16, StoreGlobal2DTF16,
+    LoadGlobal2DTBF16, StoreGlobal2DTBF16, LoadGlobal2DTU8,
+    LoadGlobal2DWF32, StoreGlobal2DWF32, LoadGlobal2DWF16, StoreGlobal2DWF16,
+    LoadGlobal2DWBF16, StoreGlobal2DWBF16, LoadGlobal2DWU8,
+    AdvanceBlock2D, AdvanceBase
 )
 
 def pprint_bytecode(bc: List[List[int]]) -> str:
@@ -19,10 +24,19 @@ def pprint_bytecode(bc: List[List[int]]) -> str:
     # Define instructions with special argument decoding
     float_imms = {INSNS[LoadImm], INSNS[FAddImm], INSNS[FMulImm], INSNS[FApprox]}
     global_io = {
-        INSNS[LoadGlobalF32], INSNS[StoreGlobalF32], 
-        INSNS[LoadGlobalF16], INSNS[StoreGlobalF16],
-        INSNS[LoadGlobalBF16], INSNS[StoreGlobalBF16],
-        INSNS[LoadGlobalU8]
+        INSNS[LoadGlobal1DF32], INSNS[StoreGlobal1DF32], 
+        INSNS[LoadGlobal1DF16], INSNS[StoreGlobal1DF16],
+        INSNS[LoadGlobal1DBF16], INSNS[StoreGlobal1DBF16],
+        INSNS[LoadGlobal1DU8],
+        INSNS[LoadGlobal2DTF32], INSNS[StoreGlobal2DTF32],
+        INSNS[LoadGlobal2DTF16], INSNS[StoreGlobal2DTF16],
+        INSNS[LoadGlobal2DTBF16], INSNS[StoreGlobal2DTBF16],
+        INSNS[LoadGlobal2DTU8],
+        INSNS[LoadGlobal2DWF32], INSNS[StoreGlobal2DWF32],
+        INSNS[LoadGlobal2DWF16], INSNS[StoreGlobal2DWF16],
+        INSNS[LoadGlobal2DWBF16], INSNS[StoreGlobal2DWBF16],
+        INSNS[LoadGlobal2DWU8],
+        INSNS[AdvanceBlock2D], INSNS[AdvanceBase]
     }
     fma_imm = INSNS[FMAImm]
     packed_imm = {INSNS[LoadImm4F], INSNS[LoadImm4I]}
