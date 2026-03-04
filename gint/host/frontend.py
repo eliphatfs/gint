@@ -2,7 +2,7 @@ import numpy
 import functools
 from contextvars import ContextVar
 from typing import Optional, Sequence
-from .executor import TensorInterface, WidthIdx, ThreadIdx, Offset
+from .executor import TensorInterface
 from ..kernel.interpreter.main import *
 
 
@@ -99,32 +99,32 @@ def fmaimm(mul: float, add: float):
     return [FMAImm, numpy.array([mul, add], dtype=numpy.float16).view(numpy.int32).item()]
 
 @_bc
-def fldg(offset, arg_i):
-    return [LoadGlobalF32, 16 * offset + arg_i]
+def fldg_1d(offset, arg_i):
+    return [LoadGlobal1DF32, 16 * offset + arg_i]
 
 @_bc
-def fldg_f16(offset, arg_i):
-    return [LoadGlobalF16, 16 * offset + arg_i]
+def fldg_1d_f16(offset, arg_i):
+    return [LoadGlobal1DF16, 16 * offset + arg_i]
 
 @_bc
-def fldg_bf16(offset, arg_i):
-    return [LoadGlobalBF16, 16 * offset + arg_i]
+def fldg_1d_bf16(offset, arg_i):
+    return [LoadGlobal1DBF16, 16 * offset + arg_i]
 
 @_bc
-def fldg_u8(offset, arg_i):
-    return [LoadGlobalU8, 16 * offset + arg_i]
+def fldg_1d_u8(offset, arg_i):
+    return [LoadGlobal1DU8, 16 * offset + arg_i]
 
 @_bc
-def fstg(offset, arg_i):
-    return [StoreGlobalF32, 16 * offset + arg_i]
+def fstg_1d(offset, arg_i):
+    return [StoreGlobal1DF32, 16 * offset + arg_i]
 
 @_bc
-def fstg_f16(offset, arg_i):
-    return [StoreGlobalF16, 16 * offset + arg_i]
+def fstg_1d_f16(offset, arg_i):
+    return [StoreGlobal1DF16, 16 * offset + arg_i]
 
 @_bc
-def fstg_bf16(offset, arg_i):
-    return [StoreGlobalBF16, 16 * offset + arg_i]
+def fstg_1d_bf16(offset, arg_i):
+    return [StoreGlobal1DBF16, 16 * offset + arg_i]
 
 @_bc
 def pop():
@@ -299,12 +299,12 @@ def ixor():
     return [IXor, 0]
 
 @_bc
-def fldg_ind(arg_i):
-    return [LoadGlobalF32Indirect, arg_i]
+def fldg_1d_ind(arg_i):
+    return [LoadGlobal1DF32Indirect, arg_i]
 
 @_bc
-def fstg_ind(arg_i):
-    return [StoreGlobalF32Indirect, arg_i]
+def fstg_1d_ind(arg_i):
+    return [StoreGlobal1DF32Indirect, arg_i]
 
 @_bc
 def fpush4(packed_val: int):
@@ -317,3 +317,67 @@ def ipush4(packed_val: int):
 @_bc
 def swap():
     return [Swap, 0]
+
+@_bc
+def fldg_2dt(offset, arg_i):
+    return [LoadGlobal2DTF32, 16 * offset + arg_i]
+
+@_bc
+def fldg_2dt_f16(offset, arg_i):
+    return [LoadGlobal2DTF16, 16 * offset + arg_i]
+
+@_bc
+def fldg_2dt_bf16(offset, arg_i):
+    return [LoadGlobal2DTBF16, 16 * offset + arg_i]
+
+@_bc
+def fldg_2dt_u8(offset, arg_i):
+    return [LoadGlobal2DTU8, 16 * offset + arg_i]
+
+@_bc
+def fstg_2dt(offset, arg_i):
+    return [StoreGlobal2DTF32, 16 * offset + arg_i]
+
+@_bc
+def fstg_2dt_f16(offset, arg_i):
+    return [StoreGlobal2DTF16, 16 * offset + arg_i]
+
+@_bc
+def fstg_2dt_bf16(offset, arg_i):
+    return [StoreGlobal2DTBF16, 16 * offset + arg_i]
+
+@_bc
+def fldg_2dw(offset, arg_i):
+    return [LoadGlobal2DWF32, 16 * offset + arg_i]
+
+@_bc
+def fldg_2dw_f16(offset, arg_i):
+    return [LoadGlobal2DWF16, 16 * offset + arg_i]
+
+@_bc
+def fldg_2dw_bf16(offset, arg_i):
+    return [LoadGlobal2DWBF16, 16 * offset + arg_i]
+
+@_bc
+def fldg_2dw_u8(offset, arg_i):
+    return [LoadGlobal2DWU8, 16 * offset + arg_i]
+
+@_bc
+def fstg_2dw(offset, arg_i):
+    return [StoreGlobal2DWF32, 16 * offset + arg_i]
+
+@_bc
+def fstg_2dw_f16(offset, arg_i):
+    return [StoreGlobal2DWF16, 16 * offset + arg_i]
+
+@_bc
+def fstg_2dw_bf16(offset, arg_i):
+    return [StoreGlobal2DWBF16, 16 * offset + arg_i]
+
+@_bc
+def adv_block_2d(offset, arg_i):
+    return [AdvanceBlock2D, 16 * offset + arg_i]
+
+@_bc
+def adv_base(offset, arg_i):
+    return [AdvanceBase, 16 * offset + arg_i]

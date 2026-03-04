@@ -79,7 +79,7 @@ class _LoadStoreGlobalBase(DefaultControlOperandInstruction):
 class _LoadStoreGlobalBase1D(_LoadStoreGlobalBase):
 
     def init_block(self, LL: PlatformIRBuilder, state: StackMachineState, load_i: ir.Value, smem_base: ir.Value):
-        (block_1) = [
+        (block_1,) = [
             LL.load(LL.gep(smem_base, [i32(0), i32(eid), load_i], inbounds=True))
             for eid in [1]
         ]
@@ -150,12 +150,82 @@ class _LoadStoreGlobalBase2DT(_LoadStoreGlobalBase):
         )
 
 
-class _LoadStoreGlobalBase2DW(_LoadStoreGlobalBase):
+class _LoadStoreGlobalBase2DW(_LoadStoreGlobalBase2DT):
     def offsets_t_w(self, LL: PlatformIRBuilder, offset: ir.Value, adv_offset: ir.Value):
         t = LL.lane_id()
         offset_t = LL.add(t, adv_offset)
         init_offset_w = offset
         return offset_t, init_offset_w
+
+
+class LoadGlobal2DTF32(_LoadStoreGlobalBase2DT):
+    source_dtype = f32
+    mode = 'load'
+
+
+class StoreGlobal2DTF32(_LoadStoreGlobalBase2DT):
+    source_dtype = f32
+    mode = 'store'
+
+
+class LoadGlobal2DTF16(_LoadStoreGlobalBase2DT):
+    source_dtype = f16
+    mode = 'load'
+
+
+class StoreGlobal2DTF16(_LoadStoreGlobalBase2DT):
+    source_dtype = f16
+    mode = 'store'
+
+
+class LoadGlobal2DTBF16(_LoadStoreGlobalBase2DT):
+    source_dtype = bf16
+    mode = 'load'
+
+
+class StoreGlobal2DTBF16(_LoadStoreGlobalBase2DT):
+    source_dtype = bf16
+    mode = 'store'
+
+
+class LoadGlobal2DTU8(_LoadStoreGlobalBase2DT):
+    source_dtype = i8
+    mode = 'load'
+
+
+class LoadGlobal2DWF32(_LoadStoreGlobalBase2DW):
+    source_dtype = f32
+    mode = 'load'
+
+
+class StoreGlobal2DWF32(_LoadStoreGlobalBase2DW):
+    source_dtype = f32
+    mode = 'store'
+
+
+class LoadGlobal2DWF16(_LoadStoreGlobalBase2DW):
+    source_dtype = f16
+    mode = 'load'
+
+
+class StoreGlobal2DWF16(_LoadStoreGlobalBase2DW):
+    source_dtype = f16
+    mode = 'store'
+
+
+class LoadGlobal2DWBF16(_LoadStoreGlobalBase2DW):
+    source_dtype = bf16
+    mode = 'load'
+
+
+class StoreGlobal2DWBF16(_LoadStoreGlobalBase2DW):
+    source_dtype = bf16
+    mode = 'store'
+
+
+class LoadGlobal2DWU8(_LoadStoreGlobalBase2DW):
+    source_dtype = i8
+    mode = 'load'
 
 
 class LoadGlobal1DF32(_LoadStoreGlobalBase1D):
@@ -216,3 +286,36 @@ class LoadGlobal1DF32Indirect(_LoadStoreGlobalIndirect1D):
 class StoreGlobal1DF32Indirect(_LoadStoreGlobalIndirect1D):
     source_dtype = f32
     mode = 'store'
+
+
+class AdvanceBlock2D(DefaultControlOperandInstruction):
+    def emit(self, LL: PlatformIRBuilder, state: StackMachineState):
+        operand = self.op
+        load_i = LL.and_(operand, i32(0xf))
+        offset = LL.ashr(operand, i32(4))
+        
+        smem_base = state.smem_base
+        smem_base = LL.bitcast(smem_base, BlockTensorInfo.as_pointer(LL.smem_addrspace()))
+        
+        with LL.if_then(LL.icmp_signed('==', LL.lane_id(), i32(0))):
+            adv_offset_ptr = LL.gep(smem_base, [i32(0), i32(3), load_i], inbounds=True)
+            old_val = LL.load(adv_offset_ptr)
+            LL.store(LL.add(old_val, offset), adv_offset_ptr)
+        LL.warp_sync()
+
+
+class AdvanceBase(DefaultControlOperandInstruction):
+    def emit(self, LL: PlatformIRBuilder, state: StackMachineState):
+        operand = self.op
+        load_i = LL.and_(operand, i32(0xf))
+        offset = LL.ashr(operand, i32(4))
+        
+        smem_base = state.smem_base
+        smem_base = LL.bitcast(smem_base, BlockTensorInfo.as_pointer(LL.smem_addrspace()))
+        
+        with LL.if_then(LL.icmp_signed('==', LL.lane_id(), i32(0))):
+            base_ptr_ptr = LL.gep(smem_base, [i32(0), i32(0), load_i], inbounds=True)
+            old_val = LL.load(base_ptr_ptr)
+            # Offset is in bytes
+            LL.store(LL.gep(old_val, [offset], inbounds=True), base_ptr_ptr)
+        LL.warp_sync()

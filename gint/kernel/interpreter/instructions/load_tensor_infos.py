@@ -16,7 +16,7 @@ def emit_load_tensor_infos(LL: PlatformIRBuilder, state: StackMachineState):
     with LL.if_then(LL.icmp_signed('<', lane_id, LL.arg(2))):
         (base_ptr, elm_size, batch_strides, batch_shape, block_s1, block_s2, block_dims, block_steps)  = [
             LL.load(LL.gep(LL.arg(1), [i32(0), i32(eid), lane_id], inbounds=True))
-            for eid in range(7)
+            for eid in range(8)
         ]
         bidx = LL.logical_program_idx()
         rbidx = bidx
