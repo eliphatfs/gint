@@ -10,7 +10,7 @@ class CachePolicyCallable(Protocol):
 
 
 class SugarCallable(Protocol):
-    def __call__(self, *args: TensorInterface, REGW: int, WARP: int, **extra_kwargs) -> list[ProgramTensorInfo]: ...
+    def __call__(self, *args: TensorInterface, REGW: int, WARP: int, **extra_kwargs) -> None: ...
 
 
 class SugarDeviceCallable(Protocol):
@@ -41,8 +41,22 @@ def _bytecode(func: SugarCallable, cache_policy: CachePolicyCallable) -> SugarDe
     def sugar_wrapper(*args, REGW: int, WARP: int, **extra_kwargs):
         token = _frontend_state.set(FrontendState(args))
         try:
-            tis = func(*args, REGW=REGW, WARP=WARP, **extra_kwargs)
+            func(*args, REGW=REGW, WARP=WARP, **extra_kwargs)
             f = _frontend_state.get()
+            
+            # TODO: We may track and relax the 1-1 requirements in the future.
+            tis = []
+            for arg in args:
+                ti = f.tis.get(id(arg))
+                if ti is None:
+                    raise ValueError(f"Argument {arg} does not have exactly one ProgramTensorInfo (found 0)")
+                tis.append(ti)
+            
+            # Check for extra TIs not associated with any argument (though our current @_ti only works with args)
+            if len(f.tis) != len(args):
+                # This check might be a bit simplistic if multiple args share same TI, but it's a start.
+                pass
+
             return f.bc, tis
         finally:
             _frontend_state.reset(token)

@@ -2,7 +2,7 @@ import numpy
 import functools
 from contextvars import ContextVar
 from typing import Optional, Sequence
-from .executor import TensorInterface
+from .executor import TensorInterface, ProgramTensorInfo
 from ..kernel.interpreter.main import *
 
 
@@ -10,6 +10,7 @@ class FrontendState(object):
     
     def __init__(self, fn_args: Sequence[TensorInterface]) -> None:
         self.bc: list[list[int]] = []
+        self.tis: dict[int, ProgramTensorInfo] = {}
         self.fn_args = fn_args
         self.fn_args_map = {id(x): i for i, x in enumerate(fn_args)}
 
@@ -33,6 +34,51 @@ def _bc(func):
             return result
 
     return _api_wrapper
+
+
+def _ti(func):
+    @functools.wraps(func)
+    def _api_wrapper(*args, **kwargs):
+        f = _frontend_state.get()
+        if f is None:
+            return func(*args, **kwargs)
+        else:
+            # args[0] is the TensorInterface (or its id)
+            arg = args[0]
+            if not isinstance(arg, int):
+                arg = id(arg)
+            result = func(*args, **kwargs)
+            f.tis[arg] = result
+            return result
+
+    return _api_wrapper
+
+
+@_ti
+def make_block_1d(t: TensorInterface, block_shape: int) -> ProgramTensorInfo:
+    return ProgramTensorInfo(
+        elm_size=t.elm_size,
+        batch_strides=list(t.strides[:-1]),
+        batch_shape=list(t.shape[:-1]),
+        block_shape_stride_1=[t.shape[-1], t.strides[-1]],
+        # dummy for 2D fields
+        block_shape_stride_2=[1, 0],
+        block_grid_dims=[1, 1],
+        block_grid_steps=[block_shape, 1]
+    )
+
+
+@_ti
+def make_block_2d(t: TensorInterface, block_shape_1: int, block_shape_2: int) -> ProgramTensorInfo:
+    return ProgramTensorInfo(
+        elm_size=t.elm_size,
+        batch_strides=list(t.strides[:-2]),
+        batch_shape=list(t.shape[:-2]),
+        block_shape_stride_1=[t.shape[-2], t.strides[-2]],
+        block_shape_stride_2=[t.shape[-1], t.strides[-1]],
+        block_grid_dims=[1, 1],
+        block_grid_steps=[block_shape_1, block_shape_2]
+    )
 
 
 @_bc

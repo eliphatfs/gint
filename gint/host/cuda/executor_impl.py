@@ -69,50 +69,32 @@ class CudaExecutor(BaseExecutor):
             
             for i, t in enumerate(pd.input_infos):
                 ti.elm_size[i] = t.elm_size
-                rev_bs = t.b_strides[::-1]
-                rev_bsz = t.b_sizes[::-1]
+                rev_bs = t.batch_strides[::-1]
+                rev_bsz = t.batch_shape[::-1]
                 assert len(rev_bs) == len(rev_bsz) <= 4, "At most 4 block axes supported!"
+                
+                # Batch strides and shape (up to 4)
                 for j in range(4):
                     if j < len(rev_bsz):
-                        ti.b_strides[i][j] = rev_bs[j]
-                        ti.b_sizes[i][j] = rev_bsz[j]
+                        ti.batch_strides[i][j] = rev_bs[j]
+                        ti.batch_shape[i][j] = rev_bsz[j]
                     else:
-                        ti.b_strides[i][j] = 0
-                        ti.b_sizes[i][j] = 1
-                ti.b2t_stride[i] = t.b2t_stride
-                ti.b2t_size[i] = t.b2t_size
-                ti.b2w_stride[i] = t.b2w_stride
-                ti.b2w_size[i] = t.b2w_size
-                ti.t_stride[i] = t.t_stride
-                ti.w_stride[i] = t.w_stride
-                ti.o_stride[i] = t.o_stride
-                if len(t.constraints) > 0:
-                    ti.c1_size[i] = t.constraints[0].size
-                    ti.c1_w[i][0] = t.constraints[0].term.wt_width
-                    ti.c1_w[i][1] = t.constraints[0].term.wt_thread
-                    ti.c1_w[i][2] = t.constraints[0].term.wt_offset
-                    assert 0 <= t.constraints[0].term.wt_width <= 65535
-                    assert 0 <= t.constraints[0].term.wt_thread <= 65535
-                    assert 0 <= t.constraints[0].term.wt_offset <= 65535
-                else:
-                    ti.c1_size[i] = 1
-                    ti.c1_w[i][0] = 0
-                    ti.c1_w[i][1] = 0
-                    ti.c1_w[i][2] = 0
-                if len(t.constraints) > 1:
-                    ti.c2_size[i] = t.constraints[1].size
-                    ti.c2_w[i][0] = t.constraints[1].term.wt_width
-                    ti.c2_w[i][1] = t.constraints[1].term.wt_thread
-                    ti.c2_w[i][2] = t.constraints[1].term.wt_offset
-                    assert 0 <= t.constraints[1].term.wt_width <= 65535
-                    assert 0 <= t.constraints[1].term.wt_thread <= 65535
-                    assert 0 <= t.constraints[1].term.wt_offset <= 65535
-                else:
-                    ti.c2_size[i] = 1
-                    ti.c2_w[i][0] = 0
-                    ti.c2_w[i][1] = 0
-                    ti.c2_w[i][2] = 0
-                assert len(t.constraints) <= 2, "At most 2 constraints supported!"
+                        ti.batch_strides[i][j] = 0
+                        ti.batch_shape[i][j] = 1
+                
+                # Block shape and strides
+                ti.block_shape_stride_1[i][0] = t.block_shape_stride_1[0]
+                ti.block_shape_stride_1[i][1] = t.block_shape_stride_1[1]
+                
+                ti.block_shape_stride_2[i][0] = t.block_shape_stride_2[0]
+                ti.block_shape_stride_2[i][1] = t.block_shape_stride_2[1]
+                
+                # Block grid dims and steps
+                ti.block_grid_dims[i][0] = t.block_grid_dims[0]
+                ti.block_grid_dims[i][1] = t.block_grid_dims[1]
+                
+                ti.block_grid_steps[i][0] = t.block_grid_steps[0]
+                ti.block_grid_steps[i][1] = t.block_grid_steps[1]
         
         dcode, dinfo, ti, nargs = cacheline
         if len(args) != nargs:

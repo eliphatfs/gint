@@ -19,7 +19,6 @@ class ProgramTensorInfo:
     block_grid_dims: list[int]
     block_grid_steps: list[int]
 
-
 @dataclass
 class ProgramData:
     program: numpy.ndarray[numpy.int32]
