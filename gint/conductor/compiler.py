@@ -511,7 +511,7 @@ class GintCompiler:
             numel = some_node.meta['tensor_meta'].shape.numel()
         
         if numel == 0: numel = 1
-        num_blocks = (numel + 31) // 32
+        num_blocks = (numel + 127) // 128
         
         tensor_infos = [
             ProgramTensorInfo(
@@ -520,8 +520,8 @@ class GintCompiler:
                 batch_shape=[],
                 block_shape_stride_1=[numel, 1],
                 block_shape_stride_2=[1, 0],
-                block_grid_dims=[1, 1],
-                block_grid_steps=[32, 1]
+                block_grid_dims=[num_blocks, 1],
+                block_grid_steps=[128, 1]
             )
             for _ in range(len(global_nodes))
         ]
@@ -555,7 +555,7 @@ class GintCompiler:
         all_args = [all_args_map[n] for n in global_nodes]
         
         numel = all_args[0].numel() if all_args else 1
-        grid_dim = ((numel + 31) // 32 + REG_WIDTH - 1) // REG_WIDTH
+        grid_dim = (numel + 127) // 128
         
         compiled(*all_args, grid_dim=grid_dim, cuda_stream=torch.cuda.current_stream().cuda_stream)
 
