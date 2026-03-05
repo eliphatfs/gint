@@ -14,6 +14,7 @@ class FrontendState(object):
         self.tis_arg_ids: list[int] = []
         self.fn_args = fn_args
         self.fn_args_map = {id(x): i for i, x in enumerate(fn_args)}
+        self.tensor_info_map = {}
 
 
 _frontend_state: ContextVar[Optional[FrontendState]] = ContextVar("_frontend_state", default=None)
@@ -26,7 +27,7 @@ def _bc(func):
         if f is None:
             return func(*args)
         else:
-            argmap = f.fn_args_map
+            argmap = f.tensor_info_map
             result = func(
                 *(argmap.get(id(x), x) for x in args)
             )
@@ -49,6 +50,7 @@ def _ti(func):
             if not isinstance(arg, int):
                 arg = id(arg)
             result = func(*args, **kwargs)
+            f.tensor_info_map[id(result)] = len(f.tis)
             f.tis.append(result)
             f.tis_arg_ids.append(f.fn_args_map[arg])
             return result

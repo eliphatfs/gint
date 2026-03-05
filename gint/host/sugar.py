@@ -31,8 +31,8 @@ class SugarProgram(BaseExecutableProgram):
             return super().cache_policy(*args, **extra_kwargs)
     
     def get_program(self, *args: TensorInterface, **extra_kwargs) -> ProgramData:
-        bc, tis = self.func(*args, REGW=self.REGW, WARP=self.executor_warp_size(), **extra_kwargs)
-        return ProgramData(numpy.array(bc, dtype=numpy.int32).reshape(-1), tis)
+        bc, tis, tidx = self.func(*args, REGW=self.REGW, WARP=self.executor_warp_size(), **extra_kwargs)
+        return ProgramData(numpy.array(bc, dtype=numpy.int32).reshape(-1), tis, tidx)
     
 
 def _bytecode(func: SugarCallable, cache_policy: CachePolicyCallable) -> SugarDeviceCallable:
@@ -43,21 +43,7 @@ def _bytecode(func: SugarCallable, cache_policy: CachePolicyCallable) -> SugarDe
         try:
             func(*args, REGW=REGW, WARP=WARP, **extra_kwargs)
             f = _frontend_state.get()
-            
-            # TODO: We may track and relax the 1-1 requirements in the future.
-            tis = []
-            for arg in args:
-                ti = f.tis.get(id(arg))
-                if ti is None:
-                    raise ValueError(f"Argument {arg} does not have exactly one ProgramTensorInfo (found 0)")
-                tis.append(ti)
-            
-            # Check for extra TIs not associated with any argument (though our current @_ti only works with args)
-            if len(f.tis) != len(args):
-                # This check might be a bit simplistic if multiple args share same TI, but it's a start.
-                pass
-
-            return f.bc, tis
+            return f.bc, f.tis, f.tis_arg_ids
         finally:
             _frontend_state.reset(token)
     
