@@ -115,10 +115,24 @@ def rmsnorm(x: TensorInterface, y: TensorInterface, w: TensorInterface, REGW: in
     B, NH, T, H = x.shape
     assert (H,) == tuple(w.shape)
     
+    x_block, y_block = [
+        make_block_2d(
+            a,
+            [H, T], [a.strides[-1], a.strides[-2]], [1, cdiv(T, REGW)], [0, REGW],
+            [a.strides[0], a.strides[1]], [B, NH]
+        )
+        for a in (x, y)
+    ]
+    w_block = make_block_2d(
+        w,
+        [H, T], [w.strides[-1], 0], [1, cdiv(T, REGW)], [0, REGW],
+        [0, 0], [B, NH]  # broadcast from H to B NH T H
+    )
+
     # compute sum of head
     fpush(0.0)  # r
     for c in range(0, H, WARP):
-        fldg_bf16(c, x)  # r, x[c:c+32]
+        fldg_2dt_bf16(c, x_block)  # r, x[c:c+32]
         dup()  # r, x[c:c+32], x[c:c+32]
         fma()  # r + x**2
     warp_allreduce_fsum()
@@ -128,20 +142,12 @@ def rmsnorm(x: TensorInterface, y: TensorInterface, w: TensorInterface, REGW: in
     # RMS normalize and apply linear transformation
     for c in range(0, H, WARP):
         dup()  # rstd, rstd
-        fldg_bf16(c, x)  # rstd, rstd, x[c:c+32]
+        fldg_2dt_bf16(c, x_block)  # rstd, rstd, x[c:c+32]
         fmul()  # rstd, r * x
-        fldg_bf16(c, w)  # rstd, r * x, w
+        fldg_2dt_bf16(c, w_block)  # rstd, r * x, w
         fmul()  # rstd, r * x * w
-        fstg_bf16(c, y)  # rstd
+        fstg_2dt_bf16(c, y_block)  # rstd
     halt()
-    return (
-        [ProgramTensorInfo(
-            2, a.strides[-1], a.strides[-2], a.strides[-1], list(a.strides[:2]), [B, NH], b2w_size=cdiv(T, REGW), constraints=[WidthIdx < T, ThreadIdx + Offset < H]
-        ) for a in (x, y)]
-        + [ProgramTensorInfo(
-            2, w.strides[-1], 0, w.strides[-1], [0, 0], [B, NH], b2w_size=cdiv(T, REGW), constraints=[WidthIdx < T, ThreadIdx + Offset < H]
-        )]
-    )
 
 
 class TestRMSNorm(unittest.TestCase):
