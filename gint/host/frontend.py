@@ -10,7 +10,8 @@ class FrontendState(object):
     
     def __init__(self, fn_args: Sequence[TensorInterface]) -> None:
         self.bc: list[list[int]] = []
-        self.tis: dict[int, ProgramTensorInfo] = {}
+        self.tis: list[ProgramTensorInfo] = []
+        self.tis_arg_ids: list[int] = []
         self.fn_args = fn_args
         self.fn_args_map = {id(x): i for i, x in enumerate(fn_args)}
 
@@ -48,36 +49,53 @@ def _ti(func):
             if not isinstance(arg, int):
                 arg = id(arg)
             result = func(*args, **kwargs)
-            f.tis[arg] = result
+            f.tis.append(result)
+            f.tis_arg_ids.append(f.fn_args_map[arg])
             return result
 
     return _api_wrapper
 
 
 @_ti
-def make_block_1d(t: TensorInterface, block_shape: int) -> ProgramTensorInfo:
+def make_block_1d(
+    t: TensorInterface,
+    block1d_shape: int,
+    block1d_stride: int,
+    block1d_grid_dim: int = 1,
+    block1d_grid_step: int = 0,
+    batch_strides: list[int] = [],
+    batch_shape: list[int] = [],
+) -> ProgramTensorInfo:
     return ProgramTensorInfo(
         elm_size=t.elm_size,
-        batch_strides=list(t.strides[:-1]),
-        batch_shape=list(t.shape[:-1]),
-        block_shape_stride_1=[t.shape[-1], t.strides[-1]],
+        batch_strides=batch_strides,
+        batch_shape=batch_shape,
+        block_shape_stride_1=[block1d_shape, block1d_stride],
         # dummy for 2D fields
         block_shape_stride_2=[1, 0],
-        block_grid_dims=[1, 1],
-        block_grid_steps=[block_shape, 1]
+        block_grid_dims=[block1d_grid_dim, 1],
+        block_grid_steps=[block1d_grid_step, 0]
     )
 
 
 @_ti
-def make_block_2d(t: TensorInterface, block_shape_1: int, block_shape_2: int) -> ProgramTensorInfo:
+def make_block_2d(
+    t: TensorInterface,
+    block2d_shape: list[int],  # in order t, w (32x4)
+    block2d_stride: list[int],
+    block2d_grid_dims: list[int] = [1, 1],
+    block2d_grid_steps: list[int] = [0, 0],
+    batch_strides: list[int] = [],
+    batch_shape: list[int] = [],
+) -> ProgramTensorInfo:
     return ProgramTensorInfo(
         elm_size=t.elm_size,
-        batch_strides=list(t.strides[:-2]),
-        batch_shape=list(t.shape[:-2]),
-        block_shape_stride_1=[t.shape[-2], t.strides[-2]],
-        block_shape_stride_2=[t.shape[-1], t.strides[-1]],
-        block_grid_dims=[1, 1],
-        block_grid_steps=[block_shape_1, block_shape_2]
+        batch_strides=batch_strides,
+        batch_shape=batch_shape,
+        block_shape_stride_1=[block2d_shape[0], block2d_stride[0]],
+        block_shape_stride_2=[block2d_shape[1], block2d_stride[1]],
+        block_grid_dims=block2d_grid_dims,
+        block_grid_steps=block2d_grid_steps
     )
 
 

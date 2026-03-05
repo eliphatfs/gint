@@ -57,6 +57,9 @@ class CudaExecutor(BaseExecutor):
         
         if cacheline is None:
             pd = program.get_program(*args, **extra_kwargs)
+            if pd.input_indices is None:
+                pd.input_indices = list(range(len(pd.input_infos)))
+            assert len(pd.input_indices) == len(pd.input_infos), "Input indices must match input infos"
             _, dcode = check_cuda_error(cuda.cuMemAlloc(len(pd.program) * 4))
             check_cuda_error(cuda.cuMemcpyHtoD(dcode, pd.program, len(pd.program) * 4))
             _, hinfo = check_cuda_error(cuda.cuMemAllocHost(ctypes.sizeof(HTensorInfo)))
@@ -64,7 +67,7 @@ class CudaExecutor(BaseExecutor):
             dctx.deferred(lambda: check_cuda_error(cuda.cuMemFree(dcode)))
             dctx.deferred(lambda: check_cuda_error(cuda.cuMemFree(dinfo)))
             dctx.deferred(lambda: check_cuda_error(cuda.cuMemFreeHost(hinfo)))
-            pcu[pcp] = cacheline = dcode, dinfo, HTensorInfo.from_address(int(hinfo)), len(pd.input_infos)
+            pcu[pcp] = cacheline = dcode, dinfo, HTensorInfo.from_address(int(hinfo)), len(args), pd.input_indices
             ti = HTensorInfo.from_address(int(hinfo))
             
             for i, t in enumerate(pd.input_infos):
@@ -96,12 +99,12 @@ class CudaExecutor(BaseExecutor):
                 ti.block_grid_steps[i][0] = t.block_grid_steps[0]
                 ti.block_grid_steps[i][1] = t.block_grid_steps[1]
         
-        dcode, dinfo, ti, nargs = cacheline
+        dcode, dinfo, ti, nargs, indices = cacheline
         if len(args) != nargs:
-            raise ValueError("Tensor info should match arguments one-one")
+            raise ValueError("Number of arguments don't match the program.")
         
-        for i, t in enumerate(args):
-            ti.base_ptr[i] = t.base_ptr
+        for i, tidx in enumerate(indices):
+            ti.base_ptr[i] = args[tidx].base_ptr
         custream = cuda.CUstream(cuda_stream)
         if check_cuda_error(cuda.cuStreamIsCapturing(custream))[1] == cuda.CUstreamCaptureStatus.CU_STREAM_CAPTURE_STATUS_ACTIVE:
             check_cuda_error(cuda.cuMemcpyHtoD(dinfo, ctypes.addressof(ti), ctypes.sizeof(ti)))

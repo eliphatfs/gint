@@ -2,7 +2,7 @@ import numpy
 import torch
 import unittest
 from gint.kernel.interpreter.main import REG_WIDTH
-from gint.host.executor import BaseExecutableProgram, ProgramData, ProgramTensorInfo, TensorInterface, ThreadIdx, Offset, WidthIdx
+from gint.host.executor import BaseExecutableProgram, ProgramData, ProgramTensorInfo, TensorInterface
 from gint.host.utils import cdiv
 
 
@@ -17,17 +17,18 @@ class BatchAddProgram(BaseExecutableProgram):
         bc = []
         for i in range(0, C, 32):
             bc.extend([
-                15, 16 * i,  # ldg f1 a[i: i + 32]
-                15, 16 * i + 1,  # ldg f1 b[i: i + 32]
+                70, 16 * i,  # ldg2dt f1 a[i: i + 32]
+                70, 16 * i + 1,  # ldg2dt f1 b[i: i + 32]
                 2, 0,  # fadd f0 f1
-                16, 16 * i + 2,  # stg f0 c[i: i + 32]
+                71, 16 * i + 2,  # stg2dt f0 c[i: i + 32]
             ])
         bc.extend([0, 0])  # halt
         return ProgramData(
             numpy.array(bc, dtype=numpy.int32),
-            [ProgramTensorInfo(4, arg.strides[1], arg.strides[0], arg.strides[1], b2w_size=cdiv(B, self.REGW), constraints=[
-                Offset + ThreadIdx < C, WidthIdx < B
-            ]) for arg in (a, b, c)]
+            [ProgramTensorInfo(
+                4, [], [], [C, arg.strides[1]], [B, arg.strides[0]],
+                [1, cdiv(B, self.REGW)], [0, self.REGW]
+            ) for arg in (a, b, c)]
         )
 
 
@@ -41,21 +42,20 @@ class VectorAddProgram(BaseExecutableProgram):
         
         bc = []
         block = 256
-        for i in range(0, block, 32):
+        for i in range(0, block, 32 * self.REGW):
             bc.extend([
-                15, 16 * i,  # ldg f1 a[i: i + 32]
-                15, 16 * i + 1,  # ldg f1 b[i: i + 32]
+                15, 16 * i,  # ldg1d f1 a[i: i + 128]
+                15, 16 * i + 1,  # ldg1d f1 b[i: i + 128]
                 2, 0,  # fadd f0 f1
-                16, 16 * i + 2,  # stg f0 c[i: i + 32]
+                16, 16 * i + 2,  # stg1d f0 c[i: i + 128]
             ])
         bc.extend([0, 0])  # halt
         
         return ProgramData(
             numpy.array(bc, dtype=numpy.int32),
             [ProgramTensorInfo(
-                4, arg.strides[0], arg.strides[0] * block, arg.strides[0],
-                b2w_size=cdiv(cdiv(C, block), self.REGW),
-                constraints=[ThreadIdx + Offset + WidthIdx * block < C]
+                4, [], [], [C, arg.strides[0]], [1, 0],
+                [cdiv(C, block), 1], [block, 0]
             ) for arg in (a, b, c)]
         )
 
@@ -81,7 +81,7 @@ class TestInterpretAPB(unittest.TestCase):
             a = torch.randn(s, device='cuda', dtype=torch.float32)
             b = torch.randn(s, device='cuda', dtype=torch.float32)
             c = torch.zeros(s, device='cuda', dtype=torch.float32)
-            vector_add_prog(a, b, c, grid_dim=cdiv(cdiv(s, 256), REG_WIDTH))
+            vector_add_prog(a, b, c, grid_dim=cdiv(s, 256))
             c_ref = a + b
             torch.testing.assert_close(c, c_ref)
     
@@ -92,5 +92,5 @@ class TestInterpretAPB(unittest.TestCase):
             a = torch.randn(s, dtype=torch.float32).cuda()
             b = torch.randn(s, dtype=torch.float32).cuda()
             c = torch.empty(s, device='cuda', dtype=torch.float32)
-            vector_add_prog(a, b, c, grid_dim=cdiv(cdiv(s, 256), REG_WIDTH))
+            vector_add_prog(a, b, c, grid_dim=cdiv(s, 256))
             _ = a + b

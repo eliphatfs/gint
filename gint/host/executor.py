@@ -23,6 +23,7 @@ class ProgramTensorInfo:
 class ProgramData:
     program: numpy.ndarray[numpy.int32]
     input_infos: list[ProgramTensorInfo]
+    input_indices: Optional[list[int]] = None
 
 
 @dataclass
