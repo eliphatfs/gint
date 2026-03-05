@@ -1,6 +1,6 @@
 from ..state import StackMachineState
 from ...platforms.platform import PlatformIRBuilder
-from ..instruction import DefaultControlInstruction
+from ..instruction import DefaultControlInstruction, DefaultControlOperandInstruction
 from ...platforms.common import *
 
 
@@ -53,3 +53,32 @@ class Swap(DefaultControlInstruction):
         v1 = state.peek()
         v2 = state.peek(1)
         state.pop().pop().push(v1).push(v2)
+
+
+class DupBroadcastW(DefaultControlOperandInstruction):
+
+    def binary_cond_tree(self, LL: PlatformIRBuilder, v: list[ir.Value], low: int, high:int, op: ir.Value):
+        if low >= high - 1:
+            return v[low]
+        mid = (low + high) // 2
+        return LL.select(
+            LL.icmp_signed('<', op, i32(mid)),
+            self.binary_cond_tree(LL, v, low, mid, op),
+            self.binary_cond_tree(LL, v, mid, high, op)
+        )
+    
+    def emit(self, LL: PlatformIRBuilder, state: StackMachineState):
+        v = state.peek()
+        op = self.op
+        state.push([self.binary_cond_tree(LL, v, 0, len(v), op)] * state.reg_width)
+
+
+class DupBroadcastT(DefaultControlOperandInstruction):
+    """
+    Currently disabled because leads to mysterious increase in register per thread
+    """
+
+    def emit(self, LL: PlatformIRBuilder, state: StackMachineState):
+        v = state.peek()
+        op = self.op
+        state.push([LL.warp_broadcast_lane(v[i], op) for i in range(state.reg_width)])

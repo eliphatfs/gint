@@ -110,6 +110,7 @@ INSNS: dict[type[Instruction], int] = {
     LoadGlobal2DWU8: 83,
     AdvanceBlock2D: 84,
     AdvanceBase: 85,
+    DupBroadcastW: 86,
 }
 
 

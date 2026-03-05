@@ -447,3 +447,7 @@ def adv_block_2d(offset, arg_i):
 @_bc
 def adv_base(offset, arg_i):
     return [AdvanceBase, 16 * offset + arg_i]
+
+@_bc
+def dup_broadcast_w(w):
+    return [DupBroadcastW, w]
