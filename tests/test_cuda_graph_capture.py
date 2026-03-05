@@ -11,24 +11,27 @@ def vector_expr2(x: TensorInterface, y: TensorInterface, REGW: int, WARP: int, B
     for arg in (x, y):
         assert arg.typestr == 'f4'
     C, = x.shape
+    xb, yb = [
+        make_block_1d(arg, C, arg.strides[0], cdiv(C, REGW * WARP), BLOCK)
+        for arg in (x, y)
+    ]
     block = BLOCK
-    for i in range(0, block, WARP):
-        fldg(i, x)  # x
+    for i in range(0, block, WARP * REGW):
+        fldg_1d(i, xb)  # x
         dup()  # x, x
         dup()  # x, x, x
         fmaimm(-2.0, 3.0)  # x, x, 3 - 2x
         fmul()  # x, x * (3 - 2x)
         fmul()  # x ** 2 * (3 - 2 * x)
-        fstg(i, y)
+        fstg_1d(i, yb)
     halt()
-    return [ProgramTensorInfo(4, arg.strides[0], C, [arg.strides[0] * block], [cdiv(C, block)], [block]) for arg in (x, y)]
 
 
 def cubic_ease(x: torch.Tensor):
     orig_shape = x.shape
     x = x.view(-1)
     y = torch.empty_like(x)
-    vector_expr2(x, y, grid_dim=cdiv(cdiv(len(x), 256), REG_WIDTH), BLOCK=256, cuda_stream=torch.cuda.current_stream().cuda_stream)
+    vector_expr2(x, y, grid_dim=cdiv(len(x), 256), BLOCK=256, cuda_stream=torch.cuda.current_stream().cuda_stream)
     y_ref = x ** 2 * (3 - 2 * x)
     return y_ref.view(orig_shape), y.view(orig_shape)
 

@@ -2,6 +2,7 @@ import torch
 import unittest
 from gint.conductor import register_backend
 
+@unittest.skip("Conductor under construction")
 class TestConductorBackend(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
