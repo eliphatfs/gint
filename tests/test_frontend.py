@@ -121,10 +121,44 @@ def meaningless_execute_everything(x: TensorInterface, x_f16: TensorInterface, x
     fldg_1d_bf16(0, x_bf16)  # 2
     fstg_1d_bf16(0, x_bf16)  # 1
     fldg_1d_u8(0, x_u8)  # 2
-    faddimm(1.0)
-    fmulimm(1.0)
-    fmaimm(1.0, 1.0)
-    pop2()
+    faddimm(1.0)  # 2
+    fmulimm(1.0)  # 2
+    fmaimm(1.0, 1.0)  # 2
+    # Integer arithmetic
+    fpush(2.0)  # 3
+    fpush(3.0)  # 4
+    iadd()  # 3
+    imul()  # 2
+    fpush(5.0)  # 3
+    isub()  # 2
+    fpush(2.0)  # 3
+    idiv()  # 2
+    fpush(3.0)  # 3
+    irem()  # 2
+    fpush(1.0)  # 3
+    ishl()  # 2
+    fpush(2.0)  # 3
+    ishr()  # 2
+    fpush(7.0)  # 3
+    iand()  # 2
+    fpush(3.0)  # 3
+    ior()  # 2
+    fpush(5.0)  # 3
+    ixor()  # 2
+    # Stack manipulation
+    fpush(1.0)  # 3
+    swap()  # 3 (swaps top two)
+    pop()  # 2
+    pop()  # 1
+    fpush(10.0)  # 2
+    fpush(20.0)  # 3
+    swap()  # 3
+    pop2()  # 1
+    # Test dup_broadcast_w (broadcasts to a specific lane)
+    fpush(1.0)  # 2
+    dup_broadcast_w(0)  # 2 (broadcasts lane 0 to all lanes)
+    pop()  # 1
+    pop()  # 0
     halt()
 
 
