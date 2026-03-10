@@ -103,5 +103,16 @@ class TestInv4x4(unittest.TestCase):
             self._run(a)
 
 
+    def test_profile_inv4x4(self):
+        torch.manual_seed(42)
+        B = 65535
+        a = torch.randn(B, 4, 4, device='cuda', dtype=torch.float32)
+        a = a + 4.0 * torch.eye(4, device='cuda', dtype=torch.float32).unsqueeze(0)
+        c = torch.zeros(B, 16, device='cuda', dtype=torch.float32)
+        for _ in range(2):
+            inv4x4_kernel(a.view(B, 16), c, grid_dim=cdiv(B, 32))
+            torch.linalg.inv(a)
+
+
 if __name__ == '__main__':
     unittest.main()
