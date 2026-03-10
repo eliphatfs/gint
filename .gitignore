@@ -8,3 +8,5 @@ tmp
 .coverage
 *.ncu-rep
 /artifact
+
+gint/host/cuda/gint.fatbin.xz

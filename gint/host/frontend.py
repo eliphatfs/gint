@@ -451,3 +451,15 @@ def adv_base(offset, arg_i):
 @_bc
 def dup_broadcast_w(w):
     return [DupBroadcastW, w]
+
+@_bc
+def fload_reg(n: int):
+    return [LOAD_REGS[n], 0]
+
+@_bc
+def fstore_reg(n: int):
+    return [STORE_REGS[n], 0]
+
+@_bc
+def frcp():
+    return [FRcp, 0]

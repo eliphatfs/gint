@@ -16,8 +16,11 @@ from .instructions.move import *
 from .instructions.predication import *
 from .instructions.reduction import *
 from .instructions.special import *
+from .instructions.reg import *
 
 
+POOL_SIZE = 12   # unified stack+register pool; stack grows up, regs down from top
+NUM_REGS = 8    # reg n = pool[POOL_SIZE-1-n]; effective max stack = POOL_SIZE - NUM_REGS = 4
 MAX_STACK = 8
 REG_WIDTH = 4
 SMEM_PER_WARP = MAX_N_TENSORS * 7 * 4
@@ -111,6 +114,23 @@ INSNS: dict[type[Instruction], int] = {
     AdvanceBlock2D: 84,
     AdvanceBase: 85,
     DupBroadcastW: 86,
+    FLoadReg0: 87,
+    FLoadReg1: 88,
+    FLoadReg2: 89,
+    FLoadReg3: 90,
+    FLoadReg4: 91,
+    FLoadReg5: 92,
+    FLoadReg6: 93,
+    FLoadReg7: 94,
+    FStoreReg0: 95,
+    FStoreReg1: 96,
+    FStoreReg2: 97,
+    FStoreReg3: 98,
+    FStoreReg4: 99,
+    FStoreReg5: 100,
+    FStoreReg6: 101,
+    FStoreReg7: 102,
+    FRcp: 103,
 }
 
 
@@ -132,7 +152,7 @@ def build_main_loop(LL: PlatformIRBuilder):
     for i in range(MAX_STACK + 1):
         dispatch_bbs[i] = LL.append_basic_block("dispatch.%d" % i)
         LL.position_at_end(dispatch_bbs[i])
-        dispatch_states[i] = StackMachineState(LL, smem_base, MAX_STACK, REG_WIDTH, i)
+        dispatch_states[i] = StackMachineState(LL, smem_base, POOL_SIZE, REG_WIDTH, i, NUM_REGS, MAX_STACK)
     undef_bb = LL.append_basic_block("unreachable")
     
     def br_state(state: StackMachineState):
@@ -147,8 +167,8 @@ def build_main_loop(LL: PlatformIRBuilder):
     state = dispatch_states[0].clone()
     state.pc = entry_pc
     state.opcode = entry_opcode
-    for i in range(MAX_STACK):
-        state.stack[i] = [f32(ir.Undefined)] * REG_WIDTH
+    for i in range(POOL_SIZE):
+        state.pool[i] = [f32(ir.Undefined)] * REG_WIDTH
     emit_load_tensor_infos(LL, state)
     br_state(state)
     

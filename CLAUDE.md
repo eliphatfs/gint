@@ -17,20 +17,27 @@ The codebase is split into:
 - Located in `gint/kernel/interpreter/` - written in LLVM IR via `llvmlite`
 - **Micro-architecture**:
   - `REG_WIDTH = 4`: Processes 4 elements simultaneously (ILP - Instruction Level Parallelism)
-  - `MAX_STACK = 8`: Stack-based execution model with 8 stack slots, each holding a vector
+  - `POOL_SIZE = 12`, `NUM_REGS = 8`, `MAX_STACK = 8`: Unified pool of 12 slots — stack grows upward from index 0, virtual registers occupy the top 8 slots counting downward (`reg n = pool[11-n]`). The upper 4 stack slots overlap with the lower 4 registers, so kernels must not simultaneously maximize both stack depth and register usage.
   - Dispatch: Large switch-case in LLVM IR with weights for optimization
-  - Uses PHI nodes for state persistence across instruction dispatches
-- **Instruction set**: Basic arithmetic operations defined in `gint/kernel/interpreter/instructions/`
+  - Uses PHI nodes for state persistence across instruction dispatches (one dispatch block per stack depth 0..MAX_STACK)
+- **Instruction set**: Defined in `gint/kernel/interpreter/instructions/`
+
+### Virtual Register File
+- 8 virtual registers (`reg 0`–`reg 7`) backed by the top 8 slots of the unified pool
+- `FLoadRegN` / `FStoreRegN` (N=0..7): Specialized per-register instructions with **zero select/compare overhead** — each directly aliases `pool[pool_size-1-N]`
+- Generic `FLoadReg` / `FStoreReg` with a runtime operand were replaced by 16 specialized opcodes (87–102) to eliminate register pressure from select chains
+- Frontend: `fload_reg(n)` / `fstore_reg(n)` dispatch to the correct specialized class via `LOAD_REGS[n]` / `STORE_REGS[n]`
 
 ### Host-Side Executor
 - `gint/host/executor.py`: Core program execution interface
 - `gint/host/cuda/executor_impl.py`: NVIDIA-specific implementation (CudaExecutor)
-- Manages kernel PTX loading from `gint/host/cuda/gint.fatbin.xz`
+- Loads kernel from `gint/host/cuda/gint.fatbin.xz` (not tracked in git — must be generated locally via `./generate.sh`)
 
 ### Frontend API
 - `gint/host/frontend.py`: Pythonic bytecode generation
   - `@bytecode` decorator: Intercepts Python calls to record instruction sequences
   - `ProgramTensorInfo`: Encapsulates tensor metadata (strides, shapes, element sizes)
+  - Each instruction emits a 2-word pair `[opcode, operand]`; operand is 0 for instructions that don't use it
 - `gint/host/sugar.py`: Higher-level convenience functions
 
 ### Torch.Compile Integration (Conductor)
@@ -63,7 +70,7 @@ Tests use Python's `unittest` framework (not pytest).
 # - artifact/gint.ptx
 # - artifact/gint.fatbin
 # - artifact/gint.fatbin.xz (compressed, used by runtime)
-# - gint/host/cuda/gint.fatbin.xz (deployed version)
+# - gint/host/cuda/gint.fatbin.xz (deployed version, NOT tracked in git)
 ```
 
 **Manual generation steps** (if needed):
@@ -91,33 +98,44 @@ cp artifact/gint.fatbin.xz gint/host/cuda/gint.fatbin.xz
 - **`TensorInfo` (Device) / `HTensorInfo` (Host)**: Shared struct for tensor metadata (base pointers, strides, shapes)
 - Used for multi-dimensional data access patterns on the device
 
+### Bytecode Instruction Format
+- Each instruction is a 2-word pair `[opcode: i32, operand: i32]` in the bytecode stream
+- PC always advances by 2 after each instruction
+- Instructions with no meaningful operand use `operand = 0`
+- Opcodes defined in `INSNS` dict in `gint/kernel/interpreter/main.py`
+
 ### Kernel Specialization
 - Per-vendor implementations in `gint/kernel/platforms/`
 - Per-OS optimizations may be needed in executor implementations
 
-### Bytecode Instruction Format
-- Instructions compiled from Python-side definitions
-- Mapped through `gint/conductor/op_registry.py` for torch.compile operations
-- Stack machine semantics with vector operations
+### Adding New Instructions
+1. Implement the instruction class in `gint/kernel/interpreter/instructions/` (subclass `DefaultControlInstruction` or `DefaultControlOperandInstruction`)
+2. Add to `INSNS` dict in `gint/kernel/interpreter/main.py` with the next available opcode
+3. Add a frontend function in `gint/host/frontend.py` decorated with `@_bc`
+4. Run `./generate.sh` to regenerate the fatbin
 
 ## Project Layout
 
 ```
 gint/
   host/              # Host-side Python + CUDA bindings
-    cuda/            # NVIDIA-specific (executor_impl, driver, fatbin)
+    cuda/            # NVIDIA-specific (executor_impl, driver)
+                     # gint.fatbin.xz lives here but is NOT in git
     frontend.py      # @bytecode decorator & ProgramTensorInfo
     executor.py      # Base executor interface
     sugar.py         # Convenience APIs
   kernel/            # Device-side LLVM IR code
     interpreter/     # Stack-based VM implementation
-      instructions/  # Instruction definitions
+      instructions/  # Instruction definitions (arith, control, load_store, reg, ...)
+      state.py       # StackMachineState: unified pool + stack/reg properties
+      main.py        # INSNS opcode table, build_main_loop, constants
     platforms/       # Platform-specific code
   conductor/         # torch.compile backend
   scripts/           # gen_llir.py, driver.py
 
 tests/               # unittest modules
 benchmark/           # Performance benchmarks
+artifact/            # Build outputs (not in git)
 ```
 
 ## Installation
