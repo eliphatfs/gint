@@ -99,15 +99,17 @@ def inv4x4_kernel(a: TensorInterface, c: TensorInterface, REGW: int, WARP: int):
     # Extract 2x2 blocks A,B,C,D using VecShuffle_0101 / VecShuffle_2323
     #   A = (r0[0],r0[1],r1[0],r1[1])  B = (r0[2],r0[3],r1[2],r1[3])
     #   C = (r2[0],r2[1],r3[0],r3[1])  D = (r2[2],r2[3],r3[2],r3[3])
-    # Compute B and D first (into reg5/reg6 as temp) so we don't
-    # overwrite rows before both A&B and C&D are extracted.
+    # Compute A on stack then B: store B first (reg1) then A (reg0),
+    # similarly C then D, eliminating the temp-rename moves.
     # ------------------------------------------------------------------
-    fload_reg(0); fload_reg(1); fshuf2(2, 3, 2, 3); fstore_reg(5)   # B -> reg5
-    fload_reg(2); fload_reg(3); fshuf2(2, 3, 2, 3); fstore_reg(6)   # D -> reg6
-    fload_reg(0); fload_reg(1); fshuf2(0, 1, 0, 1); fstore_reg(0)   # A -> reg0
-    fload_reg(2); fload_reg(3); fshuf2(0, 1, 0, 1); fstore_reg(2)   # C -> reg2
-    fload_reg(5); fstore_reg(1)                                       # B -> reg1
-    fload_reg(6); fstore_reg(3)                                       # D -> reg3
+    fload_reg(0); fload_reg(1); fshuf2(0, 1, 0, 1)   # [A]
+    fload_reg(0); fload_reg(1); fshuf2(2, 3, 2, 3)   # [A, B]
+    fstore_reg(1)                                      # reg1 = B
+    fstore_reg(0)                                      # reg0 = A
+    fload_reg(2); fload_reg(3); fshuf2(0, 1, 0, 1)   # [C]
+    fload_reg(2); fload_reg(3); fshuf2(2, 3, 2, 3)   # [C, D]
+    fstore_reg(3)                                      # reg3 = D
+    fstore_reg(2)                                      # reg2 = C
 
     # ------------------------------------------------------------------
     # D_C = adj(D)*C  -> reg5
@@ -121,17 +123,13 @@ def inv4x4_kernel(a: TensorInterface, c: TensorInterface, REGW: int, WARP: int):
     # ------------------------------------------------------------------
 
     # detA * detD  (depth stays <= 4)
-    fload_reg(4); dup_broadcast_w(0)           # [detSub, detA]
-    swap(); pop()                              # [detA]
-    fload_reg(4); dup_broadcast_w(3)           # [detA, detSub, detD]
-    swap(); pop()                              # [detA, detD]
+    fload_reg(4); fperm_w(0, 0, 0, 0)         # [detA]
+    fload_reg(4); fperm_w(3, 3, 3, 3)         # [detA, detD]
     fmul()                                     # [detA*detD]
 
     # detB * detC
-    fload_reg(4); dup_broadcast_w(1)           # [detA*detD, detSub, detB]
-    swap(); pop()                              # [detA*detD, detB]
-    fload_reg(4); dup_broadcast_w(2)           # [detA*detD, detB, detSub, detC]
-    swap(); pop()                              # [detA*detD, detB, detC]
+    fload_reg(4); fperm_w(1, 1, 1, 1)         # [detA*detD, detB]
+    fload_reg(4); fperm_w(2, 2, 2, 2)         # [detA*detD, detB, detC]
     fmul()                                     # [detA*detD, detB*detC]
     fadd()                                     # [term12]
 
@@ -176,14 +174,14 @@ def inv4x4_kernel(a: TensorInterface, c: TensorInterface, REGW: int, WARP: int):
     # --- Pair 1: Z_ then X_ (both use A, B, D_C) ---
     # Z_ = detC*B - Mat2MulAdj(A, D_C)
     _mat2muladj(0, 5)                          # [mat2muladj(A,D_C)]  depth 1
-    fload_reg(4); dup_broadcast_w(2); swap(); pop()   # [mat, detC]   depth 2
+    fload_reg(4); fperm_w(2, 2, 2, 2)         # [mat, detC]          depth 2
     fload_reg(1); fmul()                       # [mat, detC*B]        depth 2
-    fsub()                                     # [Z_] = TOS-second    depth 1
+    fsub()                                     # [Z_]                 depth 1
     fload_reg(7); fmul()                       # [Z_scaled]           depth 1
 
     # X_ = detD*A - Mat2Mul(B, D_C)   (Z_scaled at depth 1, safe peak = 4)
     _mat2mul(1, 5)                             # [Z_, mat2mul(B,D_C)] depth 2
-    fload_reg(4); dup_broadcast_w(3); swap(); pop()   # [Z_, mat, detD] depth 3
+    fload_reg(4); fperm_w(3, 3, 3, 3)         # [Z_, mat, detD]      depth 3
     fload_reg(0); fmul()                       # [Z_, mat, detD*A]    depth 3
     fsub()                                     # [Z_, X_]             depth 2
     fload_reg(7); fmul()                       # [Z_, X_scaled]       depth 2
@@ -193,14 +191,14 @@ def inv4x4_kernel(a: TensorInterface, c: TensorInterface, REGW: int, WARP: int):
     # --- Pair 2: W_ then Y_ (both use C, D, A_B) ---
     # W_ = detA*D - Mat2Mul(C, A_B)
     _mat2mul(2, 6)                             # [mat2mul(C,A_B)]     depth 1
-    fload_reg(4); dup_broadcast_w(0); swap(); pop()   # [mat, detA]   depth 2
+    fload_reg(4); fperm_w(0, 0, 0, 0)         # [mat, detA]          depth 2
     fload_reg(3); fmul()                       # [mat, detA*D]        depth 2
     fsub()                                     # [W_]                 depth 1
     fload_reg(7); fmul()                       # [W_scaled]           depth 1
 
     # Y_ = detB*C - Mat2MulAdj(D, A_B)   (W_scaled at depth 1)
     _mat2muladj(3, 6)                          # [W_, mat2muladj(D,A_B)] depth 2
-    fload_reg(4); dup_broadcast_w(1); swap(); pop()   # [W_, mat, detB] depth 3
+    fload_reg(4); fperm_w(1, 1, 1, 1)         # [W_, mat, detB]      depth 3
     fload_reg(2); fmul()                       # [W_, mat, detB*C]    depth 3
     fsub()                                     # [W_, Y_]             depth 2
     fload_reg(7); fmul()                       # [W_, Y_scaled]       depth 2
@@ -215,10 +213,12 @@ def inv4x4_kernel(a: TensorInterface, c: TensorInterface, REGW: int, WARP: int):
     #   out_row3 = VecShuffle(Z_, W_, 2,0,2,0)
     # reg map: reg0=Z_, reg1=X_, reg2=W_, reg3=Y_
     # ------------------------------------------------------------------
-    fload_reg(1); fload_reg(3); fshuf2(3, 1, 3, 1); fstg_2dw(0,  c_block)
-    fload_reg(1); fload_reg(3); fshuf2(2, 0, 2, 0); fstg_2dw(4,  c_block)
-    fload_reg(0); fload_reg(2); fshuf2(3, 1, 3, 1); fstg_2dw(8,  c_block)
-    fload_reg(0); fload_reg(2); fshuf2(2, 0, 2, 0); fstg_2dw(12, c_block)
+    fload_reg(1); fload_reg(3); dup2()
+    fshuf2(3, 1, 3, 1); fstg_2dw(0,  c_block)
+    fshuf2(2, 0, 2, 0); fstg_2dw(4,  c_block)
+    fload_reg(0); fload_reg(2); dup2()
+    fshuf2(3, 1, 3, 1); fstg_2dw(8,  c_block)
+    fshuf2(2, 0, 2, 0); fstg_2dw(12, c_block)
 
     halt()
 

@@ -38,6 +38,7 @@ The codebase is split into:
 - Permutes the 4 width-lanes of the top-of-stack vector in-place
 - Operand is an i32 encoded as **i8x4 little-endian**: bits 7..0 = source lane for output 0, bits 15..8 = source lane for output 1, etc.
 - Frontend: `fperm_w(i0, i1, i2, i3)` encodes the four indices and emits opcode 104
+- **Broadcast idiom**: `fperm_w(i, i, i, i)` broadcasts lane i in-place — preferred over `dup_broadcast_w(i); swap(); pop()` (1 instruction vs 3)
 
 #### `FShuf2` (opcode 105)
 - Two-source shuffle: `VecShuffle(vec1, vec2, x, y, z, w)` → `(vec1[x], vec1[y], vec2[z], vec2[w])`
