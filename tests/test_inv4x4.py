@@ -102,14 +102,16 @@ def inv4x4_kernel(a: TensorInterface, c: TensorInterface, REGW: int, WARP: int):
     # Compute A on stack then B: store B first (reg1) then A (reg0),
     # similarly C then D, eliminating the temp-rename moves.
     # ------------------------------------------------------------------
-    fload_reg(0); fload_reg(1); fshuf2(0, 1, 0, 1)   # [A]
-    fload_reg(0); fload_reg(1); fshuf2(2, 3, 2, 3)   # [A, B]
-    fstore_reg(1)                                      # reg1 = B
-    fstore_reg(0)                                      # reg0 = A
-    fload_reg(2); fload_reg(3); fshuf2(0, 1, 0, 1)   # [C]
-    fload_reg(2); fload_reg(3); fshuf2(2, 3, 2, 3)   # [C, D]
-    fstore_reg(3)                                      # reg3 = D
-    fstore_reg(2)                                      # reg2 = C
+    fload_reg(0); fload_reg(1); dup2()
+    fshuf2(0, 1, 0, 1)   # [0, 1, A]
+    fstore_reg(0)        # reg0 = A
+    fshuf2(2, 3, 2, 3)   # [B]
+    fstore_reg(1)        # reg1 = B
+    fload_reg(2); fload_reg(3); dup2()
+    fshuf2(0, 1, 0, 1)   # [2, 3, C]
+    fstore_reg(2)        # reg2 = C
+    fshuf2(2, 3, 2, 3)   # [D]
+    fstore_reg(3)        # reg3 = D
 
     # ------------------------------------------------------------------
     # D_C = adj(D)*C  -> reg5
@@ -123,15 +125,15 @@ def inv4x4_kernel(a: TensorInterface, c: TensorInterface, REGW: int, WARP: int):
     # ------------------------------------------------------------------
 
     # detA * detD  (depth stays <= 4)
-    fload_reg(4); fperm_w(0, 0, 0, 0)         # [detA]
-    fload_reg(4); fperm_w(3, 3, 3, 3)         # [detA, detD]
-    fmul()                                     # [detA*detD]
+    fload_reg(4); fperm_w(0, 0, 1, 1)         # [detA-A-B-B]
+    fload_reg(4); fperm_w(3, 3, 2, 2)         # [detA-A-B-B, detD-D-C-C]
+    fmul()                                    # [detAD-AD-BC-BC]
 
     # detB * detC
-    fload_reg(4); fperm_w(1, 1, 1, 1)         # [detA*detD, detB]
-    fload_reg(4); fperm_w(2, 2, 2, 2)         # [detA*detD, detB, detC]
-    fmul()                                     # [detA*detD, detB*detC]
-    fadd()                                     # [term12]
+    dup_broadcast_w(0)
+    swap()
+    fperm_w(3, 3, 3, 3)                       # [detAD, detBC]
+    fadd()                                    # [term12]
 
     # trace(A_B * swz(D_C, 0,2,1,3)) via horizontal sum
     fload_reg(6)                               # [term12, A_B]
@@ -143,11 +145,8 @@ def inv4x4_kernel(a: TensorInterface, c: TensorInterface, REGW: int, WARP: int):
 
     # rDetM = adjSignMask / detM,  adjSignMask = (1,-1,-1,1)
     # Build adjSignMask: push (1,1,1,1) and (-1,-1,-1,-1), shuffle+swizzle
-    fpush(1.0); fpush(-1.0)
-    fshuf2(0, 1, 0, 1)                         # (1,1,-1,-1)
-    _swz(0, 3, 3, 0)                           # (1,-1,-1,1)
-    swap()                                     # [(1,-1,-1,1), detM]
-    frdiv()                                    # [rDetM = adjSignMask/detM]
+    fpush4(0x01ffff01)
+    fdiv()                                    # [rDetM = adjSignMask/detM]
     fstore_reg(7)
 
     # ------------------------------------------------------------------
