@@ -461,6 +461,15 @@ def fperm_w(i0: int, i1: int, i2: int, i3: int):
     return [FPermW, operand]
 
 @_bc
+def fshuf2(x: int, y: int, z: int, w: int):
+    """Shuffle lanes from two top-of-stack vectors: (vec1[x], vec1[y], vec2[z], vec2[w]).
+    vec2 is on top of the stack, vec1 is below it.
+    x, y index into vec1 (lanes 0–1 of output); z, w index into vec2 (lanes 2–3 of output).
+    Encoded as i8x4 little-endian in the i32 operand."""
+    operand = (x & 0xFF) | ((y & 0xFF) << 8) | ((z & 0xFF) << 16) | ((w & 0xFF) << 24)
+    return [FShuf2, operand]
+
+@_bc
 def fload_reg(n: int):
     return [LOAD_REGS[n], 0]
 
