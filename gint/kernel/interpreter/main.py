@@ -131,6 +131,7 @@ INSNS: dict[type[Instruction], int] = {
     FStoreReg6: 101,
     FStoreReg7: 102,
     FRcp: 103,
+    FPermW: 104,
 }
 
 

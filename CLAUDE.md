@@ -28,6 +28,12 @@ The codebase is split into:
 - Generic `FLoadReg` / `FStoreReg` with a runtime operand were replaced by 16 specialized opcodes (87–102) to eliminate register pressure from select chains
 - Frontend: `fload_reg(n)` / `fstore_reg(n)` dispatch to the correct specialized class via `LOAD_REGS[n]` / `STORE_REGS[n]`
 
+### Width-Lane Permutation (`FPermW`, opcode 104)
+- `FPermW`: Permutes the 4 width-lanes of the top-of-stack vector in-place
+- Operand is an i32 encoded as **i8x4 little-endian**: bits 7..0 = source lane for output 0, bits 15..8 = source lane for output 1, etc.
+- Implementation: bitcasts the i32 operand to `<4 x i8>`, extracts each byte, zero-extends to i32, then builds a binary selection tree (reusing `DupBroadcastW.binary_cond_tree`) for each output lane
+- Frontend: `fperm_w(i0, i1, i2, i3)` encodes the four indices and emits opcode 104
+
 ### Host-Side Executor
 - `gint/host/executor.py`: Core program execution interface
 - `gint/host/cuda/executor_impl.py`: NVIDIA-specific implementation (CudaExecutor)

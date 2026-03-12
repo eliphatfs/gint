@@ -453,6 +453,14 @@ def dup_broadcast_w(w):
     return [DupBroadcastW, w]
 
 @_bc
+def fperm_w(i0: int, i1: int, i2: int, i3: int):
+    """Permute the 4 width-lanes of the top-of-stack vector.
+    i0..i3 are the source lane indices (0–3) for output lanes 0–3.
+    Encoded as i8x4 little-endian in the i32 operand."""
+    operand = (i0 & 0xFF) | ((i1 & 0xFF) << 8) | ((i2 & 0xFF) << 16) | ((i3 & 0xFF) << 24)
+    return [FPermW, operand]
+
+@_bc
 def fload_reg(n: int):
     return [LOAD_REGS[n], 0]
 
