@@ -153,41 +153,59 @@ def inv4x4_kernel(a: TensorInterface, c: TensorInterface, REGW: int, WARP: int):
     fstore_reg(7)
 
     # ------------------------------------------------------------------
-    # Cofactor blocks (each scaled by rDetM, stored back to reg0-3)
+    # Cofactor blocks scaled by rDetM.
     #
-    #   X_ = detD*A - Mat2Mul(B, D_C)      -> reg0
-    #   W_ = detA*D - Mat2Mul(C, A_B)      -> reg1
-    #   Y_ = detB*C - Mat2MulAdj(D, A_B)   -> reg2
-    #   Z_ = detC*B - Mat2MulAdj(A, D_C)   -> reg3
+    # Register clobber conflict: X_ must write reg0 (A), W_ must write
+    # reg1 (B), but Z_ reads both A and B; Z_ writes reg3 (D) but W_
+    # reads D.  Solve by computing pairs that share inputs together:
+    #
+    #   Pair 1 (use A=reg0, B=reg1, D_C=reg5):
+    #     Z_ = detC*B - Mat2MulAdj(A, D_C)  -> reg0
+    #     X_ = detD*A - Mat2Mul(B, D_C)     -> reg1
+    #   Pair 2 (use C=reg2, D=reg3, A_B=reg6):
+    #     W_ = detA*D - Mat2Mul(C, A_B)     -> reg2
+    #     Y_ = detB*C - Mat2MulAdj(D, A_B)  -> reg3
+    #
+    # Stack discipline: compute mat2mul/mat2muladj FIRST (base depth 0,
+    # peak +3), then load det×block (at base depth 1, peak +3 → max 4).
+    # With all 8 regs in use, max safe depth = 4 (pool[0..3]).
+    # The second computation in each pair runs at base depth 1 (first
+    # result on stack), reaching max depth 4 — exactly safe.
     # ------------------------------------------------------------------
 
-    # X_
-    fload_reg(4); dup_broadcast_w(3); swap(); pop()
-    fload_reg(0); fmul()                       # [detD*A]
-    _mat2mul(1, 5)                             # [detD*A, Mat2Mul(B,D_C)]
-    frsub()                                    # [X_]
-    fload_reg(7); fmul(); fstore_reg(0)
+    # --- Pair 1: Z_ then X_ (both use A, B, D_C) ---
+    # Z_ = detC*B - Mat2MulAdj(A, D_C)
+    _mat2muladj(0, 5)                          # [mat2muladj(A,D_C)]  depth 1
+    fload_reg(4); dup_broadcast_w(2); swap(); pop()   # [mat, detC]   depth 2
+    fload_reg(1); fmul()                       # [mat, detC*B]        depth 2
+    fsub()                                     # [Z_] = TOS-second    depth 1
+    fload_reg(7); fmul()                       # [Z_scaled]           depth 1
 
-    # W_
-    fload_reg(4); dup_broadcast_w(0); swap(); pop()
-    fload_reg(3); fmul()                       # [detA*D]
-    _mat2mul(2, 6)                             # [detA*D, Mat2Mul(C,A_B)]
-    frsub()                                    # [W_]
-    fload_reg(7); fmul(); fstore_reg(1)
+    # X_ = detD*A - Mat2Mul(B, D_C)   (Z_scaled at depth 1, safe peak = 4)
+    _mat2mul(1, 5)                             # [Z_, mat2mul(B,D_C)] depth 2
+    fload_reg(4); dup_broadcast_w(3); swap(); pop()   # [Z_, mat, detD] depth 3
+    fload_reg(0); fmul()                       # [Z_, mat, detD*A]    depth 3
+    fsub()                                     # [Z_, X_]             depth 2
+    fload_reg(7); fmul()                       # [Z_, X_scaled]       depth 2
+    fstore_reg(1)                              # reg1 = X_            depth 1
+    fstore_reg(0)                              # reg0 = Z_            depth 0
 
-    # Y_
-    fload_reg(4); dup_broadcast_w(1); swap(); pop()
-    fload_reg(2); fmul()                       # [detB*C]
-    _mat2muladj(3, 6)                          # [detB*C, Mat2MulAdj(D,A_B)]
-    frsub()                                    # [Y_]
-    fload_reg(7); fmul(); fstore_reg(2)
+    # --- Pair 2: W_ then Y_ (both use C, D, A_B) ---
+    # W_ = detA*D - Mat2Mul(C, A_B)
+    _mat2mul(2, 6)                             # [mat2mul(C,A_B)]     depth 1
+    fload_reg(4); dup_broadcast_w(0); swap(); pop()   # [mat, detA]   depth 2
+    fload_reg(3); fmul()                       # [mat, detA*D]        depth 2
+    fsub()                                     # [W_]                 depth 1
+    fload_reg(7); fmul()                       # [W_scaled]           depth 1
 
-    # Z_
-    fload_reg(4); dup_broadcast_w(2); swap(); pop()
-    fload_reg(1); fmul()                       # [detC*B]
-    _mat2muladj(0, 5)                          # [detC*B, Mat2MulAdj(A,D_C)]
-    frsub()                                    # [Z_]
-    fload_reg(7); fmul(); fstore_reg(3)
+    # Y_ = detB*C - Mat2MulAdj(D, A_B)   (W_scaled at depth 1)
+    _mat2muladj(3, 6)                          # [W_, mat2muladj(D,A_B)] depth 2
+    fload_reg(4); dup_broadcast_w(1); swap(); pop()   # [W_, mat, detB] depth 3
+    fload_reg(2); fmul()                       # [W_, mat, detB*C]    depth 3
+    fsub()                                     # [W_, Y_]             depth 2
+    fload_reg(7); fmul()                       # [W_, Y_scaled]       depth 2
+    fstore_reg(3)                              # reg3 = Y_            depth 1
+    fstore_reg(2)                              # reg2 = W_            depth 0
 
     # ------------------------------------------------------------------
     # Final output rows via VecShuffle:
@@ -195,12 +213,12 @@ def inv4x4_kernel(a: TensorInterface, c: TensorInterface, REGW: int, WARP: int):
     #   out_row1 = VecShuffle(X_, Y_, 2,0,2,0)
     #   out_row2 = VecShuffle(Z_, W_, 3,1,3,1)
     #   out_row3 = VecShuffle(Z_, W_, 2,0,2,0)
-    # reg map: reg0=X_, reg1=W_, reg2=Y_, reg3=Z_
+    # reg map: reg0=Z_, reg1=X_, reg2=W_, reg3=Y_
     # ------------------------------------------------------------------
-    fload_reg(0); fload_reg(2); fshuf2(3, 1, 3, 1); fstg_2dw(0,  c_block)
-    fload_reg(0); fload_reg(2); fshuf2(2, 0, 2, 0); fstg_2dw(4,  c_block)
-    fload_reg(3); fload_reg(1); fshuf2(3, 1, 3, 1); fstg_2dw(8,  c_block)
-    fload_reg(3); fload_reg(1); fshuf2(2, 0, 2, 0); fstg_2dw(12, c_block)
+    fload_reg(1); fload_reg(3); fshuf2(3, 1, 3, 1); fstg_2dw(0,  c_block)
+    fload_reg(1); fload_reg(3); fshuf2(2, 0, 2, 0); fstg_2dw(4,  c_block)
+    fload_reg(0); fload_reg(2); fshuf2(3, 1, 3, 1); fstg_2dw(8,  c_block)
+    fload_reg(0); fload_reg(2); fshuf2(2, 0, 2, 0); fstg_2dw(12, c_block)
 
     halt()
 
