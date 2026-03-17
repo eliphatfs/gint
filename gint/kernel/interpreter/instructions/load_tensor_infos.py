@@ -11,11 +11,13 @@ BlockTensorInfo = ir.LiteralStructType([
 ])
 
 
-def emit_load_tensor_infos(LL: PlatformIRBuilder, state: StackMachineState):
+def emit_load_tensor_infos(LL: PlatformIRBuilder, state: StackMachineState, tinfo_ptr=None):
+    if tinfo_ptr is None:
+        tinfo_ptr = LL.arg(1)
     lane_id = LL.lane_id()
     with LL.if_then(LL.icmp_signed('<', lane_id, LL.arg(2))):
         (base_ptr, elm_size, batch_strides, batch_shape, block_s1, block_s2, block_dims, block_steps)  = [
-            LL.load(LL.gep(LL.arg(1), [i32(0), i32(eid), lane_id], inbounds=True))
+            LL.load(LL.gep(tinfo_ptr, [i32(0), i32(eid), lane_id], inbounds=True))
             for eid in range(8)
         ]
         bidx = LL.logical_program_idx()

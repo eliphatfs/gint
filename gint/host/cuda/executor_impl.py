@@ -111,4 +111,4 @@ class CudaExecutor(BaseExecutor):
         else:
             check_cuda_error(cuda.cuMemcpyHtoDAsync(dinfo, ctypes.addressof(ti), ctypes.sizeof(ti), custream))
         best_warps = self.heuristic_best_warps(grid_dim, concurrencies, num_sm)
-        launch_kernel(cufunc, dcode, dinfo, nargs, grid_dim, grid_dim=cdiv(grid_dim, best_warps), block_dim=(32, best_warps, 1), smem_bytes=SMEM_PER_WARP * best_warps, stream=custream)
+        launch_kernel(cufunc, dcode, dinfo, nargs, grid_dim, 0, grid_dim=cdiv(grid_dim, best_warps), block_dim=(32, best_warps, 1), smem_bytes=SMEM_PER_WARP * best_warps, stream=custream)

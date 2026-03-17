@@ -145,9 +145,27 @@ def build_main_loop(LL: PlatformIRBuilder):
     # early exit warps beyond user scheduling
     with LL.if_then(LL.icmp_unsigned('>=', LL.logical_program_idx(), LL.arg(3)), False):
         LL.ret_void()
-    
+
+    # resolve indirect pointers if flag > 0
+    is_indirect = LL.icmp_signed('>', LL.arg(4), i32(0))
+    idx = LL.logical_program_idx()
+    resolved = {}
+    with LL.if_else(is_indirect) as (then, otherwise):
+        with then:
+            code_table = LL.bitcast(LL.arg(0), i32.as_pointer().as_pointer())
+            tinfo_table = LL.bitcast(LL.arg(1), TensorInfo.as_pointer().as_pointer())
+            resolved['ind'] = (LL.load(LL.gep(code_table, [idx])), LL.load(LL.gep(tinfo_table, [idx])), LL.block)
+        with otherwise:
+            resolved['dir'] = (LL.bitcast(LL.arg(0), i32.as_pointer()), LL.arg(1), LL.block)
+    code_ptr = LL.phi(i32.as_pointer())
+    code_ptr.add_incoming(resolved['ind'][0], resolved['ind'][2])
+    code_ptr.add_incoming(resolved['dir'][0], resolved['dir'][2])
+    tinfo_ptr = LL.phi(TensorInfo.as_pointer())
+    tinfo_ptr.add_incoming(resolved['ind'][1], resolved['ind'][2])
+    tinfo_ptr.add_incoming(resolved['dir'][1], resolved['dir'][2])
+
     smem_base = LL.gep(smem_base, [i32(0), LL.mul(i32(SMEM_PER_WARP), LL.thread_idx_y())])
-    
+
     entry_bb = LL.block
     dispatch_bbs: dict[int, ir.Block] = {}
     dispatch_states: dict[int, StackMachineState] = {}
@@ -164,14 +182,14 @@ def build_main_loop(LL: PlatformIRBuilder):
         return LL.branch(dispatch_bbs[sp])
     
     LL.position_at_end(entry_bb)
-    entry_pc = LL.bitcast(LL.arg(0), i32.as_pointer())
+    entry_pc = code_ptr
     entry_opcode = LL.load(entry_pc)
     state = dispatch_states[0].clone()
     state.pc = entry_pc
     state.opcode = entry_opcode
     for i in range(POOL_SIZE):
         state.pool[i] = [f32(ir.Undefined)] * REG_WIDTH
-    emit_load_tensor_infos(LL, state)
+    emit_load_tensor_infos(LL, state, tinfo_ptr)
     br_state(state)
     
     for i in range(MAX_STACK + 1):
@@ -203,10 +221,11 @@ def build_main_loop(LL: PlatformIRBuilder):
 
 
 GEvalFType = ir.FunctionType(void, [
-    i32.as_pointer(),  # code
-    TensorInfo.as_pointer(),  # tensor info
+    i32.as_pointer(),  # code (direct) or i32** (indirect)
+    TensorInfo.as_pointer(),  # tensor info (direct) or TensorInfo** (indirect)
     i32,  # num of tensors
     i32,  # logical grid dim before dividing warps
+    i32,  # flag: >0 = indirect mode
 ])
 
 
