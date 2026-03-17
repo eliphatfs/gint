@@ -34,16 +34,127 @@ from .op_registry import OpDescriptor, get_op_descriptor
 
 
 # ---------------------------------------------------------------------------
+# Broadcasting utilities
+# ---------------------------------------------------------------------------
+
+def _broadcast_shapes(*shapes):
+    """Compute NumPy-style broadcast output shape. Returns None if incompatible."""
+    if not shapes:
+        return ()
+    ndim = max(len(s) for s in shapes)
+    result = []
+    for i in range(ndim):
+        dims = []
+        for s in shapes:
+            idx = i - (ndim - len(s))
+            dims.append(s[idx] if idx >= 0 else 1)
+        max_dim = max(dims)
+        if any(d != 1 and d != max_dim for d in dims):
+            return None
+        result.append(max_dim)
+    return tuple(result)
+
+
+def _c_contiguous_strides(shape):
+    """Compute C-contiguous strides for a shape."""
+    if not shape:
+        return []
+    strides = []
+    prod = 1
+    for s in reversed(shape):
+        strides.append(prod)
+        prod *= s
+    return list(reversed(strides))
+
+
+def _compute_broadcast_plan(output_shape, tensor_shapes):
+    """Compute a broadcast plan mapping output_shape to gint block+batch decomposition.
+
+    Returns a plan dict with 'block_size', 'batch_dims', 'per_tensor', 'grid_dim',
+    'num_inner_blocks', or None if infeasible (>4 batch dims).
+    """
+    ndim = len(output_shape)
+    if ndim == 0:
+        return None
+
+    # Right-align all tensor shapes (pad with 1s on the left)
+    padded = []
+    for s in tensor_shapes:
+        pad = ndim - len(s)
+        padded.append((1,) * pad + tuple(s))
+
+    # Merge consecutive innermost dims where ALL tensors match output (non-broadcast)
+    merge_count = 0
+    for d in range(ndim - 1, -1, -1):
+        if all(p[d] == output_shape[d] for p in padded):
+            merge_count += 1
+        else:
+            break
+    # Always include at least the innermost dim
+    if merge_count == 0:
+        merge_count = 1
+
+    block_size = 1
+    for d in range(ndim - merge_count, ndim):
+        block_size *= output_shape[d]
+
+    batch_dims = list(output_shape[:ndim - merge_count])
+    if len(batch_dims) > 4:
+        return None
+
+    num_inner_blocks = max(1, (block_size + 127) // 128)
+    batch_product = 1
+    for d in batch_dims:
+        batch_product *= d
+    grid_dim = num_inner_blocks * batch_product
+
+    per_tensor = []
+    for p in padded:
+        c_strides = _c_contiguous_strides(p)
+
+        # block_stride: 0 if any merged inner dim broadcasts, 1 otherwise
+        inner_broadcast = any(
+            p[d] == 1 and output_shape[d] > 1
+            for d in range(ndim - merge_count, ndim)
+        )
+        block_stride = 0 if inner_broadcast else 1
+
+        # batch_strides: 0 for broadcast dims, C-contiguous stride otherwise
+        b_strides = []
+        for d in range(len(batch_dims)):
+            if p[d] == 1 and output_shape[d] > 1:
+                b_strides.append(0)
+            else:
+                b_strides.append(c_strides[d])
+
+        per_tensor.append({
+            'block_stride': block_stride,
+            'batch_strides': b_strides,
+        })
+
+    return {
+        'block_size': block_size,
+        'batch_dims': batch_dims,
+        'per_tensor': per_tensor,
+        'grid_dim': grid_dim,
+        'num_inner_blocks': num_inner_blocks,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Compiled-subgraph wrapper
 # ---------------------------------------------------------------------------
 
 class GintCompiledSubgraph(BaseExecutableProgram):
     """An already-compiled gint subgraph ready for execution."""
 
-    def __init__(self, bytecode: List[List[int]], tensor_infos: List[ProgramTensorInfo]):
+    def __init__(self, bytecode: List[List[int]], tensor_infos: List[ProgramTensorInfo],
+                 output_shape: tuple = (), grid_dim: int = 1):
         super().__init__()
         self.bytecode = bytecode
         self.tensor_infos = tensor_infos
+        self.output_shape = output_shape
+        self.grid_dim = grid_dim
 
     def get_program(self, *args: TensorInterface, **extra_kwargs) -> ProgramData:
         bc_array = np.array(self.bytecode, dtype=np.int32).reshape(-1)
@@ -312,7 +423,12 @@ class GraphPartitioner:
                     current_shape = None
                 continue
 
-            can_add = (current_shape is None or shape == current_shape)
+            if current_shape is None:
+                can_add = True
+            else:
+                merged = _broadcast_shapes(current_shape, shape)
+                can_add = merged is not None
+
             if can_add:
                 candidate = current + [node]
                 scheduled = ForestTraverser(candidate).get_schedule()
@@ -320,10 +436,16 @@ class GraphPartitioner:
                     can_add = False
                 elif not self._stack_fits(scheduled):
                     can_add = False
+                else:
+                    merged_shape = _broadcast_shapes(current_shape, shape) if current_shape else shape
+                    global_shapes = [self._get_shape(n) for n in self._required_globals(scheduled)]
+                    global_shapes = [s for s in global_shapes if s is not None]
+                    if global_shapes and any(s != merged_shape for s in global_shapes):
+                        if _compute_broadcast_plan(merged_shape, global_shapes) is None:
+                            can_add = False
 
             if can_add:
-                if current_shape is None:
-                    current_shape = shape
+                current_shape = _broadcast_shapes(current_shape, shape) if current_shape else shape
                 current.append(node)
             else:
                 if current:
@@ -475,26 +597,35 @@ class GintCompiler:
         finally:
             _frontend_state.reset(token)
 
-        # Build tensor infos (all uniform 1-D for element-wise ops).
-        numel = self._numel(global_nodes, nodes)
-        num_blocks = max(1, (numel + 127) // 128)
-        tensor_infos = [
-            ProgramTensorInfo(
+        # Compute broadcast plan for per-tensor info.
+        all_shapes = [partitioner._get_shape(n) for n in global_nodes]
+        output_shape = all_shapes[0]
+        for s in all_shapes[1:]:
+            if s is not None:
+                output_shape = _broadcast_shapes(output_shape, s)
+
+        plan = _compute_broadcast_plan(output_shape, [s for s in all_shapes if s is not None])
+        num_inner_blocks = plan['num_inner_blocks']
+
+        tensor_infos = []
+        for i, node in enumerate(global_nodes):
+            entry = plan['per_tensor'][i]
+            tensor_infos.append(ProgramTensorInfo(
                 elm_size=4,
-                batch_strides=[],
-                batch_shape=[],
-                block_shape_stride_1=[numel, 1],
+                batch_strides=entry['batch_strides'],
+                batch_shape=list(plan['batch_dims']),
+                block_shape_stride_1=[plan['block_size'], entry['block_stride']],
                 block_shape_stride_2=[1, 0],
-                block_grid_dims=[num_blocks, 1],
+                block_grid_dims=[num_inner_blocks, 1],
                 block_grid_steps=[128, 1],
-            )
-            for _ in global_nodes
-        ]
+            ))
 
         from ..host.debug import dump_bytecode
         dump_bytecode(bytecode, "tmp/sg.gint")
 
-        return GintCompiledSubgraph(bytecode, tensor_infos)
+        return GintCompiledSubgraph(bytecode, tensor_infos,
+                                     output_shape=output_shape,
+                                     grid_dim=plan['grid_dim'])
 
     # --- Subgraph execution ---
 
@@ -516,17 +647,14 @@ class GintCompiler:
         output_tensors = []
         ref = input_tensors[0] if input_tensors else results[next(iter(results))]
         for node in outputs:
-            t = torch.empty_like(ref)
+            t = torch.empty(compiled.output_shape, dtype=ref.dtype, device=ref.device)
             output_tensors.append(t)
             results[node] = t
 
         all_tensors = {n: t for n, t in zip(inputs + outputs, input_tensors + output_tensors)}
         ordered     = [all_tensors[n] for n in global_nodes]
 
-        numel    = ordered[0].numel() if ordered else 1
-        grid_dim = max(1, (numel + 127) // 128)
-
-        compiled(*ordered, grid_dim=grid_dim,
+        compiled(*ordered, grid_dim=compiled.grid_dim,
                  cuda_stream=torch.cuda.current_stream().cuda_stream)
 
     def _run_eager(self, node: Node, results: Dict[Node, torch.Tensor]):

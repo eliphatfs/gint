@@ -194,6 +194,64 @@ class TestConductorBackend(unittest.TestCase):
         torch.testing.assert_close(fn(x), expected, atol=1e-5, rtol=1e-5)
 
     # ------------------------------------------------------------------
+    # Broadcasting
+    # ------------------------------------------------------------------
+
+    def test_broadcast_bias_add(self):
+        @torch.compile(backend="gint_test")
+        def fn(x, y):
+            return x + y
+
+        x = torch.randn(32, 128, device='cuda')
+        y = torch.randn(128, device='cuda')
+        torch.testing.assert_close(fn(x, y), x + y)
+
+    def test_broadcast_scalar_tensor(self):
+        @torch.compile(backend="gint_test")
+        def fn(x, y):
+            return x * y
+
+        x = torch.randn(1024, device='cuda')
+        y = torch.randn(1, device='cuda')
+        torch.testing.assert_close(fn(x, y), x * y)
+
+    def test_broadcast_both_expand(self):
+        @torch.compile(backend="gint_test")
+        def fn(x, y):
+            return x + y
+
+        x = torch.randn(64, 1, device='cuda')
+        y = torch.randn(1, 32, device='cuda')
+        torch.testing.assert_close(fn(x, y), x + y)
+
+    def test_broadcast_3d(self):
+        @torch.compile(backend="gint_test")
+        def fn(x, y):
+            return x + y
+
+        x = torch.randn(4, 8, 64, device='cuda')
+        y = torch.randn(64, device='cuda')
+        torch.testing.assert_close(fn(x, y), x + y)
+
+    def test_broadcast_with_activation(self):
+        @torch.compile(backend="gint_test")
+        def fn(x, y):
+            return torch.relu(x + y)
+
+        x = torch.randn(32, 128, device='cuda')
+        y = torch.randn(128, device='cuda')
+        torch.testing.assert_close(fn(x, y), torch.relu(x + y))
+
+    def test_broadcast_same_shape(self):
+        @torch.compile(backend="gint_test")
+        def fn(x, y):
+            return x + y
+
+        x = torch.randn(1024, device='cuda')
+        y = torch.randn(1024, device='cuda')
+        torch.testing.assert_close(fn(x, y), x + y)
+
+    # ------------------------------------------------------------------
     # Fallback: unsupported op should still produce correct result via eager
     # ------------------------------------------------------------------
 

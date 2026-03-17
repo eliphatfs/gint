@@ -74,9 +74,20 @@ The codebase is split into:
 
 ### Torch.Compile Integration (Conductor)
 - `gint/conductor/backend.py`: Backend registration and entry point
-- `gint/conductor/compiler.py`: FX graph → bytecode conversion
-- `gint/conductor/partitioner.py`: Graph partitioning with constraints (max 8 tensors, uniform shapes)
-- Supports basic arithmetic ops (add, sub, mul, div); fallback to eager mode for unsupported ops
+- `gint/conductor/compiler.py`: FX graph → bytecode conversion, graph partitioning, and broadcasting
+- Supports basic arithmetic ops (add, sub, mul, div), unary transcendentals, activations (relu, gelu, silu, leaky_relu), comparisons, and `where`; fallback to eager mode for unsupported ops
+- Partitioner constraints per subgraph: max 8 global tensor slots, max stack depth 8, broadcast-compatible shapes
+
+#### Broadcasting Support
+- The conductor natively supports NumPy-style broadcasting across per-point operations (e.g., `(32, 128) + (128,)` for bias addition)
+- **No kernel changes required** — broadcasting is implemented via `ProgramTensorInfo` stride tricks: `stride=0` for broadcast dimensions causes `offset * 0 = 0`, repeating data without duplication
+- **Key invariant**: All `ProgramTensorInfo` fields that affect grid index decomposition must be identical across tensors in a subgraph (`block_grid_dims`, `block_grid_steps`, `batch_shape`, `block_shape_stride_1[0]`). Only strides differ per tensor: `block_shape_stride_1[1]` and `batch_strides` are 0 for broadcast dims
+- **Broadcast plan** (`_compute_broadcast_plan` in `compiler.py`):
+  1. Merge consecutive innermost dims where ALL tensors match output (non-broadcast) into the block
+  2. Remaining outer dims become batch dims (up to 4, otherwise infeasible)
+  3. Per tensor: `block_stride` = 0 if broadcast in inner dims, 1 otherwise; `batch_strides[d]` = 0 for broadcast dims, C-contiguous stride otherwise
+- **Partitioner integration**: Shape equality check replaced with `_broadcast_shapes()` compatibility; broadcast plan feasibility is verified before accepting a node into a subgraph
+- Example: `a(32, 128) + b(128,)` → block=128, batch=[32], grid=32 warps. `b` gets `batch_strides=[0]` so each row reuses the same 128 elements
 
 ## Common Commands
 
