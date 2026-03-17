@@ -180,10 +180,9 @@ def indirect_arith_test(a, b, c, data, indices, out_load, out_store, REGW: int, 
     fstg_1d(0, out_load)
     
     # Indirect store: out_load -> indices -> out_store
-    # fldg_1d(0, out_load)
-    # fldg_1d(0, indices)
-    # fstg_1d_ind(out_store)
-    # TODO: debug here
+    fldg_1d(0, out_load)
+    fldg_1d(0, indices)
+    fstg_1d_ind(out_store)
         
     halt()
 
@@ -267,7 +266,7 @@ class TestFrontendExpression(unittest.TestCase):
         # Verify indirect store
         ref_store = torch.zeros(100, device='cuda', dtype=torch.float32)
         ref_store[indices.long()] = out_load
-        # torch.testing.assert_close(out_store, ref_store)
+        torch.testing.assert_close(out_store, ref_store)
         
     def test_packed_imm(self):
         packed_f_out = torch.zeros(100, device='cuda', dtype=torch.float32)

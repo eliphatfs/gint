@@ -69,7 +69,7 @@ class _LoadStoreGlobalBase(DefaultControlOperandInstruction):
                 f.add_incoming(load_val, if_block)
                 fs.append(f)
             if w < state.reg_width - 1:
-                base_ptr, cond_b, wstate = self.advance_ptr_cond_state(LL, state, base_ptr, block, w, wstate)
+                base_ptr, cond_b, wstate = self.advance_ptr_cond_state(LL, state, base_ptr, block, w + 1, wstate)
         if self.mode == 'load':
             state.push(fs)
         else:

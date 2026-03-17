@@ -46,6 +46,12 @@ The codebase is split into:
 - Same i8x4 little-endian operand encoding as `FPermW`; indices x,y select from vec1, z,w from vec2
 - Frontend: `fshuf2(x, y, z, w)` encodes indices and emits opcode 105
 
+### Indirect Load/Store (Scatter/Gather)
+- `LoadGlobal1DF32Indirect` / `StoreGlobal1DF32Indirect`: 1D indirect (gather/scatter) using stack-provided indices
+- Stack protocol: push values (store only), then push indices, then call the indirect instruction
+- Indices are f32-bitcast-to-i32 on the stack; `advance_ptr_cond_state` bitcasts back to i32 for addressing
+- **Width-lane iteration contract**: The base `emit` loop in `_LoadStoreGlobalBase` calls `advance_ptr_cond_state(w + 1, ...)` after processing lane `w`, because `advance` receives the lane index it is *setting up* (not the one just completed). `init_ptr_cond_state` bootstraps lane 0 by calling `advance(w=0, ...)`
+
 ### Indirect Dispatch Mode
 - The kernel accepts a `flag: i32` as its 5th argument
 - **Direct mode** (`flag <= 0`): All warps share the same `arg(0)` (bytecode pointer) and `arg(1)` (TensorInfo pointer) — the original behavior
