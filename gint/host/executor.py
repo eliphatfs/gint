@@ -112,11 +112,14 @@ class BaseExecutableProgram(object):
 
 
 class BaseExecutor(object):
-    
+
     def warp_size(self) -> int:
         raise NotImplementedError
-    
+
     def execute(self, program: BaseExecutableProgram, args: Sequence[TensorInterface], grid_dim: int, **extra_kwargs):
+        raise NotImplementedError
+
+    def execute_indirect(self, programs: Sequence[BaseExecutableProgram], args_list: Sequence[Sequence[TensorInterface]], indices: Sequence[int], **extra_kwargs):
         raise NotImplementedError
 
 

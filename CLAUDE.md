@@ -58,6 +58,12 @@ The codebase is split into:
 - `gint/host/executor.py`: Core program execution interface
 - `gint/host/cuda/executor_impl.py`: NVIDIA-specific implementation (CudaExecutor)
 - Loads kernel from `gint/host/cuda/gint.fatbin.xz` (not tracked in git — must be generated locally via `./generate.sh`)
+- **`execute_indirect(programs, args_list, indices)`**: Launches multiple different programs in a single kernel call
+  - `programs`: list of `BaseExecutableProgram` instances
+  - `args_list`: list of tensor arg tuples, one per program (must match `programs` length)
+  - `indices`: int array of size `grid_dim`, mapping each warp to a program index
+  - Builds per-program device code and tensor info, then assembles per-warp pointer tables for the kernel's indirect mode (`flag=1`)
+  - Tensor info grid dimensions interact with `logical_program_idx()` via `urem`, so contiguous warp assignments per program work naturally
 
 ### Frontend API
 - `gint/host/frontend.py`: Pythonic bytecode generation
