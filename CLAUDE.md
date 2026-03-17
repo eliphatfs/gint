@@ -46,6 +46,14 @@ The codebase is split into:
 - Same i8x4 little-endian operand encoding as `FPermW`; indices x,y select from vec1, z,w from vec2
 - Frontend: `fshuf2(x, y, z, w)` encodes indices and emits opcode 105
 
+### Indirect Dispatch Mode
+- The kernel accepts a `flag: i32` as its 5th argument
+- **Direct mode** (`flag <= 0`): All warps share the same `arg(0)` (bytecode pointer) and `arg(1)` (TensorInfo pointer) — the original behavior
+- **Indirect mode** (`flag > 0`): `arg(0)` and `arg(1)` are treated as **pointer tables** indexed by `logical_program_idx()`, so each warp loads its own program and tensor info via `ptr = ptrs[idx]`
+- Resolution uses `if_else` + phi to avoid speculative loads on invalid pointers in direct mode
+- The early-exit bounds check (`logical_program_idx() >= arg(3)`) applies in both modes — in indirect mode, `arg(3)` is the total number of programs in the table
+- After pointer resolution, the rest of the interpreter (dispatch loop, tensor info loading, instruction execution) is unchanged
+
 ### Host-Side Executor
 - `gint/host/executor.py`: Core program execution interface
 - `gint/host/cuda/executor_impl.py`: NVIDIA-specific implementation (CudaExecutor)
@@ -121,6 +129,13 @@ cp artifact/gint.fatbin.xz gint/host/cuda/gint.fatbin.xz
 - PC always advances by 2 after each instruction
 - Instructions with no meaningful operand use `operand = 0`
 - Opcodes defined in `INSNS` dict in `gint/kernel/interpreter/main.py`
+
+### Kernel Signature
+```
+void geval(i32* code, TensorInfo* tinfo, i32 num_tensors, i32 grid_dim, i32 flag)
+```
+- `flag <= 0`: direct mode — `code` and `tinfo` are used as-is by all warps
+- `flag > 0`: indirect mode — `code` and `tinfo` are cast to `i32**` / `TensorInfo**` and indexed per-warp
 
 ### Kernel Specialization
 - Per-vendor implementations in `gint/kernel/platforms/`
