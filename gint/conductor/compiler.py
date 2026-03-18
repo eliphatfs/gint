@@ -83,6 +83,12 @@ def _compute_broadcast_plan(output_shape, tensor_shapes):
         pad = ndim - len(s)
         padded.append((1,) * pad + tuple(s))
 
+    # Validate broadcast compatibility: each dim must be 1 or equal to output
+    for p in padded:
+        for d in range(ndim):
+            if p[d] != 1 and p[d] != output_shape[d]:
+                return None
+
     # Merge consecutive innermost dims where ALL tensors match output (non-broadcast)
     merge_count = 0
     for d in range(ndim - 1, -1, -1):
@@ -450,6 +456,17 @@ class GraphPartitioner:
             else:
                 if current:
                     subgraphs.append(ForestTraverser(current).get_schedule())
+                # Check if the rejected node can start a new subgraph on its own
+                # (its globals must be broadcast-compatible with its shape).
+                solo = ForestTraverser([node]).get_schedule()
+                solo_globals = [self._get_shape(n) for n in self._required_globals(solo)]
+                solo_globals = [s for s in solo_globals if s is not None]
+                if solo_globals and any(s != shape for s in solo_globals):
+                    if _compute_broadcast_plan(shape, solo_globals) is None:
+                        # Node can't form a valid subgraph — skip it (run eagerly)
+                        current = []
+                        current_shape = None
+                        continue
                 current = [node]
                 current_shape = shape
 

@@ -263,6 +263,71 @@ class TestConductorBackend(unittest.TestCase):
         x = torch.randn(1024, device='cuda')
         torch.testing.assert_close(fn(x), torch.relu(x) + 1.0)
 
+    # ------------------------------------------------------------------
+    # Metadata ops (view, unsqueeze, squeeze, expand, etc.)
+    # ------------------------------------------------------------------
+
+    def test_unsqueeze_squeeze_identity(self):
+        """unsqueeze + squeeze cancel out; should fuse with surrounding ops."""
+        @torch.compile(backend="gint_test")
+        def fn(x):
+            return x.unsqueeze(0).squeeze(0) * 2.0
+
+        x = torch.randn(1024, device='cuda')
+        torch.testing.assert_close(fn(x), x * 2.0)
+
+    def test_unsqueeze_fuse_with_relu(self):
+        """relu + unsqueeze + add should fuse into one subgraph."""
+        @torch.compile(backend="gint_test")
+        def fn(x):
+            return torch.relu(x).unsqueeze(0) + 1.0
+
+        x = torch.randn(1024, device='cuda')
+        expected = torch.relu(x).unsqueeze(0) + 1.0
+        torch.testing.assert_close(fn(x), expected)
+
+    def test_unsqueeze_broadcast_add(self):
+        """unsqueeze enables broadcasting: (N,) → (1, N) + (M, N) → (M, N)."""
+        @torch.compile(backend="gint_test")
+        def fn(x, y):
+            return x.unsqueeze(0) + y
+
+        x = torch.randn(128, device='cuda')
+        y = torch.randn(32, 128, device='cuda')
+        expected = x.unsqueeze(0) + y
+        torch.testing.assert_close(fn(x, y), expected)
+
+    def test_expand_add(self):
+        """expand broadcasts size-1 dim; fuses with add."""
+        @torch.compile(backend="gint_test")
+        def fn(x, y):
+            return x.expand(32, 128) + y
+
+        x = torch.randn(1, 128, device='cuda')
+        y = torch.randn(32, 128, device='cuda')
+        expected = x.expand(32, 128) + y
+        torch.testing.assert_close(fn(x, y), expected)
+
+    def test_view_pointwise(self):
+        """view followed by pointwise on the new shape."""
+        @torch.compile(backend="gint_test")
+        def fn(x):
+            return x.view(32, 32) + 1.0
+
+        x = torch.randn(1024, device='cuda')
+        expected = x.view(32, 32) + 1.0
+        torch.testing.assert_close(fn(x), expected)
+
+    def test_metadata_standalone(self):
+        """A metadata op alone (no fusion) should still produce correct result."""
+        @torch.compile(backend="gint_test")
+        def fn(x):
+            return x.unsqueeze(0) + 1.0
+
+        x = torch.randn(512, device='cuda')
+        expected = x.unsqueeze(0) + 1.0
+        torch.testing.assert_close(fn(x), expected)
+
 
 if __name__ == "__main__":
     if torch.cuda.is_available():

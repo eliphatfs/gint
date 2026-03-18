@@ -81,7 +81,7 @@ The codebase is split into:
 ### Torch.Compile Integration (Conductor)
 - `gint/conductor/backend.py`: Backend registration and entry point
 - `gint/conductor/compiler.py`: FX graph → bytecode conversion, graph partitioning, and broadcasting
-- Supports basic arithmetic ops (add, sub, mul, div), unary transcendentals, activations (relu, gelu, silu, leaky_relu), comparisons, and `where`; fallback to eager mode for unsupported ops
+- Supports basic arithmetic ops (add, sub, mul, div), unary transcendentals, activations (relu, gelu, silu, leaky_relu), comparisons, `where`, and metadata ops (view, unsqueeze, squeeze, expand, permute, transpose, t); fallback to eager mode for unsupported ops
 - Partitioner constraints per subgraph: max 8 global tensor slots, max stack depth 8, broadcast-compatible shapes
 
 #### Broadcasting Support
@@ -94,6 +94,14 @@ The codebase is split into:
   3. Per tensor: `block_stride` = 0 if broadcast in inner dims, 1 otherwise; `batch_strides[d]` = 0 for broadcast dims, C-contiguous stride otherwise
 - **Partitioner integration**: Shape equality check replaced with `_broadcast_shapes()` compatibility; broadcast plan feasibility is verified before accepting a node into a subgraph
 - Example: `a(32, 128) + b(128,)` → block=128, batch=[32], grid=32 warps. `b` gets `batch_strides=[0]` so each row reuses the same 128 elements
+
+#### Metadata Ops Support
+- The conductor supports shape/stride-only ops (`view`, `unsqueeze`, `squeeze`, `expand`, `permute`, `transpose`, `t`) as **identity on the stack** — no bytecode emitted, value passes through unchanged
+- Registered as `OpKind.METADATA` in `op_registry.py` with `arity=1`, `arg_order=[0]` (only the tensor arg is pushed; shape/dim args are read from the FX node, not the stack)
+- Enables fusion through metadata ops: e.g., `relu(x).unsqueeze(0) + 1.0` compiles to a single kernel instead of relu → eager unsqueeze → add (two kernels)
+- Shape changes are handled by the broadcast plan's per-tensor `ProgramTensorInfo` strides — unsqueeze adds a size-1 dim that broadcasts naturally, expand sets stride=0 for expanded dims
+- **Partitioner safety**: When a metadata op's global input shape is not broadcast-compatible with the output shape (e.g., `view(1024) → (32, 32)`), the node is skipped and falls back to eager execution. The `_compute_broadcast_plan` validates that each tensor dim is either 1 or equal to the output dim
+- **Current limitation**: Transpose/permute are registered but typically cause subgraph breaks because the transposed shape isn't broadcast-compatible with the original. Full support would require the broadcast plan to use actual tensor strides from FX metadata instead of computed C-contiguous strides
 
 ## Common Commands
 

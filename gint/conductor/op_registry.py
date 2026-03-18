@@ -19,6 +19,7 @@ from ..host import frontend as fe
 class OpKind(Enum):
     ELEMENTWISE = auto()   # element-wise, same shape in/out
     REDUCTION   = auto()   # reduces elements (warp-level for now)
+    METADATA    = auto()   # shape/stride-only change, identity on stack
 
 
 @dataclass
@@ -52,6 +53,15 @@ def _ew2(fe_fn, arg_order=None) -> OpDescriptor:
     """Binary elementwise – wraps a single frontend call."""
     return OpDescriptor(arity=2, kind=OpKind.ELEMENTWISE, emit_fn=lambda _node: fe_fn(),
                         arg_order=arg_order)
+
+
+def _meta1() -> OpDescriptor:
+    """Unary metadata op – identity on stack, no bytecode emitted.
+
+    Only arg[0] (the tensor) is pushed; shape/dim/size args are ignored.
+    """
+    return OpDescriptor(arity=1, kind=OpKind.METADATA,
+                        emit_fn=lambda _node: None, arg_order=[0])
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +273,18 @@ OP_REGISTRY: dict = {
         # arg_order=[0]: only push the tensor input; negative_slope is read from node.args[1]
         # at emit time as a fmulimm immediate — do NOT push it onto the stack.
         OpDescriptor(1, OpKind.ELEMENTWISE, _emit_leaky_relu, arg_order=[0], peak_stack_extra=3),
+
+    # --- Metadata ops (shape/stride changes, identity on stack) ---
+    # These emit no bytecode.  The value on the stack is unchanged; only the
+    # FX node's output shape differs, which the broadcast plan handles via
+    # per-tensor ProgramTensorInfo strides.
+    torch.ops.aten.view.default:         _meta1(),
+    torch.ops.aten.unsqueeze.default:    _meta1(),
+    torch.ops.aten.squeeze.dim:          _meta1(),
+    torch.ops.aten.expand.default:       _meta1(),
+    torch.ops.aten.permute.default:      _meta1(),
+    torch.ops.aten.transpose.int:        _meta1(),
+    torch.ops.aten.t.default:            _meta1(),
 }
 
 
