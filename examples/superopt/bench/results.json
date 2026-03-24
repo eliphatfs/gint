@@ -1,0 +1,125 @@
+{
+  "system": {
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "cuda_version": "12.1",
+    "pytorch_version": "2.5.0+cu121"
+  },
+  "experiments": {
+    "phase_breakdown": {
+      "experiment": "phase_breakdown",
+      "target": "gelu",
+      "search_length": 5,
+      "n_candidates": 14108850,
+      "n_ops": 45,
+      "batch_size": 4096,
+      "n_matches": 0,
+      "phases": {
+        "enumeration_s": 6.911,
+        "bytecode_build_s": 8.286,
+        "gpu_execution_s": 4.449,
+        "comparison_s": 0.299
+      },
+      "total_s": 19.945,
+      "throughput_candidates_per_s": 707378
+    },
+    "executor_breakdown": {
+      "experiment": "executor_breakdown",
+      "target": "relu",
+      "batch_size": 4096,
+      "n_batches": 20,
+      "avg_timings_ms": {
+        "alloc_code_ms": 0.012,
+        "build_ti_ms": 0.718,
+        "copy_ti_ms": 0.12,
+        "build_ptrs_ms": 0.399,
+        "copy_ptrs_ms": 0.011,
+        "launch_ms": 0.019,
+        "free_ms": 0.029,
+        "total_ms": 1.308
+      },
+      "throughput_candidates_per_s": 3131498
+    },
+    "three_way_comparison": {
+      "experiment": "three_way_comparison",
+      "target": "relu",
+      "search_length": 4,
+      "n_candidates_total": 69457,
+      "cpu": {
+        "n_evaluated": 69457,
+        "time_s": 0.229,
+        "throughput_per_s": 303966,
+        "matches": 3
+      },
+      "sequential_gpu": {
+        "n_evaluated": 2000,
+        "time_s": 0.172,
+        "throughput_per_s": 11625,
+        "matches": 0
+      },
+      "batch_gpu": {
+        "n_evaluated": 69457,
+        "time_s": 0.057,
+        "throughput_per_s": 1216725,
+        "matches": 3
+      },
+      "speedup_vs_cpu": 4.0,
+      "speedup_vs_seq_gpu": 104.7
+    },
+    "batch_scaling": {
+      "experiment": "batch_scaling",
+      "target": "gelu",
+      "search_length": 5,
+      "n_candidates": 14108850,
+      "scaling": [
+        {
+          "batch_size": 256,
+          "n_reps": 256,
+          "time_s": 0.039,
+          "throughput_per_s": 1663000
+        },
+        {
+          "batch_size": 512,
+          "n_reps": 128,
+          "time_s": 0.029,
+          "throughput_per_s": 2242095
+        },
+        {
+          "batch_size": 1024,
+          "n_reps": 64,
+          "time_s": 0.024,
+          "throughput_per_s": 2756212
+        },
+        {
+          "batch_size": 2048,
+          "n_reps": 32,
+          "time_s": 0.021,
+          "throughput_per_s": 3079285
+        },
+        {
+          "batch_size": 4096,
+          "n_reps": 16,
+          "time_s": 0.022,
+          "throughput_per_s": 2999964
+        },
+        {
+          "batch_size": 8192,
+          "n_reps": 8,
+          "time_s": 0.022,
+          "throughput_per_s": 3035891
+        },
+        {
+          "batch_size": 16384,
+          "n_reps": 4,
+          "time_s": 0.022,
+          "throughput_per_s": 3038206
+        }
+      ],
+      "full_search": {
+        "time_s": 13.1,
+        "throughput_per_s": 1073683,
+        "matches": 0
+      }
+    }
+  },
+  "total_time_s": 41.0
+}
