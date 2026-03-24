@@ -29,11 +29,11 @@ jobs:
 
       - name: Install gint (codegen deps only)
         run: |
-          python3 -m pip install --break-system-packages llvmlite rich numpy
+          python3 -m pip install llvmlite rich numpy
 
       - name: Install gint package
         run: |
-          python3 -m pip install --break-system-packages --no-deps -e .
+          python3 -m pip install --no-deps -e .
 
       - name: Generate fatbin
         run: |
