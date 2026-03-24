@@ -6,6 +6,16 @@ build-backend = "hatchling.build"
 name = "gint"
 dynamic = ["version"]
 license = "LGPL-2.1-or-later"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "llvmlite>=0.43",
+    "cuda-bindings>=12.6",
+    "rich",
+]
+
+[project.optional-dependencies]
+torch = ["torch>=2.0"]
 
 [tool.hatch.version]
 path = "gint/version.py"
@@ -13,6 +23,17 @@ path = "gint/version.py"
 [tool.hatch.build.targets.sdist]
 include = [
     "/gint",
+]
+artifacts = [
+    "gint/host/cuda/gint.fatbin.xz",
+]
+
+[tool.hatch.build.targets.wheel]
+include = [
+    "/gint",
+]
+artifacts = [
+    "gint/host/cuda/gint.fatbin.xz",
 ]
 
 [project.scripts]

@@ -112,6 +112,45 @@ The codebase is split into:
   - **Atomic single-pass**: Each warp reduces its chunk, `atomicAdd`s to output. Needs new `atomic_rmw` instruction (`LL.atomic_rmw('fadd', ptr, val, 'monotonic')` in llvmlite → `atom.global.add.f32` on sm_60+).
   - **Last-block trick** (like PyTorch): Needs `atomicInc` instruction + global partial buffer + conditional branch. Most efficient (single launch, full utilization, no FP atomics) but requires the most kernel additions.
 
+## Dependencies
+
+Runtime dependencies (declared in `pyproject.toml`):
+- `numpy`, `llvmlite>=0.43`, `cuda-bindings>=12.6`, `rich`
+- Optional: `torch>=2.0` (for conductor / `torch.compile` backend)
+
+### cuda-python / cuda-bindings Version Compatibility
+
+The `cuda-python` package was restructured into a metapackage starting at v12.6. The actual bindings live in `cuda-bindings`. Both 12.x (up to 12.9.x) and 13.x lines are actively maintained in parallel.
+
+| Version line | Import style | Status |
+|---|---|---|
+| cuda-python <=12.5 | `from cuda import cuda` (old trampoline) | EOL |
+| cuda-bindings 12.6–12.9.x | `import cuda.bindings.driver as cuda` | Maintained |
+| cuda-bindings 13.0+ | `import cuda.bindings.driver as cuda` | Current |
+
+**This project uses `import cuda.bindings.driver as cuda`**, which works on both 12.6+ and 13.x. The dependency spec `cuda-bindings>=12.6` accepts either line.
+
+Key 13.0 changes: old trampoline modules (`cuda.cuda`, `cuda.cudart`) removed; GIL released for all C API calls; `int(cuda_obj)` deprecated in favor of `cuda.bindings.utils.get_cuda_native_handle()` (13.0+ only, `int()` still works). We use `int()` in `driver.py` and `executor_impl.py` — no change needed until `int()` is actually removed.
+
+### GPU Architecture Support (Fatbin)
+
+The fatbin (`gint/host/cuda/gint.fatbin.xz`) includes native SASS for:
+
+| Architecture | Compute Capability | GPUs |
+|---|---|---|
+| Turing | sm_75 | RTX 2080, T4 |
+| Ampere | sm_80, sm_86 | A100, RTX 3090 |
+| Ada Lovelace | sm_89 | RTX 4090, L40 |
+| Hopper | sm_90 | H100, H200 |
+| Blackwell (datacenter) | sm_100 | B100, B200, GB200 |
+| Blackwell (consumer) | sm_120 | RTX 5090, RTX 5080 |
+
+Plus embedded `compute_120` PTX for forward compatibility with future architectures.
+
+**Important**: sm_100 and sm_120 are **sibling** architectures, not parent/child. sm_120 is NOT a superset of sm_100 — they have different tensor core models. Both need explicit `-gencode` entries. PTX forward compatibility from `compute_90` is unreliable on Blackwell (the driver JIT can reject older PTX despite it being theoretically supported). Native SASS via CUDA 12.8+ is required.
+
+**Build requirement**: `generate.sh` requires **CUDA Toolkit 12.8+** (for sm_100/sm_120 support). Earlier nvcc versions will fail on the Blackwell gencode flags.
+
 ## Common Commands
 
 ### Testing
@@ -130,6 +169,7 @@ Tests use Python's `unittest` framework (not pytest).
 ### Code Generation
 ```bash
 # Generate LLVM IR and compile to PTX/fatbin for all compute capabilities
+# Requires: CUDA Toolkit 12.8+, LLVM/clang 18, llvmlite, rich, numpy
 ./generate.sh
 
 # Generates files:
@@ -139,24 +179,13 @@ Tests use Python's `unittest` framework (not pytest).
 # - gint/host/cuda/gint.fatbin.xz (deployed version, NOT tracked in git)
 ```
 
-**Manual generation steps** (if needed):
-```bash
-# Step 1: Generate LLVM IR and compile to PTX
-gint-gen-llir -t ptx --cc 70 -o artifact/gint.ptx
+### CI / Wheel Build
 
-# Step 2: Compile PTX to fatbin (multi-arch)
-nvcc -fatbin --ptxas-options=-v \
-  -gencode arch=compute_75,code=sm_75 \
-  -gencode arch=compute_80,code=sm_80 \
-  -gencode arch=compute_86,code=sm_86 \
-  -gencode arch=compute_89,code=sm_89 \
-  -gencode arch=compute_90,code=sm_90 \
-  artifact/gint.ptx -o artifact/gint.fatbin
+GitHub Actions workflow (`.github/workflows/build.yml`) — **manual dispatch only** (`workflow_dispatch`):
+1. `generate-fatbin` job: runs in `nvidia/cuda:12.8.1-devel-ubuntu22.04` container, installs LLVM 18, generates the fatbin
+2. `build-wheel` job: downloads fatbin artifact, builds a `py3-none-any` wheel with hatchling, verifies fatbin is included
 
-# Step 3: Compress and deploy
-xz -efk artifact/gint.fatbin
-cp artifact/gint.fatbin.xz gint/host/cuda/gint.fatbin.xz
-```
+The wheel is pure Python (no native extensions) so only one Python version is needed for the build. The fatbin is included via hatchling's `artifacts` config which overrides `.gitignore` exclusion.
 
 ## Key Implementation Details
 
@@ -246,6 +275,13 @@ A GPU-accelerated superoptimizer that finds shorter equivalent bytecode sequence
 
 ## Installation
 
-Built with `hatchling`. The project exposes:
+Built with `hatchling`. Requires Python >=3.10.
+
+```bash
+pip install -e .          # core (needs cuda-bindings, numpy, llvmlite, rich)
+pip install -e ".[torch]" # with torch.compile backend
+```
+
+Entry points:
 - `gint-gen-llir`: LLVM IR generation script
 - `gint-driver`: Driver utility
