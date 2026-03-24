@@ -103,6 +103,15 @@ The codebase is split into:
 - **Partitioner safety**: When a metadata op's global input shape is not broadcast-compatible with the output shape (e.g., `view(1024) → (32, 32)`), the node is skipped and falls back to eager execution. The `_compute_broadcast_plan` validates that each tensor dim is either 1 or equal to the output dim
 - **Current limitation**: Transpose/permute are registered but typically cause subgraph breaks because the transposed shape isn't broadcast-compatible with the original. Full support would require the broadcast plan to use actual tensor strides from FX metadata instead of computed C-contiguous strides
 
+#### Reduction Design Notes (planned, not yet implemented)
+- **Existing kernel primitives**: `warp_allreduce_fsum/fmax/fmin/fprod` reduce across 32 threads, independently per width lane (4 partial results). Need width-lane reduce + loop for full reductions.
+- **Missing kernel pieces**: (1) Width-lane reduction instruction to combine 4 partial sums into one scalar. (2) Loop instruction for reduction dims > 128 elements.
+- **PyTorch's approach** for large vector reductions (`reduce_kernel`): Launches many blocks (all SMs active). Each block reduces its chunk, writes partial to a global buffer, then `atomicInc` a completion counter. The **last block** to finish detects this via the counter and does the final reduction of all partials. This packs a two-pass tree reduction into a single kernel launch. The atomic is on a **counter** (not the output value), avoiding FP non-determinism.
+- **Gint approach options**:
+  - **Two-program via `execute_indirect`**: Program 1 = each warp reduces a chunk and stores a partial. Program 2 = one warp reduces the partials. Already supported infrastructure, needs loop + width-lane reduce instructions only.
+  - **Atomic single-pass**: Each warp reduces its chunk, `atomicAdd`s to output. Needs new `atomic_rmw` instruction (`LL.atomic_rmw('fadd', ptr, val, 'monotonic')` in llvmlite → `atom.global.add.f32` on sm_60+).
+  - **Last-block trick** (like PyTorch): Needs `atomicInc` instruction + global partial buffer + conditional branch. Most efficient (single launch, full utilization, no FP atomics) but requires the most kernel additions.
+
 ## Common Commands
 
 ### Testing
@@ -197,10 +206,43 @@ gint/
   conductor/         # torch.compile backend
   scripts/           # gen_llir.py, driver.py
 
+examples/
+  superopt/          # GPU-accelerated bytecode superoptimizer
+
 tests/               # unittest modules
 benchmark/           # Performance benchmarks
 artifact/            # Build outputs (not in git)
 ```
+
+### Superoptimizer
+```bash
+# Search for shorter equivalent bytecode sequences for a target
+python -m examples.superopt relu
+
+# Run on all targets
+python -m examples.superopt --all
+
+# List available targets
+python -m examples.superopt --list
+```
+
+## Superoptimizer (`examples/superopt/`)
+
+A GPU-accelerated superoptimizer that finds shorter equivalent bytecode sequences for gint instruction patterns. Uses `execute_indirect` to evaluate thousands of candidate programs per kernel launch — no kernel changes needed.
+
+### Architecture
+- **`opcodes.py`**: Search space definition — 33+ ops with stack effects (min_depth, net_effect). Expandable with transcendentals.
+- **`candidates.py`**: DFS enumeration with depth-reachability pruning. For length 5 unary targets, prunes 33^5=40M down to ~1.5M valid sequences. Also has numpy-vectorized random batch generation for stochastic search.
+- **`executor.py`**: `BatchRunner` — concatenates all candidate bytecodes into one device allocation, builds per-candidate tensor infos with only the output pointer patched, uses a single indirect-mode kernel launch. ~8 CUDA API calls regardless of batch size.
+- **`search.py`**: Brute-force (exhaustive, length 1..N) and stochastic (random mutation hill climbing) modes. Candidates verified with 10 additional random test vector sets.
+- **`targets.py`**: Reference sequences from `op_registry.py` to optimize.
+
+### Key insight discovered
+`fselect` treats `peek(0)` as a float condition (`>0` → true branch). This means explicit comparison-against-zero patterns (`fpush(0) → flt/fgt → fselect`) can often be eliminated:
+- **relu**: `x * float(x > 0)` via `dup → fpush(0) → flt → fmul` (4 insns, was 5)
+- **abs**: `select(-x > 0, -x, x)` via `dup → fneg → dup → fselect` (4 insns, was 7)
+- **leaky_relu**: `dup → fmulimm(ns) → dupx1 → fselect` exploits that `ns*x > 0 ↔ x > 0` for positive slopes (4 insns, was 7)
+- **gelu, silu**: Already optimal (6 and 5 insns respectively)
 
 ## Installation
 

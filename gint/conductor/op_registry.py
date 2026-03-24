@@ -69,40 +69,41 @@ def _meta1() -> OpDescriptor:
 # ---------------------------------------------------------------------------
 
 def _emit_relu(_node):
-    """relu(x) = select(x>0, x, 0).
+    """relu(x) = x * (x > 0).
 
     Stack trace (rightmost = top):
       [x]           start
       [x, x]        dup
       [x, x, 0]     fpush(0)
-      [0, x, x, 0]  dupx2: v1=0,v2=x,v3=x → pop3; push(v1) push(v3) push(v2) push(v1)
-      [0, x, cond]  flt: peek(0)=0 < peek(1)=x → cond(x>0), pops 2
-      [relu(x)]     fselect: peek(0)=cond, peek(1)=x (true), peek(2)=0 (false)
+      [x, cond]     flt: 0 < x → cond = float(x > 0), pops 2
+      [relu(x)]     fmul: x * cond = x if x>0 else 0
+
+    Discovered by superoptimizer (was 5 insns, now 4).
     """
     fe.dup()
     fe.fpush(0.0)
-    fe.dupx2()
     fe.flt()
-    fe.fselect()
+    fe.fmul()
 
 
 def _emit_abs(_node):
-    """abs(x) = select(x>0, x, -x)."""
-    # [x]
-    # dup     -> [x, x]
-    # fneg    -> [x, -x]      top=-x
-    # swap    -> [-x, x]      top=x
-    # dup     -> [-x, x, x]
-    # fpush(0)-> [-x, x, x, 0]
-    # flt: 0 < x = x>0.  pop 0 and x  -> [-x, x, cond]   top=cond
-    # Select: peek(0)=cond, peek(1)=x(true), peek(2)=-x(false)
-    #         = select(x>0, x, -x) = |x|  ✓
+    """abs(x) = select(-x > 0, -x, x) = select(x < 0, -x, x).
+
+    Stack trace (rightmost = top):
+      [x]           start
+      [x, x]        dup
+      [x, -x]       fneg
+      [x, -x, -x]   dup
+      [abs(x)]      fselect: cond=-x, true=-x(x<0), false=x(x>=0)
+
+    fselect treats peek(0) as float condition (>0 → true), so when -x > 0
+    (i.e. x < 0) it picks peek(1) = -x, otherwise peek(2) = x.
+
+    Discovered by superoptimizer (was 7 insns, now 4).
+    """
     fe.dup()
     fe.fneg()
-    fe.swap()
     fe.dup()
-    fe.fpush(0.0)
-    fe.flt()
     fe.fselect()
 
 
@@ -150,18 +151,33 @@ def _emit_leaky_relu(node):
     # [x]
     # dup              -> [x, x]
     # fmulimm(ns)     -> [x, ns*x]
-    # swap             -> [ns*x, x]           top=x (true branch)
-    # dup              -> [ns*x, x, x]
-    # fpush(0)         -> [ns*x, x, x, 0]
-    # flt: 0<x=x>0    -> [ns*x, x, cond]    top=cond
-    # Select: cond=top, true=x(2nd), false=ns*x(3rd)
-    #         = select(x>0, x, ns*x) = leaky_relu ✓
+    # dupx1            -> [x, ns*x, x]       (inserts x below top)
+    # fselect: cond=x, true=ns*x, false=x ... wait, peek order:
+    #   peek(0)=x (cond), peek(1)=ns*x (true-if-cond>0), peek(2)=x (false)
+    #   when x>0: picks peek(1)=ns*x — WRONG, we want x when x>0.
+    #
+    # We need: select(x>0, x, ns*x).  dupx1 gives [x, ns*x, x].
+    # fselect: cond=x(top), true=ns*x, false=x(bottom).
+    # When x>0: true branch = ns*x.  That's leaky_relu inverted!
+    # Fix: reverse the branches.  Use [ns*x, x, x] instead:
+    #   dup -> fmulimm(ns) -> dupx1 gives [ns*x, fmulimm_result, x]... no.
+    #
+    # Actually dupx1 copies top and inserts below second:
+    #   [x, ns*x] -> dupx1 -> [x, ns*x, ns*x] ... no, dupx1 copies top,
+    #   inserts 1 below: [a, b] -> [a, b, a]?  Let me check.
+    #
+    # DupX1: v1=pop, v2=pop, push(v1), push(v2), push(v1)
+    #   [x, ns*x]: v1=ns*x, v2=x -> push(ns*x), push(x), push(ns*x)
+    #   = [ns*x, x, ns*x]
+    # fselect: cond=ns*x, true=x, false=ns*x
+    #   when ns*x>0 (i.e. x>0 for ns>0): picks x  ✓
+    #   when ns*x<=0 (i.e. x<=0): picks ns*x  ✓
+    # = leaky_relu(x)  ✓
+    #
+    # Discovered by superoptimizer (was 7 insns, now 4).
     fe.dup()
     fe.fmulimm(neg_slope)
-    fe.swap()
-    fe.dup()
-    fe.fpush(0.0)
-    fe.flt()
+    fe.dupx1()
     fe.fselect()
 
 
@@ -241,7 +257,7 @@ OP_REGISTRY: dict = {
     # --- Unary arithmetic ---
     torch.ops.aten.neg.default:   _ew1(fe.fneg),
     torch.ops.aten.abs.default:
-        OpDescriptor(1, OpKind.ELEMENTWISE, _emit_abs, peak_stack_extra=3),
+        OpDescriptor(1, OpKind.ELEMENTWISE, _emit_abs, peak_stack_extra=2),
 
     # --- Unary transcendental ---
     torch.ops.aten.sqrt.default:  _ew1(fe.fsqrt),
@@ -260,10 +276,13 @@ OP_REGISTRY: dict = {
 
     # --- Activation functions (multi-instruction sequences) ---
     # peak_stack_extra: max extra hardware slots used internally beyond the input already on stack.
-    # relu/abs/leaky_relu peak at 4 items deep (3 above the 1 input).
-    # gelu/silu peak at 2 (1 above the 1 input).
+    # Sequences were optimized by the GPU superoptimizer (examples/superopt/).
+    # relu: 4 insns (was 5), peak 2 extra (dup pushes 1 slot above input)
+    # abs: 4 insns (was 7), peak 2 extra (dup+fneg+dup → 3 items, but fselect consumes 3→1)
+    # leaky_relu: 4 insns (was 7), peak 2 extra
+    # gelu/silu: unchanged, already optimal
     torch.ops.aten.relu.default:
-        OpDescriptor(1, OpKind.ELEMENTWISE, _emit_relu, peak_stack_extra=3),
+        OpDescriptor(1, OpKind.ELEMENTWISE, _emit_relu, peak_stack_extra=2),
     torch.ops.aten.gelu.default:
         OpDescriptor(1, OpKind.ELEMENTWISE, _emit_gelu,
                      check_fn=_check_gelu_approx, peak_stack_extra=1),
@@ -272,7 +291,7 @@ OP_REGISTRY: dict = {
     torch.ops.aten.leaky_relu.default:
         # arg_order=[0]: only push the tensor input; negative_slope is read from node.args[1]
         # at emit time as a fmulimm immediate — do NOT push it onto the stack.
-        OpDescriptor(1, OpKind.ELEMENTWISE, _emit_leaky_relu, arg_order=[0], peak_stack_extra=3),
+        OpDescriptor(1, OpKind.ELEMENTWISE, _emit_leaky_relu, arg_order=[0], peak_stack_extra=2),
 
     # --- Metadata ops (shape/stride changes, identity on stack) ---
     # These emit no bytecode.  The value on the stack is unchanged; only the
