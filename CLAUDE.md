@@ -151,6 +151,24 @@ Plus embedded `compute_120` PTX for forward compatibility with future architectu
 
 **Build requirement**: `generate.sh` requires **CUDA Toolkit 12.8+** (for sm_100/sm_120 support). Earlier nvcc versions will fail on the Blackwell gencode flags.
 
+### Cross-Platform Porting Notes
+
+The architecture cleanly separates platform-specific code into two layers: `PlatformIRBuilder` (device-side, in `gint/kernel/platforms/`) and `BaseExecutor` (host-side, in `gint/host/`). All 106 opcodes and the entire interpreter dispatch loop are platform-agnostic LLVM IR. A new platform needs:
+
+1. **`PlatformIRBuilder` subclass** — implement ~17 abstract methods: thread/warp indexing, warp shuffle/broadcast/reduce, shared memory address space, transcendental math library calls, kernel module creation (triple, data layout, calling convention)
+2. **`BaseExecutor` subclass** — device memory management, kernel loading, launch API
+3. **Build pipeline** — LLVM IR → platform binary (fatbin, HSACO, SPIR-V, etc.)
+
+| Target | Difficulty | Notes |
+|---|---|---|
+| **AMD ROCm (HIP)** | Moderate | Maps 1:1 conceptually. `llvm.amdgcn.*` intrinsics for shuffles/indexing, `ocml` for math (like libdevice). `hip-python` for host API. Main issue: wavefront size is 64 on CDNA (MI250/MI300) vs our assumed 32 — either force wave32 on RDNA3 or adapt shuffle masks and reduction rounds for wave64. Also unclear if llvmlite bundles the AMDGCN backend. |
+| **OpenCL SPIR-V** | Moderate-Hard | Best cross-vendor path. `llvm-spirv` translates LLVM IR → OpenCL SPIR-V, and the OpenCL execution model (kernel functions with pointer args, flat address space, raw pointer arithmetic) matches our design closely. Subgroup ops (`cl_khr_subgroups`) map to warp primitives. Runs on Intel, AMD, NVIDIA via their OpenCL drivers. `pyopencl` for host API. Main issues: subgroup size varies by vendor (32/64/8-32), driver optimization quality lags CUDA. |
+| **Vulkan SPIR-V** | Hard | Vulkan uses a fundamentally different execution model: no raw pointers (descriptor sets + buffer offsets), `GLCompute` execution model vs `Kernel`. Our pointer-table indirect dispatch doesn't translate directly. Would likely need a parallel SPIR-V codegen path rather than reusing llvmlite → `llvm-spirv`. Subgroup ops available (Vulkan 1.1+) but size varies. Math via `GLSL.std.450` extended instructions. |
+| **Apple Metal GPU** | Hard | No LLVM IR → Metal path. Would need to generate MSL source or Metal IR directly. Metal has `simdgroup` ops (size 32 on Apple Silicon) that map well to our warp primitives. `pyobjc` for host API. Apple's `metal` compiler is clang-based but Metal IR format is undocumented. |
+| **Apple NPU (ANE)** | Impossible | Not a programmable compute device — executes compiled neural network graphs (Core ML), no user-accessible ISA, no thread model. |
+
+**Key constraint across all targets**: the interpreter assumes `WARP_SIZE=32` (32 threads per subgroup). RDNA3 AMD GPUs support wave32 natively, but CDNA and some Intel GPUs use 64 or variable sizes. This affects `lane_id` bounds, shuffle masks, and the tree reduction in `warp_allreduce` (5 rounds for 32, 6 for 64).
+
 ## Common Commands
 
 ### Testing
