@@ -81,7 +81,7 @@ The codebase is split into:
 ### Torch.Compile Integration (Conductor)
 - `gint/conductor/backend.py`: Backend registration and entry point
 - `gint/conductor/compiler.py`: FX graph → bytecode conversion, graph partitioning, and broadcasting
-- Supports basic arithmetic ops (add, sub, mul, div), unary transcendentals, activations (relu, gelu, silu, leaky_relu), comparisons, `where`, and metadata ops (view, unsqueeze, squeeze, expand, permute, transpose, t); fallback to eager mode for unsupported ops
+- Supports basic arithmetic ops (add, sub, mul, div), unary transcendentals, activations (relu, gelu, silu, leaky_relu), comparisons, `where`, metadata ops (view, unsqueeze, squeeze, expand, permute, transpose, t), and reduction ops (sum, mean on innermost dim); fallback to eager mode for unsupported ops
 - Partitioner constraints per subgraph: max 8 global tensor slots, max stack depth 8, broadcast-compatible shapes
 
 #### Broadcasting Support
@@ -103,14 +103,35 @@ The codebase is split into:
 - **Partitioner safety**: When a metadata op's global input shape is not broadcast-compatible with the output shape (e.g., `view(1024) → (32, 32)`), the node is skipped and falls back to eager execution. The `_compute_broadcast_plan` validates that each tensor dim is either 1 or equal to the output dim
 - **Current limitation**: Transpose/permute are registered but typically cause subgraph breaks because the transposed shape isn't broadcast-compatible with the original. Full support would require the broadcast plan to use actual tensor strides from FX metadata instead of computed C-contiguous strides
 
-#### Reduction Design Notes (planned, not yet implemented)
-- **Existing kernel primitives**: `warp_allreduce_fsum/fmax/fmin/fprod` reduce across 32 threads, independently per width lane (4 partial results). Need width-lane reduce + loop for full reductions.
-- **Missing kernel pieces**: (1) Width-lane reduction instruction to combine 4 partial sums into one scalar. (2) Loop instruction for reduction dims > 128 elements.
-- **PyTorch's approach** for large vector reductions (`reduce_kernel`): Launches many blocks (all SMs active). Each block reduces its chunk, writes partial to a global buffer, then `atomicInc` a completion counter. The **last block** to finish detects this via the counter and does the final reduction of all partials. This packs a two-pass tree reduction into a single kernel launch. The atomic is on a **counter** (not the output value), avoiding FP non-determinism.
-- **Gint approach options**:
-  - **Two-program via `execute_indirect`**: Program 1 = each warp reduces a chunk and stores a partial. Program 2 = one warp reduces the partials. Already supported infrastructure, needs loop + width-lane reduce instructions only.
-  - **Atomic single-pass**: Each warp reduces its chunk, `atomicAdd`s to output. Needs new `atomic_rmw` instruction (`LL.atomic_rmw('fadd', ptr, val, 'monotonic')` in llvmlite → `atom.global.add.f32` on sm_60+).
-  - **Last-block trick** (like PyTorch): Needs `atomicInc` instruction + global partial buffer + conditional branch. Most efficient (single launch, full utilization, no FP atomics) but requires the most kernel additions.
+#### Reduction Support (sum, mean)
+- Registered as `OpKind.REDUCTION` in `op_registry.py` for `aten.sum.dim_IntList` and `aten.mean.dim`
+- **Constraint**: Innermost-dim only, single reduction dim. Non-innermost reductions fall back to eager
+- **No kernel changes required** — width-lane combining is composed from existing instructions:
+  ```
+  warp_allreduce_fsum     ; [p0, p1, p2, p3] per thread
+  dup; fperm_w(2,3,0,1); fadd   ; [p0+p2, p1+p3, ...]
+  dup; fperm_w(1,0,3,2); fadd   ; [total, total, total, total]
+  ```
+  7 instructions total. Mean adds `fmulimm(1/N)`.
+- **Reduction grid model**: One warp per batch element (not per 128 output elements). Each warp consumes the entire reduction dim via unrolled multi-chunk loads: `fldg_1d(0, slot); fldg_1d(128, slot); fadd; ...`
+- **Multi-chunk loads**: For reduction dims > 128, loads are unrolled at Python codegen time (not kernel runtime). `block_shape_stride_1[0] = N` (full reduction dim) so OOB masking returns 0.0 for partial last chunks. Practical for N up to ~16K.
+- **Partitioner**: Reduction nodes are isolated as single-node subgraphs (flush any current pointwise subgraph)
+
+#### Fused Reduction+Broadcast+Pointwise
+- When a `keepdim=True` reduction feeds into a binary pointwise op that also consumes the original unreduced input (e.g., `x - mean(x, dim=-1, keepdim=True)`), the conductor fuses both into a single subgraph
+- **Two-phase bytecode** (mirrors the handwritten rmsnorm kernel in `tests/test_rmsnorm.py`):
+  - Phase 1: Load input in chunks, accumulate, warp_allreduce + width-lane combine → scalar stays on stack
+  - Phase 2: For each chunk, `dup` scalar, reload input, apply pointwise op, store output
+- **Fusion detection** (`_can_fuse_with_reduction`): Currently limited to a single binary elementwise op where the reduction result has no external users
+- **Stack depth**: Phase 1 peaks at ~2 extra slots (width-lane combine). Phase 2 needs scalar + 1 for input + op overhead. Total ~4-5, well within MAX_STACK=8
+- Example: `y = x - mean(x, dim=-1, keepdim=True)` for `x.shape = (M, N)` → single kernel launch with M warps, each loading N elements twice (reduce pass + pointwise pass)
+
+#### Reduction Future Work
+- **Dedicated `WarpFullReduceSum` instruction** — single opcode replacing the 7-instruction width-lane combine sequence
+- **Kernel loop instruction** — for reduction dims > ~16K without bytecode bloat
+- **Non-innermost reductions** — would require transposing the tensor or a different grid decomposition
+- **Multi-op fusion** — fusing reduction with more complex pointwise chains (e.g., `relu(x - mean(x, keepdim=True))`) beyond the current single binary op limit
+- **Multi-reduction patterns** — e.g., layer norm (mean + variance in one pass)
 
 ## Dependencies
 
