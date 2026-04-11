@@ -329,6 +329,115 @@ class TestConductorBackend(unittest.TestCase):
         torch.testing.assert_close(fn(x), expected)
 
 
+    # ------------------------------------------------------------------
+    # Reduction ops (sum, mean)
+    # ------------------------------------------------------------------
+
+    def test_sum_1d(self):
+        @torch.compile(backend="gint_test")
+        def fn(x):
+            return torch.sum(x, dim=0)
+
+        x = torch.randn(128, device='cuda')
+        torch.testing.assert_close(fn(x), torch.sum(x, dim=0), atol=1e-4, rtol=1e-4)
+
+    def test_sum_innermost(self):
+        @torch.compile(backend="gint_test")
+        def fn(x):
+            return torch.sum(x, dim=-1)
+
+        x = torch.randn(32, 64, device='cuda')
+        torch.testing.assert_close(fn(x), torch.sum(x, dim=-1), atol=1e-4, rtol=1e-4)
+
+    def test_sum_full_warp(self):
+        @torch.compile(backend="gint_test")
+        def fn(x):
+            return torch.sum(x, dim=-1)
+
+        x = torch.randn(16, 128, device='cuda')
+        torch.testing.assert_close(fn(x), torch.sum(x, dim=-1), atol=1e-4, rtol=1e-4)
+
+    def test_mean_innermost(self):
+        @torch.compile(backend="gint_test")
+        def fn(x):
+            return torch.mean(x, dim=-1)
+
+        x = torch.randn(32, 64, device='cuda')
+        torch.testing.assert_close(fn(x), torch.mean(x, dim=-1), atol=1e-4, rtol=1e-4)
+
+    def test_sum_keepdim(self):
+        @torch.compile(backend="gint_test")
+        def fn(x):
+            return torch.sum(x, dim=-1, keepdim=True)
+
+        x = torch.randn(32, 128, device='cuda')
+        torch.testing.assert_close(fn(x), torch.sum(x, dim=-1, keepdim=True), atol=1e-4, rtol=1e-4)
+
+    def test_mean_keepdim(self):
+        @torch.compile(backend="gint_test")
+        def fn(x):
+            return torch.mean(x, dim=-1, keepdim=True)
+
+        x = torch.randn(32, 64, device='cuda')
+        torch.testing.assert_close(fn(x), torch.mean(x, dim=-1, keepdim=True), atol=1e-4, rtol=1e-4)
+
+    def test_sum_large_dim(self):
+        """Reduction dim > 128, requires multi-chunk unrolled loads."""
+        @torch.compile(backend="gint_test")
+        def fn(x):
+            return torch.sum(x, dim=-1)
+
+        x = torch.randn(8, 512, device='cuda')
+        torch.testing.assert_close(fn(x), torch.sum(x, dim=-1), atol=1e-3, rtol=1e-3)
+
+    def test_sum_3d(self):
+        @torch.compile(backend="gint_test")
+        def fn(x):
+            return torch.sum(x, dim=-1)
+
+        x = torch.randn(4, 8, 32, device='cuda')
+        torch.testing.assert_close(fn(x), torch.sum(x, dim=-1), atol=1e-4, rtol=1e-4)
+
+    def test_sum_non_innermost_fallback(self):
+        """Non-innermost reduction should fall back to eager."""
+        @torch.compile(backend="gint_test")
+        def fn(x):
+            return torch.sum(x, dim=0)
+
+        x = torch.randn(32, 64, device='cuda')
+        torch.testing.assert_close(fn(x), torch.sum(x, dim=0), atol=1e-4, rtol=1e-4)
+
+    def test_mean_subtract(self):
+        """Reduction + broadcast pointwise: x - mean(x, keepdim=True)."""
+        @torch.compile(backend="gint_test")
+        def fn(x):
+            return x - torch.mean(x, dim=-1, keepdim=True)
+
+        x = torch.randn(16, 64, device='cuda')
+        expected = x - torch.mean(x, dim=-1, keepdim=True)
+        torch.testing.assert_close(fn(x), expected, atol=1e-4, rtol=1e-4)
+
+    def test_normalize_fused(self):
+        """Fused: x / sum(x, keepdim=True)."""
+        @torch.compile(backend="gint_test")
+        def fn(x):
+            return x / torch.sum(x, dim=-1, keepdim=True)
+
+        x = torch.rand(8, 32, device='cuda') + 0.1  # positive to avoid div-by-zero
+        expected = x / torch.sum(x, dim=-1, keepdim=True)
+        torch.testing.assert_close(fn(x), expected, atol=1e-4, rtol=1e-4)
+
+    def test_mean_subtract_large(self):
+        """Fused reduction+pointwise with multi-chunk (dim > 128)."""
+        @torch.compile(backend="gint_test")
+        def fn(x):
+            return x - torch.mean(x, dim=-1, keepdim=True)
+
+        x = torch.randn(4, 256, device='cuda')
+        expected = x - torch.mean(x, dim=-1, keepdim=True)
+        torch.testing.assert_close(fn(x), expected, atol=1e-3, rtol=1e-3)
+
+
 if __name__ == "__main__":
     if torch.cuda.is_available():
         unittest.main()

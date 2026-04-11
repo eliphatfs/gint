@@ -17,6 +17,7 @@ Architecture
 * GintCompiler      – orchestrates the above to produce an executable callable.
 """
 
+import math
 import torch
 import numpy as np
 from typing import Callable, Dict, List, Optional, Set, Union
@@ -30,7 +31,7 @@ from ..host.executor import (
 )
 from ..host import frontend as fe
 from ..host.frontend import FrontendState, _frontend_state
-from .op_registry import OpDescriptor, get_op_descriptor
+from .op_registry import OpDescriptor, OpKind, get_op_descriptor
 
 
 # ---------------------------------------------------------------------------
@@ -421,6 +422,16 @@ class GraphPartitioner:
                     current_shape = None
                 continue
 
+            # Reduction ops get their own subgraph (standalone).
+            op_desc = get_op_descriptor(node)
+            if op_desc is not None and op_desc.kind == OpKind.REDUCTION:
+                if current:
+                    subgraphs.append(ForestTraverser(current).get_schedule())
+                    current = []
+                    current_shape = None
+                subgraphs.append([node])
+                continue
+
             shape = self._get_shape(node)
             if shape is None:
                 if current:
@@ -533,11 +544,42 @@ class GintCompiler:
 
     def compile(self) -> Callable:
         partitioner = GraphPartitioner(self.gm, max_tensors=8, max_stack=8)
-        subgraph_schedules = partitioner.partition()
+        raw_schedules = partitioner.partition()
 
+        # Fuse reduction+broadcast+pointwise pairs where possible.
+        merged_schedules: List[List[Node]] = []
         compiled: Dict[int, GintCompiledSubgraph] = {}
-        for i, schedule in enumerate(subgraph_schedules):
-            compiled[i] = self._compile_subgraph(schedule, partitioner)
+        i = 0
+        sg_index = 0
+        while i < len(raw_schedules):
+            schedule = raw_schedules[i]
+            if self._is_reduction_subgraph(schedule):
+                reduction_node = schedule[0]
+                keepdim = (reduction_node.args[2]
+                           if len(reduction_node.args) > 2
+                           else reduction_node.kwargs.get('keepdim', False))
+                # Try to fuse with the following pointwise subgraph.
+                if (keepdim and i + 1 < len(raw_schedules)
+                        and not self._is_reduction_subgraph(raw_schedules[i + 1])
+                        and self._can_fuse_with_reduction(
+                            reduction_node, raw_schedules[i + 1])):
+                    pw_schedule = raw_schedules[i + 1]
+                    fused_nodes = [reduction_node] + pw_schedule
+                    compiled[sg_index] = self._compile_fused_reduction_subgraph(
+                        reduction_node, pw_schedule, partitioner)
+                    merged_schedules.append(fused_nodes)
+                    sg_index += 1
+                    i += 2
+                    continue
+                compiled[sg_index] = self._compile_reduction_subgraph(
+                    reduction_node, partitioner)
+            else:
+                compiled[sg_index] = self._compile_subgraph(schedule, partitioner)
+            merged_schedules.append(schedule)
+            sg_index += 1
+            i += 1
+
+        subgraph_schedules = merged_schedules
 
         # Map each node → its subgraph index.
         node_to_sg: Dict[Node, int] = {}
@@ -577,6 +619,31 @@ class GintCompiler:
                     return results[res] if isinstance(res, Node) else res
 
         return execute
+
+    @staticmethod
+    def _can_fuse_with_reduction(reduction_node: Node, pw_schedule: List[Node]) -> bool:
+        """Check if a pointwise schedule can fuse with a preceding keepdim reduction.
+
+        Currently only fuses a single binary elementwise op that consumes both the
+        reduction result and the reduction input, and the reduction result has no
+        external users outside the pointwise schedule.
+        """
+        if len(pw_schedule) != 1:
+            return False
+        pw_node = pw_schedule[0]
+        desc = get_op_descriptor(pw_node)
+        if desc is None or desc.kind != OpKind.ELEMENTWISE or desc.arity != 2:
+            return False
+        reduction_input = reduction_node.args[0]
+        node_args = [a for a in pw_node.args if isinstance(a, Node)]
+        if reduction_node not in node_args or reduction_input not in node_args:
+            return False
+        # Reduction result must have no users outside the fused subgraph.
+        pw_set = set(pw_schedule)
+        for user in reduction_node.users:
+            if user not in pw_set:
+                return False
+        return True
 
     # --- Subgraph compilation ---
 
@@ -643,6 +710,171 @@ class GintCompiler:
         return GintCompiledSubgraph(bytecode, tensor_infos,
                                      output_shape=output_shape,
                                      grid_dim=plan['grid_dim'])
+
+    # --- Reduction detection and compilation ---
+
+    @staticmethod
+    def _is_reduction_subgraph(schedule: List[Node]) -> bool:
+        if len(schedule) != 1:
+            return False
+        desc = get_op_descriptor(schedule[0])
+        return desc is not None and desc.kind == OpKind.REDUCTION
+
+    def _compile_reduction_subgraph(
+        self, node: Node, partitioner: GraphPartitioner
+    ) -> GintCompiledSubgraph:
+        input_node = node.args[0]
+        input_shape = list(partitioner._get_shape(input_node))
+        output_shape = list(partitioner._get_shape(node))
+
+        reduction_size = input_shape[-1]
+        n_chunks = math.ceil(reduction_size / 128)
+
+        # Determine tensor slot ordering — input first, output second
+        global_nodes = self._sorted_globals(partitioner._required_globals([node]))
+        tensor_map = {n: i for i, n in enumerate(global_nodes)}
+        input_slot = tensor_map[input_node]
+        output_slot = tensor_map[node]
+
+        fe_state = FrontendState([])
+        token = _frontend_state.set(fe_state)
+        try:
+            # Load and accumulate chunks
+            fe.fldg_1d(0, input_slot)
+            for k in range(1, n_chunks):
+                fe.fldg_1d(k * 128, input_slot)
+                fe.fadd()
+            # Warp reduce + width-lane combine
+            op_desc = get_op_descriptor(node)
+            op_desc.emit_fn(node)
+            # Store
+            fe.fstg_1d(0, output_slot)
+            fe.halt()
+            bytecode = fe_state.bc
+        finally:
+            _frontend_state.reset(token)
+
+        # Build tensor infos for each global node
+        batch_dims = input_shape[:-1] if len(input_shape) > 1 else []
+        tensor_infos = []
+        for gn in global_nodes:
+            if gn is input_node:
+                bstrides = _c_contiguous_strides(input_shape)[:-1] if len(input_shape) > 1 else []
+                tensor_infos.append(ProgramTensorInfo(
+                    elm_size=4,
+                    batch_strides=bstrides,
+                    batch_shape=list(batch_dims),
+                    block_shape_stride_1=[reduction_size, 1],
+                    block_shape_stride_2=[1, 0],
+                    block_grid_dims=[1, 1],
+                    block_grid_steps=[128, 1],
+                ))
+            else:  # output node
+                keepdim = node.args[2] if len(node.args) > 2 else node.kwargs.get('keepdim', False)
+                if keepdim:
+                    out_batch = output_shape[:-1] if len(output_shape) > 1 else []
+                else:
+                    out_batch = list(output_shape) if output_shape else []
+                bstrides = _c_contiguous_strides(out_batch) if out_batch else []
+                tensor_infos.append(ProgramTensorInfo(
+                    elm_size=4,
+                    batch_strides=bstrides,
+                    batch_shape=list(batch_dims),
+                    block_shape_stride_1=[1, 1],
+                    block_shape_stride_2=[1, 0],
+                    block_grid_dims=[1, 1],
+                    block_grid_steps=[1, 1],
+                ))
+
+        grid_dim = max(1, int(np.prod(batch_dims))) if batch_dims else 1
+
+        return GintCompiledSubgraph(
+            bytecode, tensor_infos,
+            output_shape=tuple(output_shape) if output_shape else (),
+            grid_dim=grid_dim,
+        )
+
+    def _compile_fused_reduction_subgraph(
+        self, reduction_node: Node, pw_schedule: List[Node],
+        partitioner: GraphPartitioner,
+    ) -> GintCompiledSubgraph:
+        """Compile a fused reduction+broadcast+pointwise subgraph.
+
+        Emits bytecode in two phases:
+        Phase 1: Load input in chunks, accumulate, reduce → scalar on stack.
+        Phase 2: For each chunk, reload input, apply pointwise op with scalar, store.
+        """
+        pw_node = pw_schedule[0]
+        input_node = reduction_node.args[0]
+        input_shape = list(partitioner._get_shape(input_node))
+        output_shape = list(partitioner._get_shape(pw_node))
+
+        reduction_size = input_shape[-1]
+        n_chunks = math.ceil(reduction_size / 128)
+
+        all_nodes = [reduction_node] + pw_schedule
+        global_nodes = self._sorted_globals(partitioner._required_globals(all_nodes))
+        tensor_map = {n: i for i, n in enumerate(global_nodes)}
+        input_slot = tensor_map[input_node]
+        output_slot = tensor_map[pw_node]
+
+        # Determine whether the reduction result is args[1] of the pointwise op.
+        # If so, after dup+load we need swap to match the registry's expected stack order.
+        pw_args = pw_node.args
+        reduction_is_second = (isinstance(pw_args[1], Node) and pw_args[1] is reduction_node)
+
+        fe_state = FrontendState([])
+        token = _frontend_state.set(fe_state)
+        try:
+            # Phase 1: Load and reduce
+            fe.fldg_1d(0, input_slot)
+            for k in range(1, n_chunks):
+                fe.fldg_1d(k * 128, input_slot)
+                fe.fadd()
+            red_desc = get_op_descriptor(reduction_node)
+            red_desc.emit_fn(reduction_node)
+            # Scalar reduction result is now on top of stack.
+
+            # Phase 2: For each chunk, apply pointwise op
+            pw_desc = get_op_descriptor(pw_node)
+            for k in range(n_chunks):
+                fe.dup()                              # keep scalar for next iteration
+                fe.fldg_1d(k * 128, input_slot)       # load input chunk
+                if reduction_is_second:
+                    # Stack: [scalar_copy, x_chunk]. Registry expects top=args[1]=scalar.
+                    fe.swap()
+                # else: reduction is args[0], registry expects top=args[1]=x. Already correct.
+                pw_desc.emit_fn(pw_node)
+                fe.fstg_1d(k * 128, output_slot)
+            fe.pop()                                  # discard remaining scalar
+            fe.halt()
+            bytecode = fe_state.bc
+        finally:
+            _frontend_state.reset(token)
+
+        # Build tensor infos — both input and output use the full reduction dim.
+        batch_dims = input_shape[:-1] if len(input_shape) > 1 else []
+        bstrides = _c_contiguous_strides(input_shape)[:-1] if len(input_shape) > 1 else []
+
+        tensor_infos = []
+        for gn in global_nodes:
+            tensor_infos.append(ProgramTensorInfo(
+                elm_size=4,
+                batch_strides=list(bstrides),
+                batch_shape=list(batch_dims),
+                block_shape_stride_1=[reduction_size, 1],
+                block_shape_stride_2=[1, 0],
+                block_grid_dims=[1, 1],
+                block_grid_steps=[128, 1],
+            ))
+
+        grid_dim = max(1, int(np.prod(batch_dims))) if batch_dims else 1
+
+        return GintCompiledSubgraph(
+            bytecode, tensor_infos,
+            output_shape=tuple(output_shape),
+            grid_dim=grid_dim,
+        )
 
     # --- Subgraph execution ---
 

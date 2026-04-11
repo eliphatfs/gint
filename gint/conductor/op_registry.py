@@ -198,6 +198,38 @@ def _emit_sub_tensor(node):
 
 
 # ---------------------------------------------------------------------------
+# Reduction helpers
+# ---------------------------------------------------------------------------
+
+def _check_reduction_feasible(node) -> bool:
+    """Innermost-dim reduction, single dim only."""
+    shape = node.args[0].meta['tensor_meta'].shape
+    dims = node.args[1]
+    if len(dims) != 1:
+        return False
+    dim = dims[0] % len(shape)
+    return dim == len(shape) - 1  # innermost only
+
+
+def _emit_sum(_node):
+    """7-instruction full reduction: warp_allreduce + width-lane combine."""
+    fe.warp_allreduce_fsum()
+    fe.dup()
+    fe.fperm_w(2, 3, 0, 1)
+    fe.fadd()
+    fe.dup()
+    fe.fperm_w(1, 0, 3, 2)
+    fe.fadd()
+
+
+def _emit_mean(node):
+    """Sum + divide by count."""
+    _emit_sum(node)
+    shape = node.args[0].meta['tensor_meta'].shape
+    fe.fmulimm(1.0 / float(shape[-1]))
+
+
+# ---------------------------------------------------------------------------
 # Main registry
 # ---------------------------------------------------------------------------
 
@@ -304,6 +336,16 @@ OP_REGISTRY: dict = {
     torch.ops.aten.permute.default:      _meta1(),
     torch.ops.aten.transpose.int:        _meta1(),
     torch.ops.aten.t.default:            _meta1(),
+
+    # --- Reduction ops ---
+    torch.ops.aten.sum.dim_IntList:
+        OpDescriptor(1, OpKind.REDUCTION, _emit_sum,
+                     arg_order=[0], check_fn=_check_reduction_feasible,
+                     peak_stack_extra=2),
+    torch.ops.aten.mean.dim:
+        OpDescriptor(1, OpKind.REDUCTION, _emit_mean,
+                     arg_order=[0], check_fn=_check_reduction_feasible,
+                     peak_stack_extra=2),
 }
 
 
