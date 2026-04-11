@@ -8,9 +8,12 @@ for gfx in gfx1100 gfx1101 gfx1102 gfx11-generic gfx12-generic; do
 done
 
 # Pack all compressed HSACOs into a single zip archive
-cd artifact
-zip -0 gint_amdgcn.zip gint_*.hsaco.xz
-cd ..
+python3 -c "
+import zipfile, glob
+with zipfile.ZipFile('artifact/gint_amdgcn.zip', 'w', zipfile.ZIP_STORED) as zf:
+    for f in sorted(glob.glob('artifact/gint_*.hsaco.xz')):
+        zf.write(f, f.split('/')[-1])
+"
 
 mkdir -p gint/host/hip
 cp -v artifact/gint_amdgcn.zip gint/host/hip/gint_amdgcn.zip
