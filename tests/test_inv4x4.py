@@ -1,5 +1,6 @@
 import torch
 import unittest
+from tests import requires_gpu
 from gint import TensorInterface, bytecode, cdiv
 from gint.host.frontend import *
 
@@ -222,6 +223,7 @@ def inv4x4_kernel(a: TensorInterface, c: TensorInterface, REGW: int, WARP: int):
     halt()
 
 
+@requires_gpu
 class TestInv4x4(unittest.TestCase):
 
     def _run(self, a: torch.Tensor):

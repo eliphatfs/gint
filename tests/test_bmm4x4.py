@@ -1,5 +1,6 @@
 import torch
 import unittest
+from tests import requires_gpu
 from gint import TensorInterface, bytecode, cdiv
 from gint.host.frontend import *
 
@@ -35,6 +36,7 @@ def bmm4x4_kernel(a: TensorInterface, b: TensorInterface, c: TensorInterface, RE
     halt()
 
 
+@requires_gpu
 class TestBMM4x4(unittest.TestCase):
     def test_bmm4x4(self):
         for B in [1, 32, 64, 1000, 1000000]:

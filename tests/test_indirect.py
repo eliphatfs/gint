@@ -1,5 +1,6 @@
 import torch
 import unittest
+from tests import requires_gpu
 from gint import TensorInterface, bytecode, cdiv
 from gint.host.frontend import *
 from gint.host.executor import get_executor
@@ -27,6 +28,7 @@ def vec_mul(a: TensorInterface, b: TensorInterface, c: TensorInterface, REGW: in
     halt()
 
 
+@requires_gpu
 class TestIndirectDispatch(unittest.TestCase):
 
     def test_indirect_add_mul(self):

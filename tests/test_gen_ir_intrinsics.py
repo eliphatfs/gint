@@ -1,5 +1,6 @@
 import numpy
 import unittest
+from tests import requires_gpu
 import cuda.bindings.driver as cuda
 from llvmlite import ir
 from typing import Callable, Iterable
@@ -9,6 +10,7 @@ from gint.kernel.platforms.nvptx import NVPTXIRBuilder
 from gint.host.cuda.driver import DriverContext, ptx_link, launch_kernel, check_cuda_error
 
 
+@requires_gpu
 class TestGenIRIntrinsicsNVPTX(unittest.TestCase):
     
     def test_trivial(self):

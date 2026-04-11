@@ -2,6 +2,7 @@ from llvmlite import ir
 from ..platforms.common import *
 from ..platforms.platform import PlatformIRBuilder
 from ..platforms.nvptx import NVPTXIRBuilder
+from ..platforms.amdgcn import AMDGCNIRBuilder
 from .instruction import EInsnAttrs, Instruction
 from .instructions.load_tensor_infos import emit_load_tensor_infos
 from .state import StackMachineState, InvalidStateException
@@ -231,5 +232,11 @@ GEvalFType = ir.FunctionType(void, [
 
 def build_interpreter_main_nvptx() -> PlatformIRBuilder:
     LL = NVPTXIRBuilder.create_kernel_module(GEvalFType, "geval")
+    build_main_loop(LL)
+    return LL
+
+
+def build_interpreter_main_amdgcn(gfx: str = "gfx1100") -> PlatformIRBuilder:
+    LL = AMDGCNIRBuilder.create_kernel_module(GEvalFType, "geval", gfx=gfx)
     build_main_loop(LL)
     return LL

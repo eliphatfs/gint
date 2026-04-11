@@ -1,5 +1,6 @@
 import torch
 import unittest
+from tests import requires_gpu
 from gint import ProgramTensorInfo, TensorInterface, bytecode, cdiv
 from gint.host.frontend import *
 
@@ -36,6 +37,7 @@ def cubic_ease(x: torch.Tensor):
     return y_ref.view(orig_shape), y.view(orig_shape)
 
 
+@requires_gpu
 class TestCudaGraphCapture(unittest.TestCase):
     
     def test_cubic_ease(self):

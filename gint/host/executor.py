@@ -1,3 +1,4 @@
+import os
 import sys
 import numpy
 from collections.abc import Hashable
@@ -129,7 +130,19 @@ executor: Optional[BaseExecutor] = None
 def get_executor():
     global executor
     if executor is None:
-        # initialize
-        from .cuda.executor_impl import CudaExecutor
-        executor = CudaExecutor()
+        backend = os.environ.get('GINT_BACKEND', '').lower()
+        if backend == 'hip':
+            from .hip.executor_impl import HipExecutor
+            executor = HipExecutor()
+        elif backend == 'cuda':
+            from .cuda.executor_impl import CudaExecutor
+            executor = CudaExecutor()
+        else:
+            # Auto-detect: try CUDA first (backward compatible), then HIP
+            try:
+                from .cuda.executor_impl import CudaExecutor
+                executor = CudaExecutor()
+            except Exception:
+                from .hip.executor_impl import HipExecutor
+                executor = HipExecutor()
     return executor

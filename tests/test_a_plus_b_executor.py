@@ -1,6 +1,7 @@
 import numpy
 import torch
 import unittest
+from tests import requires_gpu
 from gint.kernel.interpreter.main import REG_WIDTH
 from gint.host.executor import BaseExecutableProgram, ProgramData, ProgramTensorInfo, TensorInterface
 from gint.host.utils import cdiv
@@ -60,6 +61,7 @@ class VectorAddProgram(BaseExecutableProgram):
         )
 
 
+@requires_gpu
 class TestInterpretAPB(unittest.TestCase):
     
     def test_batch_a_plus_b(self):

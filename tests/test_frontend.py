@@ -1,5 +1,6 @@
 import torch
 import unittest
+from tests import requires_gpu
 from gint import ProgramTensorInfo, TensorInterface, bytecode, cdiv
 from gint.host.frontend import *
 
@@ -207,6 +208,7 @@ def packed_imm_test(packed_f_out, packed_i_out, REGW: int, WARP: int):
     halt()
 
 
+@requires_gpu
 class TestFrontendExpression(unittest.TestCase):
     
     def test_expr_1(self):

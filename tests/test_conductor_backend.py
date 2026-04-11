@@ -1,8 +1,10 @@
 import torch
 import unittest
+from tests import requires_gpu
 from gint.conductor import register_backend
 
 
+@requires_gpu
 class TestConductorBackend(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

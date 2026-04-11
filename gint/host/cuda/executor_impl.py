@@ -8,31 +8,7 @@ from ...kernel.interpreter.main import SMEM_PER_WARP
 from ...kernel.interpreter.structs import HTensorInfo
 from ..executor import BaseExecutor, BaseExecutableProgram, TensorInterface, _convert_arg
 from .driver import current_context, fatbin_load, launch_kernel, check_cuda_error
-from ..utils import cdiv
-
-
-def _fill_tensor_info(ti: HTensorInfo, input_infos, slot_offset: int = 0):
-    for i, t in enumerate(input_infos):
-        si = slot_offset + i
-        ti.elm_size[si] = t.elm_size
-        rev_bs = t.batch_strides[::-1]
-        rev_bsz = t.batch_shape[::-1]
-        assert len(rev_bs) == len(rev_bsz) <= 4, "At most 4 block axes supported!"
-        for j in range(4):
-            if j < len(rev_bsz):
-                ti.batch_strides[si][j] = rev_bs[j]
-                ti.batch_shape[si][j] = rev_bsz[j]
-            else:
-                ti.batch_strides[si][j] = 0
-                ti.batch_shape[si][j] = 1
-        ti.block_shape_stride_1[si][0] = t.block_shape_stride_1[0]
-        ti.block_shape_stride_1[si][1] = t.block_shape_stride_1[1]
-        ti.block_shape_stride_2[si][0] = t.block_shape_stride_2[0]
-        ti.block_shape_stride_2[si][1] = t.block_shape_stride_2[1]
-        ti.block_grid_dims[si][0] = t.block_grid_dims[0]
-        ti.block_grid_dims[si][1] = t.block_grid_dims[1]
-        ti.block_grid_steps[si][0] = t.block_grid_steps[0]
-        ti.block_grid_steps[si][1] = t.block_grid_steps[1]
+from ..utils import cdiv, fill_tensor_info as _fill_tensor_info
 
 
 class CudaExecutor(BaseExecutor):

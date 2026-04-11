@@ -7,9 +7,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 **Gint** is an experimental project implementing a **completely GPU device-side interpreter architecture** for kernel programming with cross-OS and cross-device-vendor support. The project is written with Python + LLVM IR, enabling efficient bytecode execution directly on the GPU.
 
 The codebase is split into:
-- **Host side**: Python + CUDA C bindings for device memory management, kernel loading, and bytecode dispatch
-- **Kernel side**: LLVM IR interpreter executing stack-based bytecode on GPU
+- **Host side**: Python + CUDA/HIP bindings for device memory management, kernel loading, and bytecode dispatch
+- **Kernel side**: LLVM IR interpreter executing stack-based bytecode on GPU (platform-agnostic)
 - **Conductor**: PyTorch `torch.compile` backend integration
+
+Supported GPU backends:
+- **NVIDIA (CUDA)**: Turing through Blackwell via `cuda-bindings` + fatbin
+- **AMD (HIP)**: RDNA3/3.5/4 (wave32) via `hip-python` + hipfb
 
 ## Architecture
 
@@ -61,9 +65,13 @@ The codebase is split into:
 - After pointer resolution, the rest of the interpreter (dispatch loop, tensor info loading, instruction execution) is unchanged
 
 ### Host-Side Executor
-- `gint/host/executor.py`: Core program execution interface
+- `gint/host/executor.py`: Core program execution interface + `get_executor()` auto-detection
 - `gint/host/cuda/executor_impl.py`: NVIDIA-specific implementation (CudaExecutor)
-- Loads kernel from `gint/host/cuda/gint.fatbin.xz` (not tracked in git — must be generated locally via `./generate.sh`)
+  - Loads kernel from `gint/host/cuda/gint.fatbin.xz` (not tracked in git — must be generated via `./generate.sh`)
+- `gint/host/hip/executor_impl.py`: AMD-specific implementation (HipExecutor)
+  - Loads kernel from `gint/host/hip/gint.hipfb.xz` (not tracked in git — must be generated via `./generate_amdgcn.sh`)
+- **Backend selection**: `GINT_BACKEND` env var (`"cuda"` or `"hip"`) for explicit override; default tries CUDA first, falls back to HIP
+- `gint/host/utils.py`: Shared utilities (`fill_tensor_info`, `cdiv`) used by both executors
 - **`execute_indirect(programs, args_list, indices)`**: Launches multiple different programs in a single kernel call
   - `programs`: list of `BaseExecutableProgram` instances
   - `args_list`: list of tensor arg tuples, one per program (must match `programs` length)
@@ -138,6 +146,7 @@ The codebase is split into:
 Runtime dependencies (declared in `pyproject.toml`):
 - `numpy`, `llvmlite>=0.43`, `cuda-bindings>=12.6`, `rich`
 - Optional: `torch>=2.0` (for conductor / `torch.compile` backend)
+- Optional: `hip-python>=6.0` (for AMD HIP backend, install via `pip install -e ".[hip]"`)
 
 ### cuda-python / cuda-bindings Version Compatibility
 
@@ -172,6 +181,22 @@ Plus embedded `compute_120` PTX for forward compatibility with future architectu
 
 **Build requirement**: `generate.sh` requires **CUDA Toolkit 12.8+** (for sm_100/sm_120 support). Earlier nvcc versions will fail on the Blackwell gencode flags.
 
+### AMD GPU Architecture Support (HIP Fat Binary)
+
+The hipfb (`gint/host/hip/gint.hipfb.xz`) bundles HSACO code objects for:
+
+| Architecture | GFX Target | GPUs |
+|---|---|---|
+| RDNA3 (discrete) | gfx1100, gfx1101, gfx1102 | RX 7900 XTX, RX 7800 XT, RX 7600 |
+| RDNA3/3.5 (generic) | gfx11-generic | All gfx1100–gfx1153 |
+| RDNA4 (generic) | gfx12-generic | RX 9070 XT, all gfx1200–gfx1201 |
+
+Generic targets (`gfx11-generic`, `gfx12-generic`) serve the same role as embedded PTX in CUDA fatbins — forward compatibility across GPU variants within the same generation. `hipModuleLoadData` auto-selects the best code object for the current GPU.
+
+**Build requirement**: `generate_amdgcn.sh` requires ROCm 6.0+ with `clang-offload-bundler` and OCML/OCKL bitcode libraries.
+
+**CDNA not supported**: MI250/MI300 use wave64 (64-thread wavefronts), which would require 6-round reductions instead of 5, different shuffle masks, and changes to `lane_id` bounds. Only RDNA3+ (wave32) is supported.
+
 ### Cross-Platform Porting Notes
 
 The architecture cleanly separates platform-specific code into two layers: `PlatformIRBuilder` (device-side, in `gint/kernel/platforms/`) and `BaseExecutor` (host-side, in `gint/host/`). All 106 opcodes and the entire interpreter dispatch loop are platform-agnostic LLVM IR. A new platform needs:
@@ -182,7 +207,7 @@ The architecture cleanly separates platform-specific code into two layers: `Plat
 
 | Target | Difficulty | Notes |
 |---|---|---|
-| **AMD ROCm (HIP)** | Moderate | Maps 1:1 conceptually. `llvm.amdgcn.*` intrinsics for shuffles/indexing, `ocml` for math (like libdevice). `hip-python` for host API. Main issue: wavefront size is 64 on CDNA (MI250/MI300) vs our assumed 32 — either force wave32 on RDNA3 or adapt shuffle masks and reduction rounds for wave64. Also unclear if llvmlite bundles the AMDGCN backend. |
+| **AMD ROCm (HIP)** | **Implemented** | RDNA3+ (wave32) fully supported. `AMDGCNIRBuilder` in `gint/kernel/platforms/amdgcn.py`, `HipExecutor` in `gint/host/hip/`. Uses `llvm.amdgcn.*` intrinsics, `ocml` for math, `hip-python` for host API, `ds.bpermute` for warp reductions, `readlane` for broadcasts. CDNA (MI250/MI300, wave64) is NOT supported — would need 6-round reductions and different shuffle masks. |
 | **OpenCL SPIR-V** | Moderate-Hard | Best cross-vendor path. `llvm-spirv` translates LLVM IR → OpenCL SPIR-V, and the OpenCL execution model (kernel functions with pointer args, flat address space, raw pointer arithmetic) matches our design closely. Subgroup ops (`cl_khr_subgroups`) map to warp primitives. Runs on Intel, AMD, NVIDIA via their OpenCL drivers. `pyopencl` for host API. Main issues: subgroup size varies by vendor (32/64/8-32), driver optimization quality lags CUDA. |
 | **Vulkan SPIR-V** | Hard | Vulkan uses a fundamentally different execution model: no raw pointers (descriptor sets + buffer offsets), `GLCompute` execution model vs `Kernel`. Our pointer-table indirect dispatch doesn't translate directly. Would likely need a parallel SPIR-V codegen path rather than reusing llvmlite → `llvm-spirv`. Subgroup ops available (Vulkan 1.1+) but size varies. Math via `GLSL.std.450` extended instructions. |
 | **Apple Metal GPU** | Hard | No LLVM IR → Metal path. Would need to generate MSL source or Metal IR directly. Metal has `simdgroup` ops (size 32 on Apple Silicon) that map well to our warp primitives. `pyobjc` for host API. Apple's `metal` compiler is clang-based but Metal IR format is undocumented. |
@@ -207,8 +232,8 @@ Tests use Python's `unittest` framework (not pytest).
 
 ### Code Generation
 ```bash
-# Generate LLVM IR and compile to PTX/fatbin for all compute capabilities
-# Requires: CUDA Toolkit 12.8+, LLVM/clang 18, llvmlite, rich, numpy
+# NVIDIA: Generate LLVM IR and compile to PTX/fatbin for all compute capabilities
+# Requires: CUDA Toolkit 12.8+, LLVM/clang 20, llvmlite, rich, numpy
 ./generate.sh
 
 # Generates files:
@@ -216,6 +241,20 @@ Tests use Python's `unittest` framework (not pytest).
 # - artifact/gint.fatbin
 # - artifact/gint.fatbin.xz (compressed, used by runtime)
 # - gint/host/cuda/gint.fatbin.xz (deployed version, NOT tracked in git)
+
+# AMD: Generate LLVM IR and compile to HSACO/hipfb for RDNA3+ targets
+# Requires: ROCm 6.0+, clang-offload-bundler, OCML/OCKL bitcode
+./generate_amdgcn.sh
+
+# Generates files:
+# - artifact/gint_gfx*.hsaco (per-target code objects)
+# - artifact/gint.hipfb (bundled fat binary)
+# - artifact/gint.hipfb.xz (compressed, used by runtime)
+# - gint/host/hip/gint.hipfb.xz (deployed version, NOT tracked in git)
+
+# Direct LLVM IR generation (for debugging/inspection)
+gint-gen-llir -t llir      # NVPTX LLVM IR (default)
+gint-gen-llir -t amdgcn --gfx gfx1100  # AMDGCN HSACO
 ```
 
 ### CI / Wheel Build
@@ -247,30 +286,36 @@ void geval(i32* code, TensorInfo* tinfo, i32 num_tensors, i32 grid_dim, i32 flag
 
 ### Kernel Specialization
 - Per-vendor implementations in `gint/kernel/platforms/`
+  - `nvptx.py`: NVIDIA — `llvm.nvvm.*` intrinsics, `__nv_*` libdevice math, `nvptx64-nvidia-cuda` triple
+  - `amdgcn.py`: AMD RDNA3+ — `llvm.amdgcn.*` intrinsics, `__ocml_*_f32` math, `amdgcn-amd-amdhsa` triple
+- **llvmlite limitation**: `FunctionAttributes.add()` doesn't support key-value attributes (e.g., `"amdgpu-flat-work-group-size"="32,128"`). The AMDGCN builder works around this by overriding `emit()` to inject LLVM attribute groups via regex post-processing of the serialized IR text
 - Per-OS optimizations may be needed in executor implementations
 
 ### Adding New Instructions
 1. Implement the instruction class in `gint/kernel/interpreter/instructions/` (subclass `DefaultControlInstruction` or `DefaultControlOperandInstruction`)
 2. Add to `INSNS` dict in `gint/kernel/interpreter/main.py` with the next available opcode
 3. Add a frontend function in `gint/host/frontend.py` decorated with `@_bc`
-4. Run `./generate.sh` to regenerate the fatbin
+4. Run `./generate.sh` (NVIDIA) and/or `./generate_amdgcn.sh` (AMD) to regenerate binaries
 
 ## Project Layout
 
 ```
 gint/
-  host/              # Host-side Python + CUDA bindings
+  host/              # Host-side Python + CUDA/HIP bindings
     cuda/            # NVIDIA-specific (executor_impl, driver)
                      # gint.fatbin.xz lives here but is NOT in git
+    hip/             # AMD-specific (executor_impl, driver)
+                     # gint.hipfb.xz lives here but is NOT in git
     frontend.py      # @bytecode decorator & ProgramTensorInfo
-    executor.py      # Base executor interface
+    executor.py      # Base executor interface + backend auto-detection
+    utils.py         # Shared utilities (fill_tensor_info, cdiv)
     sugar.py         # Convenience APIs
   kernel/            # Device-side LLVM IR code
     interpreter/     # Stack-based VM implementation
       instructions/  # Instruction definitions (arith, control, load_store, reg, ...)
       state.py       # StackMachineState: unified pool + stack/reg properties
       main.py        # INSNS opcode table, build_main_loop, constants
-    platforms/       # Platform-specific code
+    platforms/       # Platform-specific code (nvptx.py, amdgcn.py)
   conductor/         # torch.compile backend
   scripts/           # gen_llir.py, driver.py
 
@@ -319,6 +364,7 @@ Built with `hatchling`. Requires Python >=3.10.
 ```bash
 pip install -e .          # core (needs cuda-bindings, numpy, llvmlite, rich)
 pip install -e ".[torch]" # with torch.compile backend
+pip install -e ".[hip]"   # with AMD HIP backend (needs hip-python>=6.0)
 ```
 
 Entry points:
