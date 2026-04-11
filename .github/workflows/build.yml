@@ -82,7 +82,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: hipfb
-          path: gint/host/hip/gint.hipfb.xz
+          path: gint/host/hip/gint_amdgcn.zip
 
   build-wheel:
     needs: [generate-fatbin, generate-hipfb]
@@ -120,18 +120,18 @@ jobs:
           with zipfile.ZipFile(whl) as z:
               names = z.namelist()
               fatbin = [n for n in names if 'fatbin' in n]
-              hipfb = [n for n in names if 'hipfb' in n]
+              hipfb = [n for n in names if 'amdgcn.zip' in n]
               print(f'Wheel: {whl}')
               print(f'Total files: {len(names)}')
               print(f'Fatbin entries: {fatbin}')
-              print(f'Hipfb entries: {hipfb}')
+              print(f'AMDGCN entries: {hipfb}')
               if not fatbin:
                   print('ERROR: fatbin not found in wheel!')
                   sys.exit(1)
               if not hipfb:
-                  print('ERROR: hipfb not found in wheel!')
+                  print('ERROR: amdgcn zip not found in wheel!')
                   sys.exit(1)
-              print('OK: both fatbin and hipfb included in wheel')
+              print('OK: both fatbin and amdgcn zip included in wheel')
           "
 
       - name: Upload wheel

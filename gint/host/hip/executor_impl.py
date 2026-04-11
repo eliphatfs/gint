@@ -1,5 +1,6 @@
 import os
 import lzma
+import zipfile
 import ctypes
 import numpy
 from hip import hip
@@ -7,16 +8,41 @@ from typing import Sequence
 from ...kernel.interpreter.main import SMEM_PER_WARP
 from ...kernel.interpreter.structs import HTensorInfo
 from ..executor import BaseExecutor, BaseExecutableProgram, TensorInterface, _convert_arg
-from .driver import current_context, hipfb_load, launch_kernel, check_hip_error
+from .driver import current_context, hipfb_load, launch_kernel, check_hip_error, get_gfx_name
 from ..utils import cdiv, fill_tensor_info as _fill_tensor_info
+
+
+# Map GFX names to fallback generic targets
+_GFX_GENERIC_FALLBACK = {}
+# RDNA3 + RDNA3.5 → gfx11-generic
+for _i in range(1100, 1154):
+    _GFX_GENERIC_FALLBACK[f"gfx{_i}"] = "gfx11-generic"
+# RDNA4 → gfx12-generic
+for _i in range(1200, 1202):
+    _GFX_GENERIC_FALLBACK[f"gfx{_i}"] = "gfx12-generic"
 
 
 class HipExecutor(BaseExecutor):
 
     def __init__(self) -> None:
         self.func_cache = {}
-        with lzma.open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "gint.hipfb.xz")) as fi:
-            self.hipfb = fi.read()
+        self._zip_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gint_amdgcn.zip")
+
+    def _load_hsaco_for_gfx(self, gfx: str) -> bytes:
+        """Load the HSACO for the given GFX name from the zip archive."""
+        with zipfile.ZipFile(self._zip_path, 'r') as zf:
+            names = zf.namelist()
+            # Try exact match first, then generic fallback
+            for candidate in [gfx, _GFX_GENERIC_FALLBACK.get(gfx)]:
+                if candidate is None:
+                    continue
+                entry = f"gint_{candidate}.hsaco.xz"
+                if entry in names:
+                    return lzma.decompress(zf.read(entry))
+        raise RuntimeError(
+            f"No HSACO found for {gfx} in {self._zip_path}. "
+            f"Available: {names}"
+        )
 
     def warp_size(self) -> int:
         return 32
@@ -24,7 +50,9 @@ class HipExecutor(BaseExecutor):
     def geval_func_handle(self):
         dctx = current_context()
         if dctx not in self.func_cache:
-            hipfunc = hipfb_load(dctx, self.hipfb, b'geval')
+            gfx = get_gfx_name(dctx.device)
+            hsaco = self._load_hsaco_for_gfx(gfx)
+            hipfunc = hipfb_load(dctx, hsaco, b'geval')
             concurrencies = []
             for num_warps in [1, 2, 4]:
                 _, blocks = check_hip_error(hip.hipModuleOccupancyMaxActiveBlocksPerMultiprocessor(hipfunc, num_warps * 32, SMEM_PER_WARP * num_warps))
