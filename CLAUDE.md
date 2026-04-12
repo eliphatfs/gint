@@ -13,7 +13,7 @@ The codebase is split into:
 
 Supported GPU backends:
 - **NVIDIA (CUDA)**: Turing through Blackwell via `cuda-bindings` + fatbin
-- **AMD (HIP)**: RDNA3/3.5/4 (wave32) via `hip-python` + hipfb
+- **AMD (HIP)**: RDNA3/4 (wave32) via `hip-python` + per-target HSACO
 
 ## Architecture
 
@@ -69,7 +69,7 @@ Supported GPU backends:
 - `gint/host/cuda/executor_impl.py`: NVIDIA-specific implementation (CudaExecutor)
   - Loads kernel from `gint/host/cuda/gint.fatbin.xz` (not tracked in git — must be generated via `./generate.sh`)
 - `gint/host/hip/executor_impl.py`: AMD-specific implementation (HipExecutor)
-  - Loads kernel from `gint/host/hip/gint.hipfb.xz` (not tracked in git — must be generated via `./generate_amdgcn.sh`)
+  - Loads kernel from `gint/host/hip/gint_amdgcn.zip` (not tracked in git — must be generated via `./generate_amdgcn.sh`)
 - **Backend selection**: `GINT_BACKEND` env var (`"cuda"` or `"hip"`) for explicit override; default tries CUDA first, falls back to HIP
 - `gint/host/utils.py`: Shared utilities (`fill_tensor_info`, `cdiv`) used by both executors
 - **`execute_indirect(programs, args_list, indices)`**: Launches multiple different programs in a single kernel call
@@ -181,19 +181,18 @@ Plus embedded `compute_120` PTX for forward compatibility with future architectu
 
 **Build requirement**: `generate.sh` requires **CUDA Toolkit 12.8+** (for sm_100/sm_120 support). Earlier nvcc versions will fail on the Blackwell gencode flags.
 
-### AMD GPU Architecture Support (HIP Fat Binary)
+### AMD GPU Architecture Support (HIP)
 
-The hipfb (`gint/host/hip/gint.hipfb.xz`) bundles HSACO code objects for:
+The AMDGCN zip (`gint/host/hip/gint_amdgcn.zip`) bundles per-target HSACO code objects for:
 
 | Architecture | GFX Target | GPUs |
 |---|---|---|
 | RDNA3 (discrete) | gfx1100, gfx1101, gfx1102 | RX 7900 XTX, RX 7800 XT, RX 7600 |
-| RDNA3/3.5 (generic) | gfx11-generic | All gfx1100–gfx1153 |
-| RDNA4 (generic) | gfx12-generic | RX 9070 XT, all gfx1200–gfx1201 |
+| RDNA4 | gfx1200, gfx1201 | RX 9070 XT, RX 9070 |
 
-Generic targets (`gfx11-generic`, `gfx12-generic`) serve the same role as embedded PTX in CUDA fatbins — forward compatibility across GPU variants within the same generation. `hipModuleLoadData` auto-selects the best code object for the current GPU.
+The runtime selects the correct HSACO by querying the GPU's GFX name via `hipGetDeviceProperties`. Generic targets (`gfx11-generic`, `gfx12-generic`) were removed — HIP's runtime loader does not reliably load generic code objects on concrete GPUs despite `rocminfo` listing them as compatible.
 
-**Build requirement**: `generate_amdgcn.sh` requires ROCm 6.0+ with `clang-offload-bundler` and OCML/OCKL bitcode libraries.
+**Build requirement**: `generate_amdgcn.sh` requires ROCm 7.0+ with OCML/OCKL bitcode libraries.
 
 **CDNA not supported**: MI250/MI300 use wave64 (64-thread wavefronts), which would require 6-round reductions instead of 5, different shuffle masks, and changes to `lane_id` bounds. Only RDNA3+ (wave32) is supported.
 
@@ -242,15 +241,15 @@ Tests use Python's `unittest` framework (not pytest).
 # - artifact/gint.fatbin.xz (compressed, used by runtime)
 # - gint/host/cuda/gint.fatbin.xz (deployed version, NOT tracked in git)
 
-# AMD: Generate LLVM IR and compile to HSACO/hipfb for RDNA3+ targets
-# Requires: ROCm 6.0+, clang-offload-bundler, OCML/OCKL bitcode
+# AMD: Generate LLVM IR and compile to HSACO for RDNA3+ targets
+# Requires: ROCm 7.0+, OCML/OCKL bitcode
 ./generate_amdgcn.sh
 
 # Generates files:
 # - artifact/gint_gfx*.hsaco (per-target code objects)
-# - artifact/gint.hipfb (bundled fat binary)
-# - artifact/gint.hipfb.xz (compressed, used by runtime)
-# - gint/host/hip/gint.hipfb.xz (deployed version, NOT tracked in git)
+# - artifact/gint_gfx*.hsaco (per-target code objects)
+# - artifact/gint_amdgcn.zip (all HSACOs compressed and zipped)
+# - gint/host/hip/gint_amdgcn.zip (deployed version, NOT tracked in git)
 
 # Direct LLVM IR generation (for debugging/inspection)
 gint-gen-llir -t llir      # NVPTX LLVM IR (default)
@@ -305,7 +304,7 @@ gint/
     cuda/            # NVIDIA-specific (executor_impl, driver)
                      # gint.fatbin.xz lives here but is NOT in git
     hip/             # AMD-specific (executor_impl, driver)
-                     # gint.hipfb.xz lives here but is NOT in git
+                     # gint_amdgcn.zip lives here but is NOT in git
     frontend.py      # @bytecode decorator & ProgramTensorInfo
     executor.py      # Base executor interface + backend auto-detection
     utils.py         # Shared utilities (fill_tensor_info, cdiv)

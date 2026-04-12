@@ -2,7 +2,7 @@ set -xe
 mkdir -p artifact
 
 # Generate per-target HSACO code objects
-for gfx in gfx1100 gfx1101 gfx1102 gfx11-generic gfx12-generic; do
+for gfx in gfx1100 gfx1101 gfx1102 gfx1200 gfx1201; do
     gint-gen-llir -t amdgcn --gfx $gfx -o artifact/gint_${gfx}.hsaco
     xz -efk artifact/gint_${gfx}.hsaco
 done

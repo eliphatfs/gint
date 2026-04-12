@@ -12,14 +12,6 @@ from .driver import current_context, hipfb_load, launch_kernel, check_hip_error,
 from ..utils import cdiv, fill_tensor_info as _fill_tensor_info
 
 
-# Map GFX names to fallback generic targets
-_GFX_GENERIC_FALLBACK = {}
-# RDNA3 + RDNA3.5 → gfx11-generic
-for _i in range(1100, 1154):
-    _GFX_GENERIC_FALLBACK[f"gfx{_i}"] = "gfx11-generic"
-# RDNA4 → gfx12-generic
-for _i in range(1200, 1202):
-    _GFX_GENERIC_FALLBACK[f"gfx{_i}"] = "gfx12-generic"
 
 
 class HipExecutor(BaseExecutor):
@@ -32,13 +24,9 @@ class HipExecutor(BaseExecutor):
         """Load the HSACO for the given GFX name from the zip archive."""
         with zipfile.ZipFile(self._zip_path, 'r') as zf:
             names = zf.namelist()
-            # Try exact match first, then generic fallback
-            for candidate in [gfx, _GFX_GENERIC_FALLBACK.get(gfx)]:
-                if candidate is None:
-                    continue
-                entry = f"gint_{candidate}.hsaco.xz"
-                if entry in names:
-                    return lzma.decompress(zf.read(entry))
+            entry = f"gint_{gfx}.hsaco.xz"
+            if entry in names:
+                return lzma.decompress(zf.read(entry))
         raise RuntimeError(
             f"No HSACO found for {gfx} in {self._zip_path}. "
             f"Available: {names}"
