@@ -99,7 +99,10 @@ def prepare_arg(arg: Union[int, float, ctypes._SimpleCData, hip.hipDeviceptr_t])
     if isinstance(arg, ctypes._SimpleCData):
         return CTypesWrapper(arg)
     if isinstance(arg, hip.hipDeviceptr_t):
-        return arg
+        return CTypesWrapper(ctypes.c_void_p(int(arg)))
+    if hasattr(arg, '__int__') and hasattr(arg, 'as_c_void_p'):
+        # hip._util.types.DeviceArray from hipMalloc
+        return CTypesWrapper(ctypes.c_void_p(int(arg)))
     raise TypeError("Unrecognized argument type for kernel", type(arg))
 
 
