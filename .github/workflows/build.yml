@@ -49,7 +49,7 @@ jobs:
   generate-hipfb:
     runs-on: ubuntu-latest
     container:
-      image: rocm/dev-ubuntu-22.04:7.2.1
+      image: rocm/dev-ubuntu-22.04:7.0.2
 
     steps:
       - uses: actions/checkout@v4
