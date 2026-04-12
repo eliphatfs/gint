@@ -69,7 +69,7 @@ Supported GPU backends:
 - `gint/host/cuda/executor_impl.py`: NVIDIA-specific implementation (CudaExecutor)
   - Loads kernel from `gint/host/cuda/gint.fatbin.xz` (not tracked in git — must be generated via `./generate.sh`)
 - `gint/host/hip/executor_impl.py`: AMD-specific implementation (HipExecutor)
-  - Loads kernel from `gint/host/hip/gint_amdgcn.zip` (not tracked in git — must be generated via `./generate_amdgcn.sh`)
+  - Loads kernel from `gint/host/hip/gint.fatbin.xz` (not tracked in git — must be generated via `./generate_amdgcn.sh`)
 - **Backend selection**: `GINT_BACKEND` env var (`"cuda"` or `"hip"`) for explicit override; default tries CUDA first, falls back to HIP
 - `gint/host/utils.py`: Shared utilities (`fill_tensor_info`, `cdiv`) used by both executors
 - **`execute_indirect(programs, args_list, indices)`**: Launches multiple different programs in a single kernel call
@@ -183,14 +183,14 @@ Plus embedded `compute_120` PTX for forward compatibility with future architectu
 
 ### AMD GPU Architecture Support (HIP)
 
-The AMDGCN zip (`gint/host/hip/gint_amdgcn.zip`) bundles per-target HSACO code objects for:
+The AMDGCN fat binary (`gint/host/hip/gint.fatbin.xz`) bundles per-target HSACO code objects for:
 
 | Architecture | GFX Target | GPUs |
 |---|---|---|
-| RDNA3 (discrete) | gfx1100, gfx1101, gfx1102 | RX 7900 XTX, RX 7800 XT, RX 7600 |
+| RDNA3 (discrete) | gfx1100, gfx1101 | RX 7900 XTX, RX 7800 XT, RX 7600 |
 | RDNA4 | gfx1200, gfx1201 | RX 9070 XT, RX 9070 |
 
-The runtime selects the correct HSACO by querying the GPU's GFX name via `hipGetDeviceProperties`. Generic targets (`gfx11-generic`, `gfx12-generic`) were removed — HIP's runtime loader does not reliably load generic code objects on concrete GPUs despite `rocminfo` listing them as compatible.
+The fat binary uses the `__CLANG_OFFLOAD_BUNDLE__` format produced by `clang-offload-bundler`. `hipModuleLoadData` auto-selects the correct code object for the current GPU at runtime — no manual arch lookup needed.
 
 **Build requirement**: `generate_amdgcn.sh` requires ROCm 7.0+ with OCML/OCKL bitcode libraries.
 
@@ -246,14 +246,14 @@ Tests use Python's `unittest` framework (not pytest).
 ./generate_amdgcn.sh
 
 # Generates files:
-# - artifact/gint_gfx*.hsaco (per-target code objects)
-# - artifact/gint_gfx*.hsaco (per-target code objects)
-# - artifact/gint_amdgcn.zip (all HSACOs compressed and zipped)
-# - gint/host/hip/gint_amdgcn.zip (deployed version, NOT tracked in git)
+# - artifact/gint_gfx*.s (per-target GCN assembly text)
+# - artifact/gint_gfx*.o (per-target code objects)
+# - artifact/gint_amdgcn.fatbin (bundled fat binary, all targets)
+# - gint/host/hip/gint.fatbin.xz (deployed version, NOT tracked in git)
 
 # Direct LLVM IR generation (for debugging/inspection)
 gint-gen-llir -t llir      # NVPTX LLVM IR (default)
-gint-gen-llir -t amdgcn --gfx gfx1100  # AMDGCN HSACO
+gint-gen-llir -t amdgcn --gfx gfx1100  # AMDGCN assembly
 ```
 
 ### CI / Wheel Build
@@ -304,7 +304,7 @@ gint/
     cuda/            # NVIDIA-specific (executor_impl, driver)
                      # gint.fatbin.xz lives here but is NOT in git
     hip/             # AMD-specific (executor_impl, driver)
-                     # gint_amdgcn.zip lives here but is NOT in git
+                     # gint.fatbin.xz lives here but is NOT in git
     frontend.py      # @bytecode decorator & ProgramTensorInfo
     executor.py      # Base executor interface + backend auto-detection
     utils.py         # Shared utilities (fill_tensor_info, cdiv)

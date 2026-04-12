@@ -27,7 +27,7 @@ include = [
 ]
 artifacts = [
     "gint/host/cuda/gint.fatbin.xz",
-    "gint/host/hip/gint_amdgcn.zip",
+    "gint/host/hip/gint.fatbin.xz",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -36,7 +36,7 @@ include = [
 ]
 artifacts = [
     "gint/host/cuda/gint.fatbin.xz",
-    "gint/host/hip/gint_amdgcn.zip",
+    "gint/host/hip/gint.fatbin.xz",
 ]
 
 [project.scripts]

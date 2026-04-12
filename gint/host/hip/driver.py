@@ -72,13 +72,6 @@ def current_context():
     return _existing_driver_ctx_cache[ctx_id]
 
 
-def get_gfx_name(device: int = 0) -> str:
-    """Get the GFX architecture name (e.g. 'gfx1100') for a HIP device."""
-    props = hip.hipDeviceProp_t()
-    check_hip_error(hip.hipGetDeviceProperties(props, device))
-    return props.gcnArchName.decode().split(':')[0]
-
-
 def hipfb_load(driver_ctx: DriverContext, hipfb: bytes, fn_name: bytes) -> hip.hipFunction_t:
     """Load a HIP fat binary (or HSACO) and extract a kernel function."""
     err, module = hip.hipModuleLoadData(hipfb)

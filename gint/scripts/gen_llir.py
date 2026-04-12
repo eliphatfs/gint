@@ -64,13 +64,12 @@ def invoke_clang_shim(llir: bytes, target: Literal['ptx', 'amdgcn'] = 'ptx', cc:
             'clang',
             '--target=%s' % targets[target],
             '-mcpu=%s' % (gfx or 'gfx1100'),
+            '-S',
             '-x', 'ir',
             '-O3',
         ]
         if emit_llir:
-            cmd += ['-S', '-emit-llvm']
-        else:
-            cmd += ['-c']
+            cmd += ['-emit-llvm']
         cmd += ['-o', '-', '-']
         return subprocess.check_output(cmd, input=llir)
 
@@ -109,12 +108,7 @@ def main():
     elif args.target != 'llir':
         ir = invoke_clang_shim(ir, args.target, args.cc, args.gfx, args.emit_llir)
     if args.output_path is None:
-        if args.target == 'amdgcn' and not args.emit_llir and not args.check_only:
-            # Binary output — can't print to terminal
-            import sys
-            sys.stdout.buffer.write(ir)
-        else:
-            rich.print(ir.decode().strip().replace('[', '\\['))
+        rich.print(ir.decode().strip().replace('[', '\\['))
     else:
         with open(args.output_path, "wb") as fo:
             fo.write(ir)

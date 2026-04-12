@@ -10,3 +10,4 @@ tmp
 /artifact
 
 gint/host/cuda/gint.fatbin.xz
+gint/host/hip/gint.fatbin.xz

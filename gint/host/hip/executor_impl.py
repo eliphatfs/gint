@@ -1,6 +1,5 @@
 import os
 import lzma
-import zipfile
 import ctypes
 import numpy
 from hip import hip
@@ -8,7 +7,7 @@ from typing import Sequence
 from ...kernel.interpreter.main import SMEM_PER_WARP
 from ...kernel.interpreter.structs import HTensorInfo
 from ..executor import BaseExecutor, BaseExecutableProgram, TensorInterface, _convert_arg
-from .driver import current_context, hipfb_load, launch_kernel, check_hip_error, get_gfx_name
+from .driver import current_context, hipfb_load, launch_kernel, check_hip_error
 from ..utils import cdiv, fill_tensor_info as _fill_tensor_info
 
 
@@ -18,19 +17,8 @@ class HipExecutor(BaseExecutor):
 
     def __init__(self) -> None:
         self.func_cache = {}
-        self._zip_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gint_amdgcn.zip")
-
-    def _load_hsaco_for_gfx(self, gfx: str) -> bytes:
-        """Load the HSACO for the given GFX name from the zip archive."""
-        with zipfile.ZipFile(self._zip_path, 'r') as zf:
-            names = zf.namelist()
-            entry = f"gint_{gfx}.hsaco.xz"
-            if entry in names:
-                return lzma.decompress(zf.read(entry))
-        raise RuntimeError(
-            f"No HSACO found for {gfx} in {self._zip_path}. "
-            f"Available: {names}"
-        )
+        with lzma.open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "gint.fatbin.xz")) as fi:
+            self.fatbin = fi.read()
 
     def warp_size(self) -> int:
         return 32
@@ -38,9 +26,7 @@ class HipExecutor(BaseExecutor):
     def geval_func_handle(self):
         dctx = current_context()
         if dctx not in self.func_cache:
-            gfx = get_gfx_name(dctx.device)
-            hsaco = self._load_hsaco_for_gfx(gfx)
-            hipfunc = hipfb_load(dctx, hsaco, b'geval')
+            hipfunc = hipfb_load(dctx, self.fatbin, b'geval')
             concurrencies = []
             for num_warps in [1, 2, 4]:
                 _, blocks = check_hip_error(hip.hipModuleOccupancyMaxActiveBlocksPerMultiprocessor(hipfunc, num_warps * 32, SMEM_PER_WARP * num_warps))
