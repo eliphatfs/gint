@@ -146,7 +146,7 @@ Supported GPU backends:
 Runtime dependencies (declared in `pyproject.toml`):
 - `numpy`, `llvmlite>=0.43`, `cuda-bindings>=12.6`, `rich`
 - Optional: `torch>=2.0` (for conductor / `torch.compile` backend)
-- Optional: `hip-python>=6.0` (for AMD HIP backend, install via `pip install -e ".[hip]"`)
+- Optional: `hip-python>=6.0` (for AMD HIP backend, see installation section below)
 
 ### cuda-python / cuda-bindings Version Compatibility
 
@@ -364,8 +364,12 @@ Built with `hatchling`. Requires Python >=3.10.
 ```bash
 pip install -e .          # core (needs cuda-bindings, numpy, llvmlite, rich)
 pip install -e ".[torch]" # with torch.compile backend
-pip install -e ".[hip]"   # with AMD HIP backend (needs hip-python>=6.0)
+
+# AMD HIP backend (hip-python is only on Test PyPI due to AMD's packaging policy)
+python3 -m pip install -i https://test.pypi.org/simple "hip-python>=6.0.0"
 ```
+
+> **Note**: `hip-python` is not declared as a pip dependency because AMD only publishes real packages to Test PyPI (the PyPI entry is a dummy). This needs to be documented for end users when gint is published.
 
 Entry points:
 - `gint-gen-llir`: LLVM IR generation script
