@@ -81,10 +81,7 @@ class HipExecutor(BaseExecutor):
         for i, tidx in enumerate(indices):
             ti.base_ptr[i] = args[tidx].base_ptr
         hipstream = hip.hipStream_t(cuda_stream)
-        if check_hip_error(hip.hipStreamIsCapturing(hipstream))[1] == hip.hipStreamCaptureStatus.hipStreamCaptureStatusActive:
-            check_hip_error(hip.hipMemcpyHtoD(dinfo, ctypes.addressof(ti), ctypes.sizeof(ti)))
-        else:
-            check_hip_error(hip.hipMemcpyHtoDAsync(dinfo, ctypes.addressof(ti), ctypes.sizeof(ti), hipstream))
+        check_hip_error(hip.hipMemcpyHtoDAsync(dinfo, ctypes.addressof(ti), ctypes.sizeof(ti), hipstream))
         best_warps = self.heuristic_best_warps(grid_dim, concurrencies, num_cu)
         launch_kernel(hipfunc, dcode, dinfo, nargs, grid_dim, 0, grid_dim=cdiv(grid_dim, best_warps), block_dim=(32, best_warps, 1), smem_bytes=SMEM_PER_WARP * best_warps, stream=hipstream)
 
