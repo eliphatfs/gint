@@ -24,28 +24,39 @@ class AMDGCNIRBuilder(PlatformIRBuilder):
         entry_bb = geval.append_basic_block("entry")
         builder = AMDGCNIRBuilder(entry_bb)
         builder._gfx = gfx
-        builder._kernel_fn_name = fn_name
+        builder._kernel_fn_names = [fn_name]
+        return builder
+
+    @classmethod
+    def add_kernel(cls, prev: 'AMDGCNIRBuilder', fn_type: ir.FunctionType, fn_name: str):
+        """Append a second kernel function to the module of an existing builder
+        and return a fresh builder positioned at its entry block. The new
+        builder shares the kernel-name list, so emit() attaches the attribute
+        group to every kernel."""
+        mod = prev.module
+        geval = ir.Function(mod, fn_type, fn_name)
+        geval.calling_convention = "amdgpu_kernel"
+        entry_bb = geval.append_basic_block("entry")
+        builder = AMDGCNIRBuilder(entry_bb)
+        builder._gfx = prev._gfx
+        builder._kernel_fn_names = prev._kernel_fn_names
+        builder._kernel_fn_names.append(fn_name)
         return builder
 
     def emit(self):
         # llvmlite doesn't support arbitrary key-value function attributes,
         # so we inject them via LLVM IR attribute groups after serialization.
         llir = super().emit().decode()
-        fn_name = self._kernel_fn_name
-        llir = llir.replace(
-            f'@"{fn_name}"(',
-            f'@"{fn_name}"(',
-            1,  # only first occurrence (the definition, not declarations)
-        )
-        # Find the closing paren of the argument list in the define line and add #0
-        # The pattern is: define amdgpu_kernel void @"geval"(...)\n{
         import re
-        llir = re.sub(
-            r'(define\s+amdgpu_kernel\s+void\s+@"' + re.escape(fn_name) + r'"\([^)]*\))',
-            r'\1 #0',
-            llir,
-            count=1,
-        )
+        for fn_name in self._kernel_fn_names:
+            # Find the closing paren of the argument list in the define line and add #0
+            # The pattern is: define amdgpu_kernel void @"<fn_name>"(...)\n{
+            llir = re.sub(
+                r'(define\s+amdgpu_kernel\s+void\s+@"' + re.escape(fn_name) + r'"\([^)]*\))',
+                r'\1 #0',
+                llir,
+                count=1,
+            )
         llir += (
             f'\nattributes #0 = {{'
             f' "amdgpu-flat-work-group-size"="32,128"'

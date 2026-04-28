@@ -21,10 +21,21 @@ Supported GPU backends:
 - Located in `gint/kernel/interpreter/` - written in LLVM IR via `llvmlite`
 - **Micro-architecture**:
   - `REG_WIDTH = 4`: Processes 4 elements simultaneously (ILP - Instruction Level Parallelism)
-  - `POOL_SIZE = 12`, `NUM_REGS = 8`, `MAX_STACK = 8`: Unified pool of 12 slots — stack grows upward from index 0, virtual registers occupy the top 8 slots counting downward (`reg n = pool[11-n]`). The upper 4 stack slots overlap with the lower 4 registers, so kernels must not simultaneously maximize both stack depth and register usage.
+  - Pool/stack/register sizes are per-variant (see Kernel Variants below). Default `l12` variant: `POOL_SIZE=12, NUM_REGS=8, MAX_STACK=8`. Stack grows upward from index 0, virtual registers occupy the top `NUM_REGS` slots counting downward (`reg n = pool[POOL_SIZE-1-n]`).
   - Dispatch: Large switch-case in LLVM IR with weights for optimization
   - Uses PHI nodes for state persistence across instruction dispatches (one dispatch block per stack depth 0..MAX_STACK)
 - **Instruction set**: Defined in `gint/kernel/interpreter/instructions/`
+
+### Kernel Variants
+- The fatbin/HSACO ships **two kernel variants** under symbols `geval_s7` and `geval_l12`. Both implement the full interpreter; they differ only in pool/stack/reg sizes:
+  - `s7`: `POOL_SIZE=7, NUM_REGS=4, MAX_STACK=7` — fits all pointwise/streaming workloads (max measured: stack=6, regs=0). Smaller register pressure on the GPU → better occupancy.
+  - `l12`: `POOL_SIZE=12, NUM_REGS=8, MAX_STACK=8` — required by register-heavy kernels (e.g. `inv4x4` uses all 8 regs).
+- **Variant table**: `gint.kernel.interpreter.main.VARIANTS` maps name → `(pool_size, num_regs, max_stack)`. `variant_kernel_name(name)` formats the kernel symbol (`geval_<name>`).
+- **IR generation**: `build_interpreter_main_nvptx()` / `build_interpreter_main_amdgcn()` emit ONE module containing every variant's kernel. The `dynamic_smem` shared global is created once and shared across kernels. AMDGCN's `emit()` post-processor attaches the `#0` attribute group to every kernel symbol.
+- **Per-variant opcode filtering**: `FLoadRegN`/`FStoreRegN` opcodes for `N >= num_regs` are dropped from the dispatch table of smaller variants (otherwise they would alias into normal stack slots via `pool[pool_size-1-N]`). The `s7` variant only accepts opcodes 87–90 (load reg 0–3) and 95–98 (store reg 0–3).
+- **Host-side selection** (`gint/host/executor.py:select_variant`): runs `analyze_bytecode` on each compiled program, picks the smallest variant whose `(num_regs, max_stack)` covers the program. Decision is cached alongside the per-program device buffers in `program._cu` / `program._hip`.
+- **`execute_indirect`**: picks `max(variant) over all programs in the batch` (one launch per call, not bucketed). Mixed batches are rare; bucketing would multiply launch overhead.
+- **Build/deploy**: `./generate.sh` and `./generate_amdgcn.sh` bundle BOTH variants into one fatbin/HSACO. Re-run after pulling these changes — the old single-`geval` artifacts are incompatible with the new selection code.
 
 ### Virtual Register File
 - 8 virtual registers (`reg 0`–`reg 7`) backed by the top 8 slots of the unified pool

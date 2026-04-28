@@ -16,6 +16,16 @@ class NVPTXIRBuilder(PlatformIRBuilder):
         geval.calling_convention = "ptx_kernel"
         entry_bb = geval.append_basic_block("entry")
         return NVPTXIRBuilder(entry_bb)
+
+    @classmethod
+    def add_kernel(cls, prev: 'NVPTXIRBuilder', fn_type: ir.FunctionType, fn_name: str):
+        """Append a second kernel function to the module of an existing builder
+        and return a fresh builder positioned at its entry block."""
+        mod = prev.module
+        geval = ir.Function(mod, fn_type, fn_name)
+        geval.calling_convention = "ptx_kernel"
+        entry_bb = geval.append_basic_block("entry")
+        return NVPTXIRBuilder(entry_bb)
     
     def smem_addrspace(self) -> int:
         return 3

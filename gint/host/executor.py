@@ -5,7 +5,8 @@ from collections.abc import Hashable
 from dataclasses import dataclass, field
 from typing import Any, Union, Optional, Sequence
 
-from ..kernel.interpreter.main import REG_WIDTH
+from ..kernel.interpreter.main import REG_WIDTH, VARIANTS, DEFAULT_VARIANT
+from .analyzer import analyze_bytecode
 
 
 @dataclass
@@ -93,6 +94,27 @@ def _convert_arg(arg):
         return arg
     else:
         return TensorInterface.from_cuda_array_interface(arg)
+
+
+def select_variant(bytecode) -> str:
+    """Pick the smallest kernel variant whose limits fit the given bytecode.
+
+    Variants are ordered by ascending pool size; the first one that satisfies
+    the program's measured stack depth and register usage wins. Falls back
+    to DEFAULT_VARIANT if none fits (which currently shouldn't happen since
+    the largest variant covers the full instruction set).
+    """
+    stats = analyze_bytecode(bytecode)
+    candidates = sorted(VARIANTS.items(), key=lambda kv: kv[1][0])  # by pool_size
+    for name, (pool_size, num_regs, max_stack) in candidates:
+        if stats.max_stack <= max_stack and (stats.max_reg_idx + 1) <= num_regs:
+            return name
+    return DEFAULT_VARIANT
+
+
+def _variant_max(a: str, b: str) -> str:
+    """Return the larger of two variants by pool size."""
+    return a if VARIANTS[a][0] >= VARIANTS[b][0] else b
 
 
 class BaseExecutableProgram(object):

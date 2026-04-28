@@ -27,6 +27,36 @@ REG_WIDTH = 4
 SMEM_PER_WARP = MAX_N_TENSORS * 7 * 4
 
 
+# Kernel variants. Each entry: (pool_size, num_regs, max_stack).
+# The kernel symbol baked into the fatbin/HSACO is `geval_<name>`.
+# Selection at host side: smallest variant whose limits cover the program.
+VARIANTS: dict[str, tuple[int, int, int]] = {
+    's7':  (7,  4, 7),   # small: covers all pointwise/streaming workloads
+    'l12': (12, 8, 8),   # large: covers register-heavy kernels (e.g. inv4x4)
+}
+DEFAULT_VARIANT = 'l12'  # back-compat default for callers that don't select
+
+
+def _is_invalid_reg_op(Insn, num_regs: int) -> bool:
+    """Reg-load/store classes carry a `_reg_n` attribute. Variants with fewer
+    registers than the global max must skip opcodes that address out-of-range
+    registers — leaving them in would alias into stack slots."""
+    n = getattr(Insn, '_reg_n', None)
+    return n is not None and n >= num_regs
+
+
+def _ensure_smem_global(LL: PlatformIRBuilder):
+    """Reuse the existing dynamic_smem global if a prior variant already
+    created it in this module; otherwise create it."""
+    for gv in LL.module.global_values:
+        if gv.name == 'dynamic_smem':
+            return gv
+    smem_base = ir.GlobalVariable(LL.module, ir.ArrayType(i8, 0), name='dynamic_smem', addrspace=3)
+    smem_base.linkage = 'external'
+    smem_base.align = 16
+    return smem_base
+
+
 INSNS: dict[type[Instruction], int] = {
     Halt: 0,
     Nop: 1,
@@ -137,12 +167,9 @@ INSNS: dict[type[Instruction], int] = {
 }
 
 
-def build_main_loop(LL: PlatformIRBuilder):
-    # declare dynamic smem
-    smem_base = ir.GlobalVariable(LL.module, ir.ArrayType(i8, 0), name='dynamic_smem', addrspace=3)
-    smem_base.linkage = 'external'
-    smem_base.align = 16
-    
+def build_main_loop(LL: PlatformIRBuilder, pool_size: int = POOL_SIZE, num_regs: int = NUM_REGS, max_stack: int = MAX_STACK):
+    smem_base = _ensure_smem_global(LL)
+
     # early exit warps beyond user scheduling
     with LL.if_then(LL.icmp_unsigned('>=', LL.logical_program_idx(), LL.arg(3)), False):
         LL.ret_void()
@@ -170,10 +197,10 @@ def build_main_loop(LL: PlatformIRBuilder):
     entry_bb = LL.block
     dispatch_bbs: dict[int, ir.Block] = {}
     dispatch_states: dict[int, StackMachineState] = {}
-    for i in range(MAX_STACK + 1):
+    for i in range(max_stack + 1):
         dispatch_bbs[i] = LL.append_basic_block("dispatch.%d" % i)
         LL.position_at_end(dispatch_bbs[i])
-        dispatch_states[i] = StackMachineState(LL, smem_base, POOL_SIZE, REG_WIDTH, i, NUM_REGS, MAX_STACK)
+        dispatch_states[i] = StackMachineState(LL, smem_base, pool_size, REG_WIDTH, i, num_regs, max_stack)
     undef_bb = LL.append_basic_block("unreachable")
     
     def br_state(state: StackMachineState):
@@ -188,16 +215,18 @@ def build_main_loop(LL: PlatformIRBuilder):
     state = dispatch_states[0].clone()
     state.pc = entry_pc
     state.opcode = entry_opcode
-    for i in range(POOL_SIZE):
+    for i in range(pool_size):
         state.pool[i] = [f32(ir.Undefined)] * REG_WIDTH
     emit_load_tensor_infos(LL, state, tinfo_ptr)
     br_state(state)
-    
-    for i in range(MAX_STACK + 1):
+
+    variant_insns = [(Insn, opid) for Insn, opid in INSNS.items() if not _is_invalid_reg_op(Insn, num_regs)]
+
+    for i in range(max_stack + 1):
         LL.position_at_end(dispatch_bbs[i])
         dispatch_switch = LL.switch(dispatch_states[i].opcode, undef_bb)
         dispatch_weights = [1]
-        for Insn, opid in INSNS.items():
+        for Insn, opid in variant_insns:
             insn_bb = LL.append_basic_block("%s.%d" % (Insn.__name__, i))
             LL.position_at_end(insn_bb)
             cstate = dispatch_states[i].clone()
@@ -216,7 +245,7 @@ def build_main_loop(LL: PlatformIRBuilder):
             else:
                 dispatch_weights.append(10)
         dispatch_switch.set_weights(dispatch_weights)
-    
+
     LL.position_at_end(undef_bb)
     LL.unreachable()
 
@@ -230,13 +259,42 @@ GEvalFType = ir.FunctionType(void, [
 ])
 
 
-def build_interpreter_main_nvptx() -> PlatformIRBuilder:
-    LL = NVPTXIRBuilder.create_kernel_module(GEvalFType, "geval")
-    build_main_loop(LL)
+def variant_kernel_name(variant: str) -> str:
+    """Symbol name baked into the fatbin/HSACO for a given variant."""
+    return f"geval_{variant}"
+
+
+def build_interpreter_main_nvptx(variants: list[str] = None) -> PlatformIRBuilder:
+    """Build an NVPTX module containing one kernel per requested variant.
+
+    Returns the IR builder of the LAST variant; the module (`LL.module`)
+    contains every variant's kernel.
+    """
+    if variants is None:
+        variants = list(VARIANTS)
+    assert variants, "must request at least one variant"
+    first, *rest = variants
+    pool, regs, stack = VARIANTS[first]
+    LL = NVPTXIRBuilder.create_kernel_module(GEvalFType, variant_kernel_name(first))
+    build_main_loop(LL, pool, regs, stack)
+    for v in rest:
+        pool, regs, stack = VARIANTS[v]
+        LL = NVPTXIRBuilder.add_kernel(LL, GEvalFType, variant_kernel_name(v))
+        build_main_loop(LL, pool, regs, stack)
     return LL
 
 
-def build_interpreter_main_amdgcn(gfx: str = "gfx1100") -> PlatformIRBuilder:
-    LL = AMDGCNIRBuilder.create_kernel_module(GEvalFType, "geval", gfx=gfx)
-    build_main_loop(LL)
+def build_interpreter_main_amdgcn(gfx: str = "gfx1100", variants: list[str] = None) -> PlatformIRBuilder:
+    """Build an AMDGCN module containing one kernel per requested variant."""
+    if variants is None:
+        variants = list(VARIANTS)
+    assert variants, "must request at least one variant"
+    first, *rest = variants
+    pool, regs, stack = VARIANTS[first]
+    LL = AMDGCNIRBuilder.create_kernel_module(GEvalFType, variant_kernel_name(first), gfx=gfx)
+    build_main_loop(LL, pool, regs, stack)
+    for v in rest:
+        pool, regs, stack = VARIANTS[v]
+        LL = AMDGCNIRBuilder.add_kernel(LL, GEvalFType, variant_kernel_name(v))
+        build_main_loop(LL, pool, regs, stack)
     return LL

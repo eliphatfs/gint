@@ -3,10 +3,10 @@ import lzma
 import ctypes
 import numpy
 import cuda.bindings.driver as cuda
-from typing import Sequence
-from ...kernel.interpreter.main import SMEM_PER_WARP
+from typing import Optional, Sequence
+from ...kernel.interpreter.main import SMEM_PER_WARP, VARIANTS, variant_kernel_name
 from ...kernel.interpreter.structs import HTensorInfo
-from ..executor import BaseExecutor, BaseExecutableProgram, TensorInterface, _convert_arg
+from ..executor import BaseExecutor, BaseExecutableProgram, TensorInterface, _convert_arg, select_variant, _variant_max
 from .driver import current_context, fatbin_load, launch_kernel, check_cuda_error
 from ..utils import cdiv, fill_tensor_info as _fill_tensor_info
 
@@ -21,18 +21,20 @@ class CudaExecutor(BaseExecutor):
     def warp_size(self) -> int:
         return 32
 
-    def geval_func_handle(self):
+    def geval_func_handle(self, variant: str):
         dctx = current_context()
-        if dctx not in self.func_cache:
-            cufunc = fatbin_load(dctx, self.fatbin, b'geval')
+        key = (dctx, variant)
+        if key not in self.func_cache:
+            sym = variant_kernel_name(variant).encode()
+            cufunc = fatbin_load(dctx, self.fatbin, sym)
             concurrencies = []
             for num_warps in [1, 2, 4]:
                 _, blocks = check_cuda_error(cuda.cuOccupancyMaxActiveBlocksPerMultiprocessor(cufunc, num_warps * 32, SMEM_PER_WARP * num_warps))
                 concurrencies.append((num_warps, blocks))
             _, device = check_cuda_error(cuda.cuCtxGetDevice())
             _, num_sm = check_cuda_error(cuda.cuDeviceGetAttribute(cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device))
-            self.func_cache[dctx] = dctx, cufunc, concurrencies, num_sm
-        return self.func_cache[dctx]
+            self.func_cache[key] = dctx, cufunc, concurrencies, num_sm
+        return self.func_cache[key]
 
     def heuristic_best_warps(self, num_blocks, concurrencies, num_sm):
         best_warps = 1
@@ -47,8 +49,6 @@ class CudaExecutor(BaseExecutor):
         return best_warps
 
     def execute(self, program: BaseExecutableProgram, args: Sequence[TensorInterface], grid_dim: int, cuda_stream: int = 0, **extra_kwargs):
-        dctx, cufunc, concurrencies, num_sm = self.geval_func_handle()
-
         if not hasattr(program, '_cu'):
             program._cu = {}
 
@@ -61,20 +61,24 @@ class CudaExecutor(BaseExecutor):
             if pd.input_indices is None:
                 pd.input_indices = list(range(len(pd.input_infos)))
             assert len(pd.input_indices) == len(pd.input_infos), "Input indices must match input infos"
+            variant = select_variant(pd.program)
             _, dcode = check_cuda_error(cuda.cuMemAlloc(len(pd.program) * 4))
             check_cuda_error(cuda.cuMemcpyHtoD(dcode, pd.program, len(pd.program) * 4))
             _, hinfo = check_cuda_error(cuda.cuMemAllocHost(ctypes.sizeof(HTensorInfo)))
             _, dinfo = check_cuda_error(cuda.cuMemAlloc(ctypes.sizeof(HTensorInfo)))
-            dctx.deferred(lambda: check_cuda_error(cuda.cuMemFree(dcode)))
-            dctx.deferred(lambda: check_cuda_error(cuda.cuMemFree(dinfo)))
-            dctx.deferred(lambda: check_cuda_error(cuda.cuMemFreeHost(hinfo)))
-            pcu[pcp] = cacheline = dcode, dinfo, HTensorInfo.from_address(int(hinfo)), len(args), pd.input_indices
+            dctx_local = current_context()
+            dctx_local.deferred(lambda: check_cuda_error(cuda.cuMemFree(dcode)))
+            dctx_local.deferred(lambda: check_cuda_error(cuda.cuMemFree(dinfo)))
+            dctx_local.deferred(lambda: check_cuda_error(cuda.cuMemFreeHost(hinfo)))
+            pcu[pcp] = cacheline = dcode, dinfo, HTensorInfo.from_address(int(hinfo)), len(args), pd.input_indices, variant
             ti = HTensorInfo.from_address(int(hinfo))
             _fill_tensor_info(ti, pd.input_infos)
 
-        dcode, dinfo, ti, nargs, indices = cacheline
+        dcode, dinfo, ti, nargs, indices, variant = cacheline
         if len(args) != nargs:
             raise ValueError("Number of arguments don't match the program.")
+
+        dctx, cufunc, concurrencies, num_sm = self.geval_func_handle(variant)
 
         for i, tidx in enumerate(indices):
             ti.base_ptr[i] = args[tidx].base_ptr
@@ -95,17 +99,19 @@ class CudaExecutor(BaseExecutor):
     ):
         assert len(programs) == len(args_list), "programs and args_list must have the same length"
         grid_dim = len(indices)
-        dctx, cufunc, concurrencies, num_sm = self.geval_func_handle()
 
         # Convert args and build per-program device resources
         converted_args_list = [[_convert_arg(a) for a in args] for args in args_list]
         dcode_list = []
         dinfo_list = []
         ntensors_list = []
+        batch_variant: Optional[str] = None
         for prog, args in zip(programs, converted_args_list):
             pd = prog.get_program(*args)
             if pd.input_indices is None:
                 pd.input_indices = list(range(len(pd.input_infos)))
+            v = select_variant(pd.program)
+            batch_variant = v if batch_variant is None else _variant_max(batch_variant, v)
 
             # Upload bytecode
             _, dcode = check_cuda_error(cuda.cuMemAlloc(len(pd.program) * 4))
@@ -126,6 +132,8 @@ class CudaExecutor(BaseExecutor):
             dcode_list.append(dcode)
             dinfo_list.append(dinfo)
             ntensors_list.append(len(pd.input_infos))
+
+        dctx, cufunc, concurrencies, num_sm = self.geval_func_handle(batch_variant)
 
         # Build per-warp pointer tables
         code_ptrs = (ctypes.c_int64 * grid_dim)()
