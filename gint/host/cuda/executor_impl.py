@@ -99,6 +99,7 @@ class CudaExecutor(BaseExecutor):
     ):
         assert len(programs) == len(args_list), "programs and args_list must have the same length"
         grid_dim = len(indices)
+        dctx = current_context()
 
         # Convert args and build per-program device resources
         converted_args_list = [[_convert_arg(a) for a in args] for args in args_list]
@@ -133,7 +134,7 @@ class CudaExecutor(BaseExecutor):
             dinfo_list.append(dinfo)
             ntensors_list.append(len(pd.input_infos))
 
-        dctx, cufunc, concurrencies, num_sm = self.geval_func_handle(batch_variant)
+        _, cufunc, concurrencies, num_sm = self.geval_func_handle(batch_variant)
 
         # Build per-warp pointer tables
         code_ptrs = (ctypes.c_int64 * grid_dim)()

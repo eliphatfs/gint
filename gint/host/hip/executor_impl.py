@@ -98,6 +98,7 @@ class HipExecutor(BaseExecutor):
     ):
         assert len(programs) == len(args_list), "programs and args_list must have the same length"
         grid_dim = len(indices)
+        dctx = current_context()
 
         converted_args_list = [[_convert_arg(a) for a in args] for args in args_list]
         dcode_list = []
@@ -129,7 +130,7 @@ class HipExecutor(BaseExecutor):
             dinfo_list.append(dinfo)
             ntensors_list.append(len(pd.input_infos))
 
-        dctx, hipfunc, concurrencies, num_cu = self.geval_func_handle(batch_variant)
+        _, hipfunc, concurrencies, num_cu = self.geval_func_handle(batch_variant)
 
         code_ptrs = (ctypes.c_int64 * grid_dim)()
         tinfo_ptrs = (ctypes.c_int64 * grid_dim)()
