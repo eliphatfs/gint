@@ -1,33 +1,13 @@
 import torch
 import unittest
 from tests import requires_gpu
-from gint.conductor import register_backend
-from gint.conductor import backend as backend_mod
+import gint.conductor  # noqa: F401  (auto-registers "gint" / "gint-no-cuda-graph")
 
 
 @requires_gpu
 class TestConductorCudaGraphs(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        try:
-            register_backend("gint_graphs", cuda_graphs=True)
-        except Exception:
-            pass
-
-    def test_flag_resolution(self):
-        import os
-        self.assertFalse(backend_mod._resolve_cuda_graphs(None))
-        self.assertFalse(backend_mod._resolve_cuda_graphs(False))
-        self.assertTrue(backend_mod._resolve_cuda_graphs(True))
-        os.environ['GINT_CUDA_GRAPHS'] = '1'
-        try:
-            self.assertTrue(backend_mod._resolve_cuda_graphs(None))
-            self.assertFalse(backend_mod._resolve_cuda_graphs(False))
-        finally:
-            del os.environ['GINT_CUDA_GRAPHS']
-
     def test_pointwise_repeated_calls_fresh_inputs(self):
-        @torch.compile(backend="gint_graphs")
+        @torch.compile(backend="gint")
         def fn(x, y):
             return torch.relu(x) + y * 2.0
 
@@ -37,7 +17,7 @@ class TestConductorCudaGraphs(unittest.TestCase):
             torch.testing.assert_close(fn(x, y), torch.relu(x) + y * 2.0)
 
     def test_intermediate_tensor_across_replays(self):
-        @torch.compile(backend="gint_graphs")
+        @torch.compile(backend="gint")
         def fn(a, b, c):
             return (a + b) * c
 
@@ -48,7 +28,7 @@ class TestConductorCudaGraphs(unittest.TestCase):
             torch.testing.assert_close(fn(a, b, c), (a + b) * c)
 
     def test_broadcast_under_graphs(self):
-        @torch.compile(backend="gint_graphs")
+        @torch.compile(backend="gint")
         def fn(x, y):
             return x + y
 

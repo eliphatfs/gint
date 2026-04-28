@@ -92,11 +92,18 @@ Supported GPU backends:
 - Supports basic arithmetic ops (add, sub, mul, div), unary transcendentals, activations (relu, gelu, silu, leaky_relu), comparisons, `where`, metadata ops (view, unsqueeze, squeeze, expand, permute, transpose, t), and reduction ops (sum, mean on innermost dim); fallback to eager mode for unsupported ops
 - Partitioner constraints per subgraph: max 8 global tensor slots, max stack depth 8, broadcast-compatible shapes
 
-#### CUDA Graphs (opt-in)
-- `register_backend(name, cuda_graphs=True)` (or env `GINT_CUDA_GRAPHS=1`) wraps the AOT-compiled callable with `torch.cuda.make_graphed_callables`, so subsequent calls replay a CUDA graph instead of paying per-call launch overhead. Default is OFF
-- `mode="reduce-overhead"` is **inductor-only** and is silently ignored when `backend="gint"`; this flag is the gint equivalent
+#### Backend Registration
+- `import gint.conductor` auto-registers two backends (only runs when torch is importable, since `gint.conductor` itself depends on torch):
+  - `"gint"` — default, `cuda_graphs=True`
+  - `"gint-no-cuda-graph"` — `cuda_graphs=False`
+- `gint/__init__.py` already imports `gint.conductor` under a try/except, so `import gint` is sufficient on torch-enabled installs; on torch-less installs the conductor module silently isn't loaded and no backends are registered
+- `register_backend(name, cuda_graphs)` is still public for users who want a custom name; it swallows re-registration errors with a printed warning so re-imports are safe
+
+#### CUDA Graphs
+- The `"gint"` backend wraps the AOT-compiled callable with `torch.cuda.make_graphed_callables`, so subsequent calls replay a CUDA graph instead of paying per-call launch overhead. Use `"gint-no-cuda-graph"` to opt out
+- `mode="reduce-overhead"` is **inductor-only** and is silently ignored when `backend="gint"`; choosing `"gint"` vs `"gint-no-cuda-graph"` is the gint equivalent
 - Implemented entirely via PyTorch's `make_graphed_callables` — no executor changes. The existing `cuStreamIsCapturing` branch in `CudaExecutor.execute` (`gint/host/cuda/executor_impl.py:82-85`) already cooperates with capture: the pinned `HTensorInfo` host buffer is updated each call (writing fresh tensor base pointers), and the captured H2D memcpy node copies it into the cached device `dinfo` on every replay. The bytecode and tensor-info device buffers are cached per-shape in `program._cu[pcp]` so addresses are stable
-- The flag is **bound at registration time** via a closure (`_make_gint_backend`), so multiple registrations with different settings coexist
+- The flag is **bound at registration time** via a closure (`_make_gint_backend`), so the two registered backends coexist
 - Microbench (relu(x)+y*2.0, N=1024 on a single GPU): ~3× speedup from launch-overhead amortization
 - Not wrapped: `execute_indirect` (per-warp pointer tables are reallocated per call). The conductor's pointwise/reduction path uses `execute`, so this isn't on the hot path. HIP analogue not yet plumbed
 

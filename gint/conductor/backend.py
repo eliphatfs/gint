@@ -5,19 +5,12 @@ This module implements the backend contract required by torch.compile,
 converting FX graphs into gint bytecode programs.
 """
 
-import os
 import torch
-from typing import List, Callable, Optional
+from typing import List, Callable
 from torch.fx import GraphModule
 
 from ..host.executor import TensorInterface, get_executor
 from .compiler import GintCompiler
-
-
-def _resolve_cuda_graphs(flag: Optional[bool]) -> bool:
-    if flag is not None:
-        return bool(flag)
-    return os.environ.get('GINT_CUDA_GRAPHS', '').lower() in ('1', 'true', 'yes', 'on')
 
 
 def _make_gint_backend(cuda_graphs: bool) -> Callable:
@@ -48,36 +41,33 @@ def _make_gint_backend(cuda_graphs: bool) -> Callable:
     return gint_backend
 
 
-# Public default backend (no graphs); preserved for users importing it directly.
-gint_backend = _make_gint_backend(cuda_graphs=False)
-
-
-def register_backend(name: str = "gint", cuda_graphs: Optional[bool] = None):
+def register_backend(name: str, cuda_graphs: bool):
     """
-    Register the gint backend with torch.compile.
+    Register a gint torch.compile backend under ``name``.
+
+    On ``import gint.conductor`` the package auto-registers two backends:
+
+    - ``"gint"`` — cuda_graphs=True (default).
+    - ``"gint-no-cuda-graph"`` — cuda_graphs=False.
+
+    Use this function only if you need a custom name or to re-register
+    after a torch dynamo reset. Re-registering an existing name is a
+    no-op (logged, not raised).
 
     Args:
-        name: The name to register the backend under (default: "gint")
-        cuda_graphs: If True (or env ``GINT_CUDA_GRAPHS=1``), wrap the
-            compiled forward in ``torch.cuda.make_graphed_callables`` so
-            subsequent calls replay a CUDA graph. Default: False.
-
-    Usage:
-        >>> from gint.conductor import register_backend
-        >>> register_backend(cuda_graphs=True)
-        >>>
-        >>> @torch.compile(backend="gint")
-        >>> def my_function(x, y):
-        >>>     return x + y
+        name: The name to register the backend under.
+        cuda_graphs: If True, wrap the compiled forward in
+            ``torch.cuda.make_graphed_callables`` so subsequent calls
+            replay a CUDA graph.
     """
-    use_graphs = _resolve_cuda_graphs(cuda_graphs)
-    backend_fn = _make_gint_backend(cuda_graphs=use_graphs)
+    backend_fn = _make_gint_backend(cuda_graphs=cuda_graphs)
     try:
         torch._dynamo.register_backend(name=name, compiler_fn=backend_fn)
-        suffix = " (cuda_graphs=True)" if use_graphs else ""
-        print(f"Successfully registered gint backend as '{name}'{suffix}")
     except AttributeError:
         raise RuntimeError(
             "torch._dynamo not available. "
             "Please ensure you have PyTorch 2.0+ installed with dynamo support."
         )
+    except Exception as e:
+        # Most commonly: name already registered (e.g. module re-import). Don't crash imports.
+        print(f"[gint] register_backend({name!r}) skipped: {e!r}")
