@@ -2,6 +2,7 @@ from .version import __version__
 from .host.utils import cdiv
 from .host.sugar import bytecode
 from .host.executor import BaseExecutableProgram, ProgramData, ProgramTensorInfo, TensorInterface
+from .host.analyzer import analyze_bytecode, BytecodeStats
 
 # Torch.compile backend (optional import - requires PyTorch)
 try:

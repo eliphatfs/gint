@@ -85,6 +85,7 @@ Supported GPU backends:
   - `ProgramTensorInfo`: Encapsulates tensor metadata (strides, shapes, element sizes)
   - Each instruction emits a 2-word pair `[opcode, operand]`; operand is 0 for instructions that don't use it
 - `gint/host/sugar.py`: Higher-level convenience functions
+- `gint/host/analyzer.py`: Static analyzer over recorded bytecode — `analyze_bytecode(bc)` returns a `BytecodeStats` (peak stack depth, registers used, min pool size). Hand-maintained `_EFFECTS` table covers every opcode in `INSNS`. Torch-free; useful for kernel-variant selection and partitioner heuristics. Re-exported as `gint.analyze_bytecode`
 
 ### Torch.Compile Integration (Conductor)
 - `gint/conductor/backend.py`: Backend registration and entry point
@@ -324,6 +325,7 @@ gint/
     executor.py      # Base executor interface + backend auto-detection
     utils.py         # Shared utilities (fill_tensor_info, cdiv)
     sugar.py         # Convenience APIs
+    analyzer.py      # Static stack/reg usage analyzer for recorded bytecode
   kernel/            # Device-side LLVM IR code
     interpreter/     # Stack-based VM implementation
       instructions/  # Instruction definitions (arith, control, load_store, reg, ...)
