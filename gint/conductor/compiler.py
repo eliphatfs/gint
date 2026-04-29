@@ -220,18 +220,31 @@ class StackCodegen:
         # Virtual stack: list of FX nodes (or None for constants), bottom first.
         self.vstack: List[Optional[Node]] = []
         # Remaining internal uses for each node (decremented as args are consumed).
+        # Counts arg-appearances (multiset), so mul(x, x) counts x twice.
         self.uses_left: Dict[Node, int] = {}
         # Nodes that must be stored to global memory (external outputs or
         # multi-use intermediates already registered in tensor_map).
         self.ext_out: Set[Node] = set()
+        # How many times each Node has been claimed for the current op's
+        # operand list. Reset at the end of emit_op. Lets handle_operand
+        # distinguish "top is mine from a prior op" (no dup needed for
+        # depth==0) from "top is the slot I just pushed for arg #i, and
+        # arg #i+1 wants the same value" (must dup).
+        self._current_op_pushed: Dict[Node, int] = {}
 
     def set_subgraph_nodes(self, nodes: List[Node], graph_outputs: Set[Node]):
         node_set = set(nodes)
         self.uses_left = {}
         self.ext_out = set()
+        # Count internal uses by arg-appearance, not unique-user count.
+        # node.users is a dict keyed on user nodes, so mul(x, x) reports
+        # x.users == [mul] even though x is consumed twice.
         for node in nodes:
-            internal = sum(1 for u in node.users if u in node_set)
-            self.uses_left[node] = internal
+            for arg in node.args:
+                if isinstance(arg, Node) and arg in node_set:
+                    self.uses_left[arg] = self.uses_left.get(arg, 0) + 1
+        for node in nodes:
+            self.uses_left.setdefault(node, 0)
             if node in graph_outputs or any(u not in node_set for u in node.users):
                 self.ext_out.add(node)
 
@@ -264,6 +277,8 @@ class StackCodegen:
 
         uses_left = self.uses_left.get(arg, 0)
         depth = self._depth(arg)
+        already_claimed = self._current_op_pushed.get(arg, 0)
+        self._current_op_pushed[arg] = already_claimed + 1
 
         if depth == -1:
             # Not on virtual stack: load from global memory.
@@ -273,8 +288,11 @@ class StackCodegen:
             self.vstack.append(arg)
 
         elif depth == 0:
-            # Already on top.  Duplicate if it will be needed again after this use.
-            if uses_left > 1:
+            # Already on top. Duplicate when:
+            # - the top slot is already claimed by an earlier operand of the
+            #   current op (e.g. mul(x, x) — the second x needs its own slot), or
+            # - more uses remain after this one (preserve a copy for later).
+            if already_claimed >= 1 or uses_left > 1:
                 fe.dup()
                 self.vstack.append(arg)
 
@@ -360,6 +378,9 @@ class StackCodegen:
             fe.pop()
             self.vstack.pop()
         # else: internal_uses > 0, result stays on the virtual stack.
+
+        # Reset per-op claims; next op starts with no claimed slots.
+        self._current_op_pushed = {}
 
 
 # ---------------------------------------------------------------------------
@@ -703,9 +724,6 @@ class GintCompiler:
                 block_grid_dims=[num_inner_blocks, 1],
                 block_grid_steps=[128, 1],
             ))
-
-        from ..host.debug import dump_bytecode
-        dump_bytecode(bytecode, "tmp/sg.gint")
 
         return GintCompiledSubgraph(bytecode, tensor_infos,
                                      output_shape=output_shape,

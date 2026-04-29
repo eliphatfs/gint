@@ -13,7 +13,7 @@ from ..host.executor import TensorInterface, get_executor
 from .compiler import GintCompiler
 
 
-def _make_gint_backend(cuda_graphs: bool) -> Callable:
+def _make_gint_backend(cuda_graphs: bool, num_warmup_iters: int) -> Callable:
     """Return a torch.compile backend callable with the cuda_graphs flag baked in."""
     def gint_backend(gm: GraphModule, example_inputs: List[torch.Tensor]) -> Callable:
         from torch._functorch.aot_autograd import aot_module
@@ -33,7 +33,9 @@ def _make_gint_backend(cuda_graphs: bool) -> Callable:
             return compiled
 
         try:
-            return torch.cuda.make_graphed_callables(compiled, tuple(example_inputs))
+            return torch.cuda.make_graphed_callables(
+                compiled, tuple(example_inputs), num_warmup_iters=num_warmup_iters
+            )
         except Exception as e:
             print(f"[gint] CUDA graph capture failed ({e!r}); falling back to non-graphed path")
             return compiled
@@ -41,7 +43,7 @@ def _make_gint_backend(cuda_graphs: bool) -> Callable:
     return gint_backend
 
 
-def register_backend(name: str, cuda_graphs: bool):
+def register_backend(name: str, cuda_graphs: bool, num_warmup_iters: int = 1):
     """
     Register a gint torch.compile backend under ``name``.
 
@@ -59,8 +61,14 @@ def register_backend(name: str, cuda_graphs: bool):
         cuda_graphs: If True, wrap the compiled forward in
             ``torch.cuda.make_graphed_callables`` so subsequent calls
             replay a CUDA graph.
+        num_warmup_iters: Iterations the side-stream warmup runs before
+            capture. Default 1 — sufficient to populate gint's per-shape
+            device buffer cache, which is all that needs to be allocated
+            before capture (no cudnn/JIT to pre-bake). Don't use 0:
+            allocations would land inside the captured region and break
+            capture.
     """
-    backend_fn = _make_gint_backend(cuda_graphs=cuda_graphs)
+    backend_fn = _make_gint_backend(cuda_graphs=cuda_graphs, num_warmup_iters=num_warmup_iters)
     try:
         torch._dynamo.register_backend(name=name, compiler_fn=backend_fn)
     except AttributeError:

@@ -101,6 +101,7 @@ Supported GPU backends:
 ### Torch.Compile Integration (Conductor)
 - `gint/conductor/backend.py`: Backend registration and entry point
 - `gint/conductor/compiler.py`: FX graph → bytecode conversion, graph partitioning, and broadcasting
+- `gint/conductor/debug.py`: `inspect_subgraphs(fn, *args)` runs `fn` through the gint backend and returns one `SubgraphInfo` per compiled subgraph (kind, FX nodes, bytecode, output shape, grid dim). Pair with `print_subgraphs` to dump the bytecode of each subgraph — the right tool when a torch.compile path looks slower than expected or you want to verify partitioning / fusion behavior
 - Supports basic arithmetic ops (add, sub, mul, div), unary transcendentals, activations (relu, gelu, silu, leaky_relu), comparisons, `where`, metadata ops (view, unsqueeze, squeeze, expand, permute, transpose, t), and reduction ops (sum, mean on innermost dim); fallback to eager mode for unsupported ops
 - Partitioner constraints per subgraph: max 8 global tensor slots, max stack depth 8, broadcast-compatible shapes
 
@@ -109,7 +110,7 @@ Supported GPU backends:
   - `"gint"` — default, `cuda_graphs=True`
   - `"gint-no-cuda-graph"` — `cuda_graphs=False`
 - `gint/__init__.py` already imports `gint.conductor` under a try/except, so `import gint` is sufficient on torch-enabled installs; on torch-less installs the conductor module silently isn't loaded and no backends are registered
-- `register_backend(name, cuda_graphs)` is still public for users who want a custom name; it swallows re-registration errors with a printed warning so re-imports are safe
+- `register_backend(name, cuda_graphs, num_warmup_iters=1)` is still public for users who want a custom name; it swallows re-registration errors with a printed warning so re-imports are safe. `num_warmup_iters` is forwarded to `make_graphed_callables` — default 1 is enough to populate gint's per-shape device buffer cache before capture; don't pass 0 (allocations would land inside the captured region)
 
 #### CUDA Graphs
 - The `"gint"` backend wraps the AOT-compiled callable with `torch.cuda.make_graphed_callables`, so subsequent calls replay a CUDA graph instead of paying per-call launch overhead. Use `"gint-no-cuda-graph"` to opt out
