@@ -306,6 +306,10 @@ OP_REGISTRY: dict = {
     torch.ops.aten.atan.default:  _ew1(fe.fatan),
     torch.ops.aten.erf.default:   _ew1(fe.ferf),
 
+    # --- Power ---
+    torch.ops.aten.pow.Tensor_Scalar: _ew2(fe.fpow),
+    torch.ops.aten.pow.Tensor_Tensor: _ew2(fe.fpow),
+
     # --- Activation functions (multi-instruction sequences) ---
     # peak_stack_extra: max extra hardware slots used internally beyond the input already on stack.
     # Sequences were optimized by the GPU superoptimizer (examples/superopt/).

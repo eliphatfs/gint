@@ -567,11 +567,22 @@ class GintCompiler:
         partitioner = GraphPartitioner(self.gm, max_tensors=8, max_stack=8)
         raw_schedules = partitioner.partition()
 
-        # Fuse reduction+broadcast+pointwise pairs where possible.
+        # Fuse pointwise + reduction + pointwise triples where possible.
         merged_schedules: List[List[Node]] = []
         compiled: Dict[int, GintCompiledSubgraph] = {}
         i = 0
         sg_index = 0
+        pending_pw: Optional[List[Node]] = None  # deferred pointwise schedule
+
+        def _emit_pending():
+            """Compile and record the deferred pointwise subgraph (if any)."""
+            nonlocal sg_index
+            if pending_pw is not None:
+                compiled[sg_index] = self._compile_subgraph(
+                    pending_pw, partitioner)
+                merged_schedules.append(pending_pw)
+                sg_index += 1
+
         while i < len(raw_schedules):
             schedule = raw_schedules[i]
             if self._is_reduction_subgraph(schedule):
@@ -579,26 +590,46 @@ class GintCompiler:
                 keepdim = (reduction_node.args[2]
                            if len(reduction_node.args) > 2
                            else reduction_node.kwargs.get('keepdim', False))
-                # Try to fuse with the following pointwise subgraph.
+
+                # Check for pre-reduction fusion (deferred pointwise before reduction).
+                pre_prefix = None
+                if pending_pw is not None:
+                    if self._can_fuse_pre_reduction(
+                            pending_pw, reduction_node, partitioner):
+                        pre_prefix = pending_pw
+                        pending_pw = None  # consumed, don't compile
+                    else:
+                        _emit_pending()
+
+                # Check for post-reduction fusion (existing).
+                pw_schedule = None
                 if (keepdim and i + 1 < len(raw_schedules)
                         and not self._is_reduction_subgraph(raw_schedules[i + 1])
                         and self._can_fuse_with_reduction(
-                            reduction_node, raw_schedules[i + 1])):
+                            reduction_node, raw_schedules[i + 1], partitioner)):
                     pw_schedule = raw_schedules[i + 1]
-                    fused_nodes = [reduction_node] + pw_schedule
+
+                if pre_prefix is not None or pw_schedule is not None:
+                    fused_nodes = (pre_prefix or []) + [reduction_node] + (pw_schedule or [])
                     compiled[sg_index] = self._compile_fused_reduction_subgraph(
-                        reduction_node, pw_schedule, partitioner)
+                        reduction_node, pw_schedule or [], partitioner,
+                        pre_prefix=pre_prefix)
                     merged_schedules.append(fused_nodes)
                     sg_index += 1
-                    i += 2
+                    i += 2 if pw_schedule else 1
                     continue
                 compiled[sg_index] = self._compile_reduction_subgraph(
                     reduction_node, partitioner)
             else:
-                compiled[sg_index] = self._compile_subgraph(schedule, partitioner)
+                _emit_pending()
+                pending_pw = schedule  # defer compilation
+                i += 1
+                continue
             merged_schedules.append(schedule)
             sg_index += 1
             i += 1
+
+        _emit_pending()
 
         subgraph_schedules = merged_schedules
 
@@ -642,29 +673,135 @@ class GintCompiler:
         return execute
 
     @staticmethod
-    def _can_fuse_with_reduction(reduction_node: Node, pw_schedule: List[Node]) -> bool:
+    def _can_fuse_with_reduction(reduction_node: Node, pw_schedule: List[Node],
+                                  partitioner: GraphPartitioner) -> bool:
         """Check if a pointwise schedule can fuse with a preceding keepdim reduction.
 
-        Currently only fuses a single binary elementwise op that consumes both the
-        reduction result and the reduction input, and the reduction result has no
-        external users outside the pointwise schedule.
+        Supports multi-op pointwise chains that split into a scalar prefix (ops
+        consuming only the reduction scalar) and a broadcast suffix (ops consuming
+        external global tensors that share the reduction dimension).
         """
-        if len(pw_schedule) != 1:
-            return False
-        pw_node = pw_schedule[0]
-        desc = get_op_descriptor(pw_node)
-        if desc is None or desc.kind != OpKind.ELEMENTWISE or desc.arity != 2:
-            return False
-        reduction_input = reduction_node.args[0]
-        node_args = [a for a in pw_node.args if isinstance(a, Node)]
-        if reduction_node not in node_args or reduction_input not in node_args:
-            return False
-        # Reduction result must have no users outside the fused subgraph.
         pw_set = set(pw_schedule)
+
+        # 1. All nodes must be ELEMENTWISE.
+        for node in pw_schedule:
+            desc = get_op_descriptor(node)
+            if desc is None or desc.kind != OpKind.ELEMENTWISE:
+                return False
+
+        # 2. Reduction result must have no users outside the fused subgraph.
         for user in reduction_node.users:
             if user not in pw_set:
                 return False
+
+        # 3. Compute the split; broadcast suffix must be non-empty.
+        scalar_prefix, broadcast_suffix = GintCompiler._split_pointwise_chain(
+            reduction_node, pw_schedule)
+        if not broadcast_suffix:
+            return False
+
+        # 4. All external global inputs to broadcast_suffix must share the
+        #    reduction dimension.
+        reduction_input = reduction_node.args[0]
+        input_shape = partitioner._get_shape(reduction_input)
+        if input_shape is None:
+            return False
+        reduction_size = input_shape[-1]
+
+        for node in broadcast_suffix:
+            for arg in node.args:
+                if not isinstance(arg, Node):
+                    continue
+                if arg in pw_set or arg is reduction_node:
+                    continue
+                shape = partitioner._get_shape(arg)
+                if shape is None:
+                    return False
+                if len(shape) == 0:
+                    continue  # 0-d scalar tensor, will broadcast
+                if shape[-1] != reduction_size:
+                    return False
+
         return True
+
+    @staticmethod
+    def _can_fuse_pre_reduction(pre_schedule: List[Node], reduction_node: Node,
+                                 partitioner: GraphPartitioner) -> bool:
+        """Check if a pointwise subgraph can fuse BEFORE a reduction.
+
+        The pre-prefix ops are emitted inside the Phase 1 accumulation loop:
+        each chunk is loaded, the prefix ops are applied, and the result is
+        accumulated.  This avoids storing the prefix result to global memory.
+        """
+        pre_set = set(pre_schedule)
+
+        # 1. All nodes must be ELEMENTWISE.
+        for node in pre_schedule:
+            desc = get_op_descriptor(node)
+            if desc is None or desc.kind != OpKind.ELEMENTWISE:
+                return False
+
+        # 2. The reduction input must be a node in the pre-prefix schedule,
+        #    and its only consumer must be the reduction.
+        reduction_input = reduction_node.args[0]
+        if reduction_input not in pre_set:
+            return False
+        for user in reduction_input.users:
+            if user is not reduction_node:
+                return False
+
+        # 3. All external inputs to the pre-prefix must share the reduction dim.
+        input_shape = partitioner._get_shape(reduction_input)
+        if input_shape is None:
+            return False
+        reduction_size = input_shape[-1]
+
+        for node in pre_schedule:
+            for arg in node.args:
+                if not isinstance(arg, Node):
+                    continue
+                if arg in pre_set:
+                    continue
+                shape = partitioner._get_shape(arg)
+                if shape is None:
+                    return False
+                if len(shape) == 0:
+                    continue
+                if shape[-1] != reduction_size:
+                    return False
+
+        return True
+
+    @staticmethod
+    def _split_pointwise_chain(reduction_node: Node, pw_schedule: List[Node]) -> tuple:
+        """Split pw_schedule into (scalar_prefix, broadcast_suffix).
+
+        A node belongs to broadcast_suffix if it transitively depends on any
+        external global tensor (not in pw_schedule and not the reduction_node).
+        """
+        pw_set = set(pw_schedule)
+        broadcast_set: Set[Node] = set()
+        for node in pw_schedule:
+            for arg in node.args:
+                if not isinstance(arg, Node):
+                    continue
+                if arg not in pw_set and arg is not reduction_node:
+                    broadcast_set.add(node)
+                    break
+                if arg in broadcast_set:
+                    broadcast_set.add(node)
+                    break
+        scalar_prefix = [n for n in pw_schedule if n not in broadcast_set]
+        broadcast_suffix = [n for n in pw_schedule if n in broadcast_set]
+        return scalar_prefix, broadcast_suffix
+
+    @staticmethod
+    def _vstack_depth(vstack: List[Optional[Node]], node: Node) -> int:
+        """Return depth of *node* from top of *vstack* (0 = top), or -1 if absent."""
+        for i, n in enumerate(reversed(vstack)):
+            if n is node:
+                return i
+        return -1
 
     # --- Subgraph compilation ---
 
@@ -815,70 +952,176 @@ class GintCompiler:
     def _compile_fused_reduction_subgraph(
         self, reduction_node: Node, pw_schedule: List[Node],
         partitioner: GraphPartitioner,
+        pre_prefix: Optional[List[Node]] = None,
     ) -> GintCompiledSubgraph:
-        """Compile a fused reduction+broadcast+pointwise subgraph.
+        """Compile a fused pointwise+reduction+pointwise subgraph.
 
-        Emits bytecode in two phases:
-        Phase 1: Load input in chunks, accumulate, reduce → scalar on stack.
-        Phase 2: For each chunk, reload input, apply pointwise op with scalar, store.
+        Phases:
+        Phase 1:  Load (apply pre-prefix) chunks, accumulate, warp-reduce.
+        Phase 1b: Emit scalar prefix ops (consume only the scalar + constants).
+        Phase 2:  For each chunk, dup scalar, emit broadcast suffix ops, store.
         """
-        pw_node = pw_schedule[0]
-        input_node = reduction_node.args[0]
-        input_shape = list(partitioner._get_shape(input_node))
-        output_shape = list(partitioner._get_shape(pw_node))
+        scalar_prefix, broadcast_suffix = GintCompiler._split_pointwise_chain(
+            reduction_node, pw_schedule)
 
+        reduction_input = reduction_node.args[0]
+        input_shape = list(partitioner._get_shape(reduction_input))
         reduction_size = input_shape[-1]
         n_chunks = math.ceil(reduction_size / 128)
 
-        all_nodes = [reduction_node] + pw_schedule
+        final_node = broadcast_suffix[-1]
+        output_shape = list(partitioner._get_shape(final_node))
+
+        all_nodes = (pre_prefix or []) + [reduction_node] + pw_schedule
         global_nodes = self._sorted_globals(partitioner._required_globals(all_nodes))
         tensor_map = {n: i for i, n in enumerate(global_nodes)}
-        input_slot = tensor_map[input_node]
-        output_slot = tensor_map[pw_node]
-
-        # Determine whether the reduction result is args[1] of the pointwise op.
-        # If so, after dup+load we need swap to match the registry's expected stack order.
-        pw_args = pw_node.args
-        reduction_is_second = (isinstance(pw_args[1], Node) and pw_args[1] is reduction_node)
+        node_set = set(all_nodes)
+        output_nodes = {n for n in broadcast_suffix
+                        if n in tensor_map and (
+                           n in partitioner.graph_outputs or
+                           any(u not in node_set for u in n.users))}
 
         fe_state = FrontendState([])
         token = _frontend_state.set(fe_state)
         try:
-            # Phase 1: Load and reduce
-            fe.fldg_1d(0, input_slot)
-            for k in range(1, n_chunks):
-                fe.fldg_1d(k * 128, input_slot)
-                fe.fadd()
+            # Phase 1: Load, apply pre-prefix ops, accumulate, warp-reduce
+            if pre_prefix:
+                # Emit pre-prefix ops inside the accumulation loop: each
+                # chunk is loaded, transformed, then accumulated.
+                for k in range(n_chunks):
+                    for node in pre_prefix:
+                        desc = get_op_descriptor(node)
+                        arg_order = desc.arg_order if desc.arg_order is not None \
+                                    else list(range(len(node.args)))
+                        for idx in arg_order:
+                            arg = node.args[idx]
+                            if isinstance(arg, (int, float)):
+                                fe.fpush(float(arg))
+                            elif arg in tensor_map:
+                                fe.fldg_1d(k * 128, tensor_map[arg])
+                        desc.emit_fn(node)
+                    if k == 0:
+                        pass  # first value starts the accumulator
+                    else:
+                        fe.fadd()
+            else:
+                input_slot = tensor_map[reduction_input]
+                fe.fldg_1d(0, input_slot)
+                for k in range(1, n_chunks):
+                    fe.fldg_1d(k * 128, input_slot)
+                    fe.fadd()
             red_desc = get_op_descriptor(reduction_node)
             red_desc.emit_fn(reduction_node)
-            # Scalar reduction result is now on top of stack.
+            # Stack now: [scalar_reduction_result]
 
-            # Phase 2: For each chunk, apply pointwise op
-            pw_desc = get_op_descriptor(pw_node)
+            # Phase 1b: Emit scalar prefix ops (once, before the chunk loop).
+            for node in scalar_prefix:
+                desc = get_op_descriptor(node)
+                arg_order = desc.arg_order if desc.arg_order is not None \
+                            else list(range(len(node.args)))
+                # Count Node-arg appearances to emit dup when the same arg is
+                # used multiple times by the same op (e.g. mul(s, s)).
+                arg_counts: Dict[Node, int] = {}
+                for idx in arg_order:
+                    arg = node.args[idx]
+                    if isinstance(arg, Node):
+                        arg_counts[arg] = arg_counts.get(arg, 0) + 1
+
+                for idx in arg_order:
+                    arg = node.args[idx]
+                    if isinstance(arg, (int, float)):
+                        fe.fpush(float(arg))
+                    elif isinstance(arg, Node):
+                        if arg_counts.get(arg, 0) > 1:
+                            fe.dup()
+                            arg_counts[arg] -= 1
+                desc.emit_fn(node)
+            # Stack now: [scalar_reduction_result_modified]
+
+            # Phase 2: Per-chunk broadcast suffix
+            scalar_node = scalar_prefix[-1] if scalar_prefix else reduction_node
+
             for k in range(n_chunks):
-                fe.dup()                              # keep scalar for next iteration
-                fe.fldg_1d(k * 128, input_slot)       # load input chunk
-                if reduction_is_second:
-                    # Stack: [scalar_copy, x_chunk]. Registry expects top=args[1]=scalar.
-                    fe.swap()
-                # else: reduction is args[0], registry expects top=args[1]=x. Already correct.
-                pw_desc.emit_fn(pw_node)
-                fe.fstg_1d(k * 128, output_slot)
-            fe.pop()                                  # discard remaining scalar
+                fe.dup()  # duplicate scalar for this iteration
+                chunk_vstack: List[Optional[Node]] = [scalar_node]
+
+                for node in broadcast_suffix:
+                    desc = get_op_descriptor(node)
+                    arg_order = desc.arg_order if desc.arg_order is not None \
+                                else list(range(len(node.args)))
+
+                    for idx in arg_order:
+                        arg = node.args[idx]
+                        if isinstance(arg, (int, float)):
+                            fe.fpush(float(arg))
+                            chunk_vstack.append(None)
+                        elif isinstance(arg, Node):
+                            if arg in tensor_map:
+                                # Global tensor: load with chunk offset
+                                fe.fldg_1d(k * 128, tensor_map[arg])
+                                chunk_vstack.append(arg)
+                            else:
+                                # Scalar / intermediate: on chunk_vstack
+                                depth = GintCompiler._vstack_depth(chunk_vstack, arg)
+                                if depth == -1:
+                                    raise RuntimeError(
+                                        f"Arg {arg.name} not on chunk stack "
+                                        f"for {node.name}")
+                                if depth == 0:
+                                    pass  # already on top
+                                elif depth == 1:
+                                    fe.swap()
+                                    top = chunk_vstack.pop()
+                                    sec = chunk_vstack.pop()
+                                    chunk_vstack.append(top)
+                                    chunk_vstack.append(sec)
+                                else:
+                                    raise RuntimeError(
+                                        f"Arg {arg.name} buried at depth {depth} "
+                                        f"for {node.name}")
+
+                    desc.emit_fn(node)
+                    for _ in range(desc.arity):
+                        chunk_vstack.pop()
+                    chunk_vstack.append(node)
+
+                    if node in output_nodes:
+                        fe.fstg_1d(k * 128, tensor_map[node])
+                        chunk_vstack.pop()
+
+                # Pop any leftover intermediates from this iteration
+                # (e.g. scalar if unused by broadcast suffix).
+                while chunk_vstack:
+                    fe.pop()
+                    chunk_vstack.pop()
+
+            # Pop the original scalar (survived all iterations via dup).
+            fe.pop()
             fe.halt()
             bytecode = fe_state.bc
         finally:
             _frontend_state.reset(token)
 
-        # Build tensor infos — both input and output use the full reduction dim.
+        # Build tensor infos — per-tensor batch strides account for broadcast.
         batch_dims = input_shape[:-1] if len(input_shape) > 1 else []
-        bstrides = _c_contiguous_strides(input_shape)[:-1] if len(input_shape) > 1 else []
 
         tensor_infos = []
         for gn in global_nodes:
+            gn_shape = partitioner._get_shape(gn)
+            if gn_shape is not None and len(gn_shape) >= 1:
+                # Broadcast: if gn has fewer dims than input_shape, its
+                # batch strides are 0 for the missing leading dims.
+                gn_batch_ndim = len(gn_shape) - 1  # exclude last dim
+                missing = len(batch_dims) - gn_batch_ndim
+                gn_bstrides = [0] * max(0, missing)
+                if gn_batch_ndim > 0:
+                    gn_full_strides = _c_contiguous_strides(gn_shape)
+                    gn_bstrides = gn_bstrides + list(gn_full_strides[:-1])
+            else:
+                gn_bstrides = []
             tensor_infos.append(ProgramTensorInfo(
                 elm_size=4,
-                batch_strides=list(bstrides),
+                batch_strides=list(gn_bstrides),
                 batch_shape=list(batch_dims),
                 block_shape_stride_1=[reduction_size, 1],
                 block_shape_stride_2=[1, 0],

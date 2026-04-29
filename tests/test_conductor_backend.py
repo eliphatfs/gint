@@ -432,6 +432,62 @@ class TestConductorBackend(unittest.TestCase):
         expected = x - torch.mean(x, dim=-1, keepdim=True)
         torch.testing.assert_close(fn(x), expected, atol=1e-3, rtol=1e-3)
 
+    def test_mean_subtract_still_fuses(self):
+        """Regression: existing single-op fusion still works after generalization."""
+        @torch.compile(backend="gint-no-cuda-graph")
+        def fn(x):
+            return x - torch.mean(x, dim=-1, keepdim=True)
+
+        x = torch.randn(16, 64, device='cuda')
+        expected = x - torch.mean(x, dim=-1, keepdim=True)
+        torch.testing.assert_close(fn(x), expected, atol=1e-4, rtol=1e-4)
+
+    def test_sum_normalize_still_fuses(self):
+        """Regression: x / sum(x, keepdim=True) still fuses."""
+        @torch.compile(backend="gint-no-cuda-graph")
+        def fn(x):
+            return x / torch.sum(x, dim=-1, keepdim=True)
+
+        x = torch.rand(8, 32, device='cuda') + 0.1
+        expected = x / torch.sum(x, dim=-1, keepdim=True)
+        torch.testing.assert_close(fn(x), expected, atol=1e-4, rtol=1e-4)
+
+    def test_rms_norm_fused(self):
+        """RMSNorm: x * rsqrt(mean(x*x) + eps) * w in a single kernel."""
+        def rms_norm_manual(x, w, eps=1e-5):
+            rstd = torch.rsqrt(torch.mean(x * x, dim=-1, keepdim=True) + eps)
+            return x * rstd * w
+
+        compiled = torch.compile(rms_norm_manual, backend="gint-no-cuda-graph")
+        x = torch.randn(16, 64, device='cuda')
+        w = torch.randn(64, device='cuda')
+        torch.testing.assert_close(compiled(x, w), rms_norm_manual(x, w),
+                                   atol=1e-4, rtol=1e-4)
+
+    def test_rms_norm_3d(self):
+        """RMSNorm with 3D input + 1D weight."""
+        def rms_norm_manual(x, w, eps=1e-5):
+            rstd = torch.rsqrt(torch.mean(x * x, dim=-1, keepdim=True) + eps)
+            return x * rstd * w
+
+        compiled = torch.compile(rms_norm_manual, backend="gint-no-cuda-graph")
+        x = torch.randn(4, 8, 32, device='cuda')
+        w = torch.randn(32, device='cuda')
+        torch.testing.assert_close(compiled(x, w), rms_norm_manual(x, w),
+                                   atol=1e-4, rtol=1e-4)
+
+    def test_rms_norm_large_dim(self):
+        """RMSNorm with multi-chunk (dim > 128)."""
+        def rms_norm_manual(x, w, eps=1e-5):
+            rstd = torch.rsqrt(torch.mean(x * x, dim=-1, keepdim=True) + eps)
+            return x * rstd * w
+
+        compiled = torch.compile(rms_norm_manual, backend="gint-no-cuda-graph")
+        x = torch.randn(4, 256, device='cuda')
+        w = torch.randn(256, device='cuda')
+        torch.testing.assert_close(compiled(x, w), rms_norm_manual(x, w),
+                                   atol=1e-3, rtol=1e-3)
+
 
 if __name__ == "__main__":
     if torch.cuda.is_available():

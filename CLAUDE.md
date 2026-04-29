@@ -154,19 +154,22 @@ Supported GPU backends:
 - **Partitioner**: Reduction nodes are isolated as single-node subgraphs (flush any current pointwise subgraph)
 
 #### Fused Reduction+Broadcast+Pointwise
-- When a `keepdim=True` reduction feeds into a binary pointwise op that also consumes the original unreduced input (e.g., `x - mean(x, dim=-1, keepdim=True)`), the conductor fuses both into a single subgraph
-- **Two-phase bytecode** (mirrors the handwritten rmsnorm kernel in `tests/test_rmsnorm.py`):
-  - Phase 1: Load input in chunks, accumulate, warp_allreduce + width-lane combine → scalar stays on stack
-  - Phase 2: For each chunk, `dup` scalar, reload input, apply pointwise op, store output
-- **Fusion detection** (`_can_fuse_with_reduction`): Currently limited to a single binary elementwise op where the reduction result has no external users
+- When a `keepdim=True` reduction is followed by a pointwise subgraph, the conductor fuses them post-partitioning into a single subgraph
+- **Generalized multi-op support**: The post-reduction pointwise chain is split into a **scalar prefix** (ops consuming only the reduction scalar, e.g. `+eps`, `rsqrt`) and a **broadcast suffix** (ops consuming external globals, e.g. `*x`, `*w`). The scalar prefix executes once; the broadcast suffix runs per-chunk
+- **Pre-reduction fusion**: A pointwise subgraph immediately preceding a reduction (e.g. `x*x` before `mean`) is absorbed into the Phase 1 accumulation loop — no intermediate global memory round-trip
+- **Three-phase bytecode** (mirrors the handwritten rmsnorm kernel in `tests/test_rmsnorm.py`):
+  - Phase 1: For each chunk, load (apply pre-prefix ops), accumulate, warp_allreduce + width-lane combine → scalar on stack
+  - Phase 1b: Emit scalar prefix ops on the scalar
+  - Phase 2: For each chunk, `dup` scalar, load chunked globals, emit broadcast suffix ops, store output
+- **Fusion detection**: `_can_fuse_with_reduction` (post-reduction) and `_can_fuse_pre_reduction` (pre-reduction) validate that all involved ops are ELEMENTWISE, that the reduction result has no external users, and that all external globals share the reduction dimension
+- **Deferred compilation**: Pointwise subgraphs preceding reductions are buffered rather than compiled immediately, avoiding wasted work when they are absorbed by pre-reduction fusion
 - **Stack depth**: Phase 1 peaks at ~2 extra slots (width-lane combine). Phase 2 needs scalar + 1 for input + op overhead. Total ~4-5, well within MAX_STACK=8
-- Example: `y = x - mean(x, dim=-1, keepdim=True)` for `x.shape = (M, N)` → single kernel launch with M warps, each loading N elements twice (reduce pass + pointwise pass)
+- Examples: `x - mean(x)` (single binary op, existing pattern). `x * rsqrt(mean(x*x) + eps) * w` (full RMSNorm, 6 nodes fused into 1 kernel)
 
 #### Reduction Future Work
 - **Dedicated `WarpFullReduceSum` instruction** — single opcode replacing the 7-instruction width-lane combine sequence
 - **Kernel loop instruction** — for reduction dims > ~16K without bytecode bloat
 - **Non-innermost reductions** — would require transposing the tensor or a different grid decomposition
-- **Multi-op fusion** — fusing reduction with more complex pointwise chains (e.g., `relu(x - mean(x, keepdim=True))`) beyond the current single binary op limit
 - **Multi-reduction patterns** — e.g., layer norm (mean + variance in one pass)
 
 ## Dependencies

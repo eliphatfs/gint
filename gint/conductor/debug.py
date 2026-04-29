@@ -78,11 +78,13 @@ def inspect_subgraphs(fn: Callable, *args, **kwargs) -> List[SubgraphInfo]:
         ))
         return result
 
-    def cap_fused(self, red_node, pw_schedule, partitioner):
-        result = orig_fused(self, red_node, pw_schedule, partitioner)
+    def cap_fused(self, red_node, pw_schedule, partitioner, pre_prefix=None):
+        result = orig_fused(self, red_node, pw_schedule, partitioner,
+                            pre_prefix=pre_prefix)
+        nodes = (pre_prefix or []) + [red_node] + list(pw_schedule)
         captured.append(SubgraphInfo(
             kind='fused-reduction',
-            nodes=[red_node] + list(pw_schedule),
+            nodes=nodes,
             bytecode=result.bytecode,
             output_shape=getattr(result, 'output_shape', None),
             grid_dim=getattr(result, 'grid_dim', 0),
