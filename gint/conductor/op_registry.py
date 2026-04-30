@@ -248,6 +248,17 @@ OP_REGISTRY: dict = {
     torch.ops.aten.remainder.Tensor:
         _ew2(fe.frem),
 
+    # Scalar variants: self is a tensor, other is a scalar constant.
+    # Stack order: [self, scalar_constant] — fadd/frsub/frdiv handle this correctly.
+    torch.ops.aten.add.Scalar:
+        OpDescriptor(2, OpKind.ELEMENTWISE, _emit_add_tensor),
+    torch.ops.aten.sub.Scalar:
+        OpDescriptor(2, OpKind.ELEMENTWISE, _emit_sub_tensor),
+    torch.ops.aten.mul.Scalar:
+        _ew2(fe.fmul),
+    torch.ops.aten.div.Scalar:
+        _ew2(fe.frdiv),
+
     # --- Comparison (produce 0.0/1.0 float) ---
     # Tensor variants: aten.gt(self, other) = self > other.
     # FGt = peek(0)>peek(1) = top>second.  With natural push [self,other] top=other:
@@ -307,8 +318,10 @@ OP_REGISTRY: dict = {
     torch.ops.aten.erf.default:   _ew1(fe.ferf),
 
     # --- Power ---
-    torch.ops.aten.pow.Tensor_Scalar: _ew2(fe.fpow),
-    torch.ops.aten.pow.Tensor_Tensor: _ew2(fe.fpow),
+    # FPow computes top^second.  ATen arg order is (base, exponent), so push
+    # exponent first → stack [exponent, base] → FPow = base^exponent.
+    torch.ops.aten.pow.Tensor_Scalar: _ew2(fe.fpow, arg_order=[1, 0]),
+    torch.ops.aten.pow.Tensor_Tensor: _ew2(fe.fpow, arg_order=[1, 0]),
 
     # --- Activation functions (multi-instruction sequences) ---
     # peak_stack_extra: max extra hardware slots used internally beyond the input already on stack.

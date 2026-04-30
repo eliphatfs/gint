@@ -969,8 +969,15 @@ class GintCompiler:
         reduction_size = input_shape[-1]
         n_chunks = math.ceil(reduction_size / 128)
 
-        final_node = broadcast_suffix[-1]
-        output_shape = list(partitioner._get_shape(final_node))
+        # Determine the output node: broadcast suffix if present, otherwise
+        # the last scalar-prefix node, otherwise the reduction itself.
+        if broadcast_suffix:
+            output_node = broadcast_suffix[-1]
+        elif scalar_prefix:
+            output_node = scalar_prefix[-1]
+        else:
+            output_node = reduction_node
+        output_shape = list(partitioner._get_shape(output_node))
 
         all_nodes = (pre_prefix or []) + [reduction_node] + pw_schedule
         global_nodes = self._sorted_globals(partitioner._required_globals(all_nodes))
@@ -1038,65 +1045,72 @@ class GintCompiler:
                 desc.emit_fn(node)
             # Stack now: [scalar_reduction_result_modified]
 
-            # Phase 2: Per-chunk broadcast suffix
-            scalar_node = scalar_prefix[-1] if scalar_prefix else reduction_node
+            if broadcast_suffix:
+                # Phase 2: Per-chunk broadcast suffix
+                scalar_node = scalar_prefix[-1] if scalar_prefix else reduction_node
 
-            for k in range(n_chunks):
-                fe.dup()  # duplicate scalar for this iteration
-                chunk_vstack: List[Optional[Node]] = [scalar_node]
+                for k in range(n_chunks):
+                    fe.dup()  # duplicate scalar for this iteration
+                    chunk_vstack: List[Optional[Node]] = [scalar_node]
 
-                for node in broadcast_suffix:
-                    desc = get_op_descriptor(node)
-                    arg_order = desc.arg_order if desc.arg_order is not None \
-                                else list(range(len(node.args)))
+                    for node in broadcast_suffix:
+                        desc = get_op_descriptor(node)
+                        arg_order = desc.arg_order if desc.arg_order is not None \
+                                    else list(range(len(node.args)))
 
-                    for idx in arg_order:
-                        arg = node.args[idx]
-                        if isinstance(arg, (int, float)):
-                            fe.fpush(float(arg))
-                            chunk_vstack.append(None)
-                        elif isinstance(arg, Node):
-                            if arg in tensor_map:
-                                # Global tensor: load with chunk offset
-                                fe.fldg_1d(k * 128, tensor_map[arg])
-                                chunk_vstack.append(arg)
-                            else:
-                                # Scalar / intermediate: on chunk_vstack
-                                depth = GintCompiler._vstack_depth(chunk_vstack, arg)
-                                if depth == -1:
-                                    raise RuntimeError(
-                                        f"Arg {arg.name} not on chunk stack "
-                                        f"for {node.name}")
-                                if depth == 0:
-                                    pass  # already on top
-                                elif depth == 1:
-                                    fe.swap()
-                                    top = chunk_vstack.pop()
-                                    sec = chunk_vstack.pop()
-                                    chunk_vstack.append(top)
-                                    chunk_vstack.append(sec)
+                        for idx in arg_order:
+                            arg = node.args[idx]
+                            if isinstance(arg, (int, float)):
+                                fe.fpush(float(arg))
+                                chunk_vstack.append(None)
+                            elif isinstance(arg, Node):
+                                if arg in tensor_map:
+                                    # Global tensor: load with chunk offset
+                                    fe.fldg_1d(k * 128, tensor_map[arg])
+                                    chunk_vstack.append(arg)
                                 else:
-                                    raise RuntimeError(
-                                        f"Arg {arg.name} buried at depth {depth} "
-                                        f"for {node.name}")
+                                    # Scalar / intermediate: on chunk_vstack
+                                    depth = GintCompiler._vstack_depth(chunk_vstack, arg)
+                                    if depth == -1:
+                                        raise RuntimeError(
+                                            f"Arg {arg.name} not on chunk stack "
+                                            f"for {node.name}")
+                                    if depth == 0:
+                                        pass  # already on top
+                                    elif depth == 1:
+                                        fe.swap()
+                                        top = chunk_vstack.pop()
+                                        sec = chunk_vstack.pop()
+                                        chunk_vstack.append(top)
+                                        chunk_vstack.append(sec)
+                                    else:
+                                        raise RuntimeError(
+                                            f"Arg {arg.name} buried at depth {depth} "
+                                            f"for {node.name}")
 
-                    desc.emit_fn(node)
-                    for _ in range(desc.arity):
+                        desc.emit_fn(node)
+                        for _ in range(desc.arity):
+                            chunk_vstack.pop()
+                        chunk_vstack.append(node)
+
+                        if node in output_nodes:
+                            fe.fstg_1d(k * 128, tensor_map[node])
+                            chunk_vstack.pop()
+
+                    # Pop any leftover intermediates from this iteration
+                    # (e.g. scalar if unused by broadcast suffix).
+                    while chunk_vstack:
+                        fe.pop()
                         chunk_vstack.pop()
-                    chunk_vstack.append(node)
 
-                    if node in output_nodes:
-                        fe.fstg_1d(k * 128, tensor_map[node])
-                        chunk_vstack.pop()
-
-                # Pop any leftover intermediates from this iteration
-                # (e.g. scalar if unused by broadcast suffix).
-                while chunk_vstack:
-                    fe.pop()
-                    chunk_vstack.pop()
-
-            # Pop the original scalar (survived all iterations via dup).
-            fe.pop()
+                # Pop the original scalar (survived all iterations via dup).
+                fe.pop()
+            else:
+                # No broadcast suffix: store the scalar result (once per batch element).
+                if output_node in tensor_map:
+                    fe.fstg_1d(0, tensor_map[output_node])
+                else:
+                    fe.pop()  # consume unused scalar
             fe.halt()
             bytecode = fe_state.bc
         finally:
@@ -1104,29 +1118,48 @@ class GintCompiler:
 
         # Build tensor infos — per-tensor batch strides account for broadcast.
         batch_dims = input_shape[:-1] if len(input_shape) > 1 else []
+        # Identify "input" globals (those read from, not written to).
+        # Output globals have block size matching their last dim; inputs get
+        # the full reduction block.
+        input_globals = set()
+        for node in (pre_prefix or []):
+            input_globals.update(n for n in node.args if isinstance(n, Node) and n in tensor_map)
+        input_globals.add(reduction_input)
+        if broadcast_suffix:
+            for node in broadcast_suffix:
+                input_globals.update(n for n in node.args
+                                     if isinstance(n, Node) and n in tensor_map)
 
         tensor_infos = []
         for gn in global_nodes:
             gn_shape = partitioner._get_shape(gn)
             if gn_shape is not None and len(gn_shape) >= 1:
-                # Broadcast: if gn has fewer dims than input_shape, its
-                # batch strides are 0 for the missing leading dims.
-                gn_batch_ndim = len(gn_shape) - 1  # exclude last dim
+                gn_batch_ndim = len(gn_shape) - 1
                 missing = len(batch_dims) - gn_batch_ndim
                 gn_bstrides = [0] * max(0, missing)
                 if gn_batch_ndim > 0:
                     gn_full_strides = _c_contiguous_strides(gn_shape)
                     gn_bstrides = gn_bstrides + list(gn_full_strides[:-1])
+                block_size = gn_shape[-1]
             else:
                 gn_bstrides = []
+                block_size = 1
+            # Input globals use the full reduction block; output globals use
+            # their actual block size (1 for scalars, reduction_size for
+            # full-size broadcast outputs).
+            if gn in input_globals:
+                block_size = reduction_size
+                grid_steps = [128, 1]
+            else:
+                grid_steps = [block_size, 1]
             tensor_infos.append(ProgramTensorInfo(
                 elm_size=4,
                 batch_strides=list(gn_bstrides),
                 batch_shape=list(batch_dims),
-                block_shape_stride_1=[reduction_size, 1],
+                block_shape_stride_1=[block_size, 1],
                 block_shape_stride_2=[1, 0],
                 block_grid_dims=[1, 1],
-                block_grid_steps=[128, 1],
+                block_grid_steps=list(grid_steps),
             ))
 
         grid_dim = max(1, int(np.prod(batch_dims))) if batch_dims else 1
