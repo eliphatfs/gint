@@ -44,10 +44,10 @@ class SubgraphInfo:
 
 
 def inspect_subgraphs(fn: Callable, *args, **kwargs) -> List[SubgraphInfo]:
-    """Run ``fn`` through ``torch.compile(backend='gint-no-cuda-graph')`` and
+    """Run ``fn`` through ``torch.compile(backend='gint', options={"cuda_graphs": False})`` and
     return one SubgraphInfo per subgraph the conductor compiled.
 
-    Uses the no-cuda-graph backend so the side-stream warmup pass inside
+    Disables cuda graphs so the side-stream warmup pass inside
     ``make_graphed_callables`` doesn't double-compile.
     """
     captured: List[SubgraphInfo] = []
@@ -95,7 +95,7 @@ def inspect_subgraphs(fn: Callable, *args, **kwargs) -> List[SubgraphInfo]:
     GintCompiler._compile_reduction_subgraph = cap_reduction
     GintCompiler._compile_fused_reduction_subgraph = cap_fused
     try:
-        compiled = torch.compile(fn, backend='gint-no-cuda-graph')
+        compiled = torch.compile(fn, backend='gint', options={"cuda_graphs": False})
         compiled(*args, **kwargs)
         torch.cuda.synchronize()
     finally:

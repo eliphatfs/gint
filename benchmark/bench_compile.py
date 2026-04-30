@@ -7,7 +7,7 @@ across:
   - torch.compile(backend='inductor')                            (no cuda graphs)
   - torch.compile(backend='inductor', mode='reduce-overhead')    (cuda graphs)
   - torch.compile(backend='gint')                                (cuda graphs)
-  - torch.compile(backend='gint-no-cuda-graph')                  (no cuda graphs)
+  - torch.compile(backend='gint', options={"cuda_graphs": False})  (no cuda graphs)
 
 Per-backend priming with a different small function (x * 2.0) pays the
 one-time backend-bootstrap cost up front, so the timed first call to the
@@ -182,7 +182,7 @@ def prime_backends():
     _ = torch.compile(_smoke_eager, backend='inductor')(x)
     _ = torch.compile(_smoke_eager, backend='inductor', mode='reduce-overhead')(x)
     _ = torch.compile(_smoke_eager, backend='gint')(x)
-    _ = torch.compile(_smoke_eager, backend='gint-no-cuda-graph')(x)
+    _ = torch.compile(_smoke_eager, backend='gint', options={"cuda_graphs": False})(x)
     torch.cuda.synchronize()
 
 
@@ -262,7 +262,7 @@ def build_add3(n):
     impls['gint'] = (lambda f=torch.compile(add3_eager, backend='gint'):
                      f(a, b, c))
     impls['gint-nocg'] = (lambda f=torch.compile(add3_eager,
-                                                 backend='gint-no-cuda-graph'):
+                                                 backend='gint', options={"cuda_graphs": False}):
                           f(a, b, c))
     return impls, ref, f"shape=({n},)", 1e-5
 
@@ -332,7 +332,7 @@ def build_rmsnorm(M=4096, N=2048):
     impls['gint'] = (lambda f=torch.compile(rms_norm_manual, backend='gint'):
                      f(x, w))
     impls['gint-nocg'] = (lambda f=torch.compile(rms_norm_manual,
-                                                 backend='gint-no-cuda-graph'):
+                                                 backend='gint', options={"cuda_graphs": False}):
                           f(x, w))
 
     # Hand-rolled fused fp32 rmsnorm (single gint kernel) — upper bound on

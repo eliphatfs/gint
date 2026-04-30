@@ -8,7 +8,7 @@ in the bench loop.
 
 Usage:
     python benchmark/isolate_first_call.py gint
-    python benchmark/isolate_first_call.py gint-no-cuda-graph
+    python benchmark/isolate_first_call.py "gint,options={\"cuda_graphs\": false}"
 """
 
 import os
@@ -46,7 +46,7 @@ def main(backend):
         # Force gint fatbin load + first-launch cost to be paid before timing.
         torch.cuda.synchronize()
         ts = time.perf_counter()
-        primer = torch.compile(add3, backend='gint-no-cuda-graph')
+        primer = torch.compile(add3, backend='gint', options={"cuda_graphs": False})
         primer(
             torch.randn(64, device='cuda'),
             torch.randn(64, device='cuda'),
