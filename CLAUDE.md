@@ -134,12 +134,14 @@ Supported GPU backends:
 - Example: `a(32, 128) + b(128,)` → block=128, batch=[32], grid=32 warps. `b` gets `batch_strides=[0]` so each row reuses the same 128 elements
 
 #### Metadata Ops Support
-- The conductor supports shape/stride-only ops (`view`, `unsqueeze`, `squeeze`, `expand`, `permute`, `transpose`, `t`) as **identity on the stack** — no bytecode emitted, value passes through unchanged
+- The conductor supports shape/stride-only ops (`view`, `unsqueeze`, `squeeze`, `expand`, `permute`, `transpose`, `t`, `slice`) as **identity on the stack** — no bytecode emitted, value passes through unchanged
 - Registered as `OpKind.METADATA` in `op_registry.py` with `arity=1`, `arg_order=[0]` (only the tensor arg is pushed; shape/dim args are read from the FX node, not the stack)
 - Enables fusion through metadata ops: e.g., `relu(x).unsqueeze(0) + 1.0` compiles to a single kernel instead of relu → eager unsqueeze → add (two kernels)
 - Shape changes are handled by the broadcast plan's per-tensor `ProgramTensorInfo` strides — unsqueeze adds a size-1 dim that broadcasts naturally, expand sets stride=0 for expanded dims
-- **Partitioner safety**: When a metadata op's global input shape is not broadcast-compatible with the output shape (e.g., `view(1024) → (32, 32)`), the node is skipped and falls back to eager execution. The `_compute_broadcast_plan` validates that each tensor dim is either 1 or equal to the output dim
-- **Current limitation**: Transpose/permute are registered but typically cause subgraph breaks because the transposed shape isn't broadcast-compatible with the original. Full support would require the broadcast plan to use actual tensor strides from FX metadata instead of computed C-contiguous strides
+- **Slice support** (`aten.slice.Tensor`): slice + pointwise fuses into a single kernel (e.g., `x[:, :64].relu()`). The slice input global uses effective shapes (sliced size). Non-zero start offsets are handled via `narrow()` at runtime (`input_adjustments` in `GintCompiledSubgraph`). Stepped slices (step != 1) are not fused.
+- **`_get_strides`**: Reads actual tensor strides from FX metadata (`node.meta['val'].stride()`). Falls back to C-contiguous computation if unavailable. Strides are threaded through `_compute_broadcast_plan` for correct `block_stride` and `batch_strides` on non-contiguous tensors.
+- **Partitioner safety**: When a metadata op's global input shape is not broadcast-compatible with the output shape (e.g., `view(1024) → (32, 32)`), the node is skipped and falls back to eager execution. The `_compute_broadcast_plan` validates that each tensor dim is either 1 or equal to the output dim. Slice ops are forced to start a new subgraph (they shrink a dimension which isn't broadcast-compatible).
+- **Current limitation**: Non-contiguous input strides (e.g. transpose) are correctly read and used for the input tensors, but the output tensor is still created as C-contiguous. The output stride doesn't match the input stride for transposed views, so `x.t().relu()` still falls back to eager.
 
 #### Reduction Support (sum, mean)
 - Registered as `OpKind.REDUCTION` in `op_registry.py` for `aten.sum.dim_IntList` and `aten.mean.dim`

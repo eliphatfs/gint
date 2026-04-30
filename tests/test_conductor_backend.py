@@ -2,6 +2,7 @@ import torch
 import unittest
 from tests import requires_gpu
 import gint.conductor  # noqa: F401  (auto-registers "gint" / "gint-no-cuda-graph")
+from gint.conductor.debug import inspect_subgraphs
 
 
 @requires_gpu
@@ -323,6 +324,66 @@ class TestConductorBackend(unittest.TestCase):
         expected = x.unsqueeze(0) + 1.0
         torch.testing.assert_close(fn(x), expected)
 
+    # ------------------------------------------------------------------
+    # Slice metadata ops
+    # ------------------------------------------------------------------
+
+    def test_slice_relu_fusion(self):
+        """slice + relu should fuse into one kernel subgraph."""
+        @torch.compile(backend="gint", options={"cuda_graphs": False})
+        def fn(x):
+            return x[:, :64].relu()
+
+        x = torch.randn(32, 128, device='cuda')
+        expected = x[:, :64].relu()
+        torch.testing.assert_close(fn(x), expected)
+
+        # Verify single kernel: the real slice (on dim=1) + relu are fused.
+        # Use a fresh function for inspect_subgraphs (fn.__wrapped__ doesn't work).
+        def _ref(x):
+            return x[:, :64].relu()
+        info = inspect_subgraphs(_ref, x)
+        fused = [sg for sg in info if len(sg.nodes) > 1]
+        self.assertEqual(len(fused), 1,
+                         f"Expected 1 fused subgraph, got {len(fused)}: "
+                         f"{[[n.name for n in sg.nodes] for sg in info]}")
+
+    def test_slice_bias_fusion(self):
+        """slice + bias broadcast should fuse into one kernel subgraph."""
+        @torch.compile(backend="gint", options={"cuda_graphs": False})
+        def fn(x):
+            return x[:, 32:96] + 1.0
+
+        x = torch.randn(32, 128, device='cuda')
+        expected = x[:, 32:96] + 1.0
+        torch.testing.assert_close(fn(x), expected)
+
+        def _ref(x):
+            return x[:, 32:96] + 1.0
+        info = inspect_subgraphs(_ref, x)
+        fused = [sg for sg in info if len(sg.nodes) > 1]
+        self.assertEqual(len(fused), 1,
+                         f"Expected 1 fused subgraph, got {len(fused)}: "
+                         f"{[[n.name for n in sg.nodes] for sg in info]}")
+
+    def test_slice_offset_relu_fusion(self):
+        """slice with non-zero start + relu should still fuse."""
+        @torch.compile(backend="gint", options={"cuda_graphs": False})
+        def fn(x):
+            return x[:, 16:80].relu()
+
+        x = torch.randn(32, 128, device='cuda')
+        expected = x[:, 16:80].relu()
+        torch.testing.assert_close(fn(x), expected)
+
+        def _ref(x):
+            return x[:, 16:80].relu()
+        info = inspect_subgraphs(_ref, x)
+        fused = [sg for sg in info if len(sg.nodes) > 1]
+        self.assertEqual(len(fused), 1,
+                         f"Expected 1 fused subgraph, got {len(fused)}: "
+                         f"{[[n.name for n in sg.nodes] for sg in info]}")
+
 
     # ------------------------------------------------------------------
     # Reduction ops (sum, mean)
@@ -412,6 +473,12 @@ class TestConductorBackend(unittest.TestCase):
         expected = x - torch.mean(x, dim=-1, keepdim=True)
         torch.testing.assert_close(fn(x), expected, atol=1e-4, rtol=1e-4)
 
+        def _ref(x):
+            return x - torch.mean(x, dim=-1, keepdim=True)
+        info = inspect_subgraphs(_ref, x)
+        self.assertEqual(len(info), 1,
+                         f"Expected 1 fused subgraph, got {len(info)}")
+
     def test_normalize_fused(self):
         """Fused: x / sum(x, keepdim=True)."""
         @torch.compile(backend="gint", options={"cuda_graphs": False})
@@ -421,6 +488,12 @@ class TestConductorBackend(unittest.TestCase):
         x = torch.rand(8, 32, device='cuda') + 0.1  # positive to avoid div-by-zero
         expected = x / torch.sum(x, dim=-1, keepdim=True)
         torch.testing.assert_close(fn(x), expected, atol=1e-4, rtol=1e-4)
+
+        def _ref(x):
+            return x / torch.sum(x, dim=-1, keepdim=True)
+        info = inspect_subgraphs(_ref, x)
+        self.assertEqual(len(info), 1,
+                         f"Expected 1 fused subgraph, got {len(info)}")
 
     def test_mean_subtract_large(self):
         """Fused reduction+pointwise with multi-chunk (dim > 128)."""
@@ -432,6 +505,12 @@ class TestConductorBackend(unittest.TestCase):
         expected = x - torch.mean(x, dim=-1, keepdim=True)
         torch.testing.assert_close(fn(x), expected, atol=1e-3, rtol=1e-3)
 
+        def _ref(x):
+            return x - torch.mean(x, dim=-1, keepdim=True)
+        info = inspect_subgraphs(_ref, x)
+        self.assertEqual(len(info), 1,
+                         f"Expected 1 fused subgraph, got {len(info)}")
+
     def test_mean_subtract_still_fuses(self):
         """Regression: existing single-op fusion still works after generalization."""
         @torch.compile(backend="gint", options={"cuda_graphs": False})
@@ -441,6 +520,12 @@ class TestConductorBackend(unittest.TestCase):
         x = torch.randn(16, 64, device='cuda')
         expected = x - torch.mean(x, dim=-1, keepdim=True)
         torch.testing.assert_close(fn(x), expected, atol=1e-4, rtol=1e-4)
+
+        def _ref(x):
+            return x - torch.mean(x, dim=-1, keepdim=True)
+        info = inspect_subgraphs(_ref, x)
+        self.assertEqual(len(info), 1,
+                         f"Expected 1 fused subgraph, got {len(info)}")
 
     def test_sum_normalize_still_fuses(self):
         """Regression: x / sum(x, keepdim=True) still fuses."""
@@ -452,15 +537,27 @@ class TestConductorBackend(unittest.TestCase):
         expected = x / torch.sum(x, dim=-1, keepdim=True)
         torch.testing.assert_close(fn(x), expected, atol=1e-4, rtol=1e-4)
 
+        def _ref(x):
+            return x / torch.sum(x, dim=-1, keepdim=True)
+        info = inspect_subgraphs(_ref, x)
+        self.assertEqual(len(info), 1,
+                         f"Expected 1 fused subgraph, got {len(info)}")
+
     def test_rms_norm_fused(self):
         """RMSNorm: x * rsqrt(mean(x*x) + eps) * w in a single kernel."""
         def rms_norm_manual(x, w, eps=1e-5):
             rstd = torch.rsqrt(torch.mean(x * x, dim=-1, keepdim=True) + eps)
             return x * rstd * w
 
-        compiled = torch.compile(rms_norm_manual, backend="gint", options={"cuda_graphs": False})
         x = torch.randn(16, 64, device='cuda')
         w = torch.randn(64, device='cuda')
+
+        # Inspect BEFORE compiling — Dynamo caches and won't re-run gint.
+        info = inspect_subgraphs(rms_norm_manual, x, w)
+        self.assertEqual(len(info), 1,
+                         f"Expected 1 fused kernel, got {len(info)}")
+
+        compiled = torch.compile(rms_norm_manual, backend="gint", options={"cuda_graphs": False})
         torch.testing.assert_close(compiled(x, w), rms_norm_manual(x, w),
                                    atol=1e-4, rtol=1e-4)
 
@@ -470,9 +567,14 @@ class TestConductorBackend(unittest.TestCase):
             rstd = torch.rsqrt(torch.mean(x * x, dim=-1, keepdim=True) + eps)
             return x * rstd * w
 
-        compiled = torch.compile(rms_norm_manual, backend="gint", options={"cuda_graphs": False})
         x = torch.randn(4, 8, 32, device='cuda')
         w = torch.randn(32, device='cuda')
+
+        info = inspect_subgraphs(rms_norm_manual, x, w)
+        self.assertEqual(len(info), 1,
+                         f"Expected 1 fused kernel, got {len(info)}")
+
+        compiled = torch.compile(rms_norm_manual, backend="gint", options={"cuda_graphs": False})
         torch.testing.assert_close(compiled(x, w), rms_norm_manual(x, w),
                                    atol=1e-4, rtol=1e-4)
 
@@ -482,9 +584,14 @@ class TestConductorBackend(unittest.TestCase):
             rstd = torch.rsqrt(torch.mean(x * x, dim=-1, keepdim=True) + eps)
             return x * rstd * w
 
-        compiled = torch.compile(rms_norm_manual, backend="gint", options={"cuda_graphs": False})
         x = torch.randn(4, 256, device='cuda')
         w = torch.randn(256, device='cuda')
+
+        info = inspect_subgraphs(rms_norm_manual, x, w)
+        self.assertEqual(len(info), 1,
+                         f"Expected 1 fused kernel, got {len(info)}")
+
+        compiled = torch.compile(rms_norm_manual, backend="gint", options={"cuda_graphs": False})
         torch.testing.assert_close(compiled(x, w), rms_norm_manual(x, w),
                                    atol=1e-3, rtol=1e-3)
 

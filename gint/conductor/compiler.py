@@ -68,8 +68,11 @@ def _c_contiguous_strides(shape):
     return list(reversed(strides))
 
 
-def _compute_broadcast_plan(output_shape, tensor_shapes):
+def _compute_broadcast_plan(output_shape, tensor_shapes, tensor_strides=None):
     """Compute a broadcast plan mapping output_shape to gint block+batch decomposition.
+
+    If *tensor_strides* is provided (parallel list to *tensor_shapes*), actual
+    memory strides are used instead of computing C-contiguous strides from shape.
 
     Returns a plan dict with 'block_size', 'batch_dims', 'per_tensor', 'grid_dim',
     'num_inner_blocks', or None if infeasible (>4 batch dims).
@@ -101,6 +104,19 @@ def _compute_broadcast_plan(output_shape, tensor_shapes):
     if merge_count == 0:
         merge_count = 1
 
+    # If actual strides are non-contiguous in the merged inner dims, we can't
+    # safely merge — the kernel's flat block access requires the merged region
+    # to be contiguous in memory.  Clamp merge_count back to 1.
+    if tensor_strides is not None:
+        for p, orig_strides in zip(padded, tensor_strides):
+            if orig_strides is None:
+                continue
+            c_orig = _c_contiguous_strides(p[-len(orig_strides):])
+            merge_in_orig = min(merge_count, len(orig_strides))
+            if tuple(orig_strides[-merge_in_orig:]) != tuple(c_orig[-merge_in_orig:]):
+                merge_count = 1
+                break
+
     block_size = 1
     for d in range(ndim - merge_count, ndim):
         block_size *= output_shape[d]
@@ -116,21 +132,31 @@ def _compute_broadcast_plan(output_shape, tensor_shapes):
     grid_dim = num_inner_blocks * batch_product
 
     per_tensor = []
-    for p in padded:
+    for i, p in enumerate(padded):
+        orig_strides = tensor_strides[i] if tensor_strides is not None else None
+        pad_ndim = ndim - (len(orig_strides) if orig_strides is not None else 0)
         c_strides = _c_contiguous_strides(p)
 
-        # block_stride: 0 if any merged inner dim broadcasts, 1 otherwise
+        # block_stride: 0 if any merged inner dim broadcasts, else actual
+        # innermost-dim stride (or 1 for C-contiguous fallback)
         inner_broadcast = any(
             p[d] == 1 and output_shape[d] > 1
             for d in range(ndim - merge_count, ndim)
         )
-        block_stride = 0 if inner_broadcast else 1
+        if inner_broadcast:
+            block_stride = 0
+        elif orig_strides is not None:
+            block_stride = orig_strides[-1]
+        else:
+            block_stride = 1
 
-        # batch_strides: 0 for broadcast dims, C-contiguous stride otherwise
+        # batch_strides: 0 for broadcast dims, actual stride otherwise
         b_strides = []
         for d in range(len(batch_dims)):
             if p[d] == 1 and output_shape[d] > 1:
                 b_strides.append(0)
+            elif orig_strides is not None and d >= pad_ndim:
+                b_strides.append(orig_strides[d - pad_ndim])
             else:
                 b_strides.append(c_strides[d])
 
@@ -156,12 +182,18 @@ class GintCompiledSubgraph(BaseExecutableProgram):
     """An already-compiled gint subgraph ready for execution."""
 
     def __init__(self, bytecode: List[List[int]], tensor_infos: List[ProgramTensorInfo],
-                 output_shape: tuple = (), grid_dim: int = 1):
+                 output_shape: tuple = (), grid_dim: int = 1,
+                 input_adjustments: List[tuple] = None):
+        """
+        *input_adjustments*: list of (global_idx, dim, start) for slice inputs
+        whose base pointer needs adjustment at runtime.
+        """
         super().__init__()
         self.bytecode = bytecode
         self.tensor_infos = tensor_infos
         self.output_shape = output_shape
         self.grid_dim = grid_dim
+        self.input_adjustments = input_adjustments or []
 
     def get_program(self, *args: TensorInterface, **extra_kwargs) -> ProgramData:
         bc_array = np.array(self.bytecode, dtype=np.int32).reshape(-1)
@@ -422,10 +454,53 @@ class GraphPartitioner:
             return node.meta['val'].shape
         return None
 
+    @staticmethod
+    def _get_strides(node: Node):
+        """Read actual strides from FX metadata, falling back to C-contiguous."""
+        if 'val' in node.meta and hasattr(node.meta['val'], 'stride'):
+            return node.meta['val'].stride()
+        shape = None
+        if 'tensor_meta' in node.meta:
+            shape = node.meta['tensor_meta'].shape
+        elif 'val' in node.meta and hasattr(node.meta['val'], 'shape'):
+            shape = node.meta['val'].shape
+        if shape is not None:
+            return _c_contiguous_strides(shape)
+        return None
+
     def _is_supported(self, node: Node) -> bool:
         if node.op != 'call_function':
             return False
         return get_op_descriptor(node) is not None
+
+    @staticmethod
+    def _is_slice_node(node: Node) -> bool:
+        op_desc = get_op_descriptor(node)
+        return (op_desc is not None and op_desc.kind == OpKind.METADATA
+                and node.target == torch.ops.aten.slice.Tensor)
+
+    @staticmethod
+    def _effective_global_shapes(nodes, global_nodes, raw_shapes):
+        """Replace global shapes with effective shapes for slice inputs.
+
+        When a slice node is in *nodes*, its input global should use the
+        slice OUTPUT shape (the only part the subgraph accesses).
+        """
+        result = list(raw_shapes)
+        node_set = set(nodes)
+        for node in nodes:
+            if GraphPartitioner._is_slice_node(node):
+                inp = node.args[0]
+                if isinstance(inp, Node) and inp in global_nodes:
+                    idx = global_nodes.index(inp)
+                    out_shape = None
+                    if 'tensor_meta' in node.meta:
+                        out_shape = node.meta['tensor_meta'].shape
+                    elif 'val' in node.meta and hasattr(node.meta['val'], 'shape'):
+                        out_shape = node.meta['val'].shape
+                    if out_shape is not None:
+                        result[idx] = out_shape
+        return result
 
     def partition(self) -> List[List[Node]]:
         subgraphs: List[List[Node]] = []
@@ -461,8 +536,15 @@ class GraphPartitioner:
                     current_shape = None
                 continue
 
+            # Slice ops change shape and base pointer (for non-zero start).  They
+            # must be standalone so the downstream subgraph receives the correctly-
+            # offset tensor via PyTorch's view mechanism.
+            is_slice = self._is_slice_node(node) if op_desc is not None else False
+
             if current_shape is None:
                 can_add = True
+            elif is_slice:
+                can_add = False
             else:
                 merged = _broadcast_shapes(current_shape, shape)
                 can_add = merged is not None
@@ -476,25 +558,33 @@ class GraphPartitioner:
                     can_add = False
                 else:
                     merged_shape = _broadcast_shapes(current_shape, shape) if current_shape else shape
-                    global_shapes = [self._get_shape(n) for n in self._required_globals(scheduled)]
-                    global_shapes = [s for s in global_shapes if s is not None]
+                    global_nodes_list = list(self._required_globals(scheduled))
+                    global_shapes_raw = [self._get_shape(n) for n in global_nodes_list]
+                    global_shapes_raw = self._effective_global_shapes(
+                        scheduled, global_nodes_list, global_shapes_raw)
+                    global_shapes = [s for s in global_shapes_raw if s is not None]
                     if global_shapes and any(s != merged_shape for s in global_shapes):
-                        if _compute_broadcast_plan(merged_shape, global_shapes) is None:
+                        global_strides = [self._get_strides(n) for n in global_nodes_list]
+                        global_strides = [global_strides[i] for i, s in enumerate(global_shapes_raw) if s is not None]
+                        if _compute_broadcast_plan(merged_shape, global_shapes, global_strides) is None:
                             can_add = False
 
             if can_add:
                 current_shape = _broadcast_shapes(current_shape, shape) if current_shape else shape
                 current.append(node)
             else:
-                if current:
-                    subgraphs.append(ForestTraverser(current).get_schedule())
                 # Check if the rejected node can start a new subgraph on its own
                 # (its globals must be broadcast-compatible with its shape).
                 solo = ForestTraverser([node]).get_schedule()
-                solo_globals = [self._get_shape(n) for n in self._required_globals(solo)]
-                solo_globals = [s for s in solo_globals if s is not None]
+                solo_global_nodes = list(self._required_globals(solo))
+                solo_globals_raw = [self._get_shape(n) for n in solo_global_nodes]
+                solo_globals_raw = self._effective_global_shapes(
+                    solo, solo_global_nodes, solo_globals_raw)
+                solo_globals = [s for s in solo_globals_raw if s is not None]
                 if solo_globals and any(s != shape for s in solo_globals):
-                    if _compute_broadcast_plan(shape, solo_globals) is None:
+                    solo_strides = [self._get_strides(n) for n in solo_global_nodes]
+                    solo_strides = [solo_strides[i] for i, s in enumerate(solo_globals_raw) if s is not None]
+                    if _compute_broadcast_plan(shape, solo_globals, solo_strides) is None:
                         # Node can't form a valid subgraph — skip it (run eagerly)
                         current = []
                         current_shape = None
@@ -840,13 +930,21 @@ class GintCompiler:
             _frontend_state.reset(token)
 
         # Compute broadcast plan for per-tensor info.
+        # Use effective shapes: for slice inputs, the effective shape is the
+        # slice OUTPUT shape (the subgraph only accesses the sliced window).
         all_shapes = [partitioner._get_shape(n) for n in global_nodes]
+        all_shapes = list(GraphPartitioner._effective_global_shapes(
+            nodes, global_nodes, all_shapes))
+        all_strides = [partitioner._get_strides(n) for n in global_nodes]
+
         output_shape = all_shapes[0]
         for s in all_shapes[1:]:
             if s is not None:
                 output_shape = _broadcast_shapes(output_shape, s)
 
-        plan = _compute_broadcast_plan(output_shape, [s for s in all_shapes if s is not None])
+        valid_shapes = [s for s in all_shapes if s is not None]
+        valid_strides = [all_strides[i] for i, s in enumerate(all_shapes) if s is not None]
+        plan = _compute_broadcast_plan(output_shape, valid_shapes, valid_strides)
         num_inner_blocks = plan['num_inner_blocks']
 
         tensor_infos = []
@@ -862,9 +960,30 @@ class GintCompiler:
                 block_grid_steps=[128, 1],
             ))
 
+        # Compute input adjustments for slice ops: non-zero start offsets
+        # require adjusting the input tensor's base pointer at runtime.
+        input_adjustments = []
+        for node in nodes:
+            if not GraphPartitioner._is_slice_node(node):
+                continue
+            inp = node.args[0]
+            if not isinstance(inp, Node) or inp not in global_nodes:
+                continue
+            dim = node.args[1]
+            start = node.args[2]
+            end = node.args[3]
+            step = node.args[4] if len(node.args) > 4 else 1
+            if step != 1:
+                continue  # stepped slices not supported
+            if start == 0:
+                continue  # no offset needed
+            gidx = global_nodes.index(inp)
+            input_adjustments.append((gidx, dim, start))
+
         return GintCompiledSubgraph(bytecode, tensor_infos,
                                      output_shape=output_shape,
-                                     grid_dim=plan['grid_dim'])
+                                     grid_dim=plan['grid_dim'],
+                                     input_adjustments=input_adjustments)
 
     # --- Reduction detection and compilation ---
 
@@ -1187,6 +1306,17 @@ class GintCompiler:
         outputs = [n for n in global_nodes if n in node_set]
 
         input_tensors  = [results[n] for n in inputs]
+
+        # Apply slice adjustments: narrow input tensors at the slice start offset.
+        for gidx, dim, start in compiled.input_adjustments:
+            node = global_nodes[gidx]
+            if node in inputs:
+                pos = inputs.index(node)
+                inp_shape = partitioner._get_shape(node)
+                if inp_shape is not None:
+                    length = inp_shape[dim] - start
+                    input_tensors[pos] = input_tensors[pos].narrow(dim, start, length)
+
         output_tensors = []
         ref = input_tensors[0] if input_tensors else results[next(iter(results))]
         for node in outputs:

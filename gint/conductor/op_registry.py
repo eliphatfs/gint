@@ -353,6 +353,7 @@ OP_REGISTRY: dict = {
     torch.ops.aten.permute.default:      _meta1(),
     torch.ops.aten.transpose.int:        _meta1(),
     torch.ops.aten.t.default:            _meta1(),
+    torch.ops.aten.slice.Tensor:         _meta1(),
 
     # --- Reduction ops ---
     torch.ops.aten.sum.dim_IntList:
