@@ -153,6 +153,11 @@ Supported GPU backends:
 - Outer batch dims (when len(batch_dims) > 1) stay in `batch_shape`; the innermost is pulled into block_grid. The current implementation only enables the new tile when `len(batch_dims) >= 1` (i.e. the merge couldn't fully collapse to a flat block); otherwise stays on 1d
 - Geometry-smith case: subgraph mixing `(M, 1)` and `(M, 3)` had `block_size=3, batch_dims=[M]` → 2dw with `grid=ceil(M/32)`. Wall time dropped 0.70 ms → 0.16 ms at M=1M (matches eager within 1.5×)
 
+#### CSE Pre-Pass
+- `GintCompiler.compile` runs `torch.fx.passes.dialect.common.cse_pass.CSEPass` on the AOT graph before partitioning. The pass is hash-based local value numbering on `(target, hash(args, kwargs))` with a banlist (random / in-place ops) supplied via `get_CSE_banned_ops()`. It returns a fresh `GraphModule` with node metadata preserved.
+- Why: AOT decomposition often emits duplicates that FX's own tracing didn't catch. Geometry_smith's two `schlick_ggx(_, roughness)` calls each materialize their own `r*r`, `/2`, `1-k` — CSE collapses the duplicates so the partitioner / register planner sees a single canonical copy. Cuts the post-reduction tail from 14 nodes (21 insns) to 11 nodes (18 insns).
+- Functional dialect only — gint never emits stateful or in-place ops, so the standard banlist suffices.
+
 #### Register-Spill Codegen (`_plan_spills`)
 - The l12 kernel variant has `POOL_SIZE=12` slots shared between stack (grows up from `pool[0]`) and 8 virtual registers (`reg N = pool[POOL_SIZE-1-N]`). The conductor uses up to 11 of those (`stack + active_regs ≤ 11`) to leave one slot of headroom for transient `dup`/`swap` shuffling.
 - `_plan_spills(nodes, ext_io)` walks the schedule once and assigns a virtual register to every multi-user intermediate (`>1 distinct downstream user inside the subgraph`) that isn't already an external-IO node. Register indices are reused across non-overlapping live ranges via simple liveness (free regs at last-use, allocate at result production). Returns `(node_to_reg, overflow, feasible)` — overflow is the set of multi-user nodes that didn't fit in any of the 8 registers and falls back to a global-tensor slot.

@@ -948,6 +948,18 @@ class GintCompiler:
         self.example_inputs = example_inputs
 
     def compile(self) -> Callable:
+        # Run torch.fx's CSE pass first. AOT autograd hands us decomposed
+        # graphs in which two ``schlick_ggx(_, roughness)`` calls each emit
+        # their own ``roughness * roughness`` / ``mul / 2`` / ``1 - k`` —
+        # CSE collapses the duplicates so the partitioner sees one copy.
+        # The pass is hash-based local value numbering on
+        # ``(target, hash(args, kwargs))`` with a banlist for stateful ops;
+        # it returns a fresh GraphModule with node metadata copied.
+        from torch.fx.passes.dialect.common.cse_pass import CSEPass, get_CSE_banned_ops
+        cse_result = CSEPass(banned_ops=get_CSE_banned_ops()).call(self.gm)
+        if cse_result.modified:
+            self.gm = cse_result.graph_module
+
         partitioner = GraphPartitioner(self.gm, max_tensors=8, max_stack=8)
         raw_schedules = partitioner.partition()
 

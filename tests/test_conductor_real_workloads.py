@@ -171,6 +171,41 @@ class TestRealWorkloads(unittest.TestCase):
         got = compiled(x)
         torch.testing.assert_close(got, ref, atol=1e-4, rtol=1e-4)
 
+    def test_cse_dedups_duplicate_subexpressions(self):
+        """torch.fx's CSE pass should run before partitioning, so two
+        independent calls to a helper that internally computes the same
+        expression collapse into a single computation.
+
+        Mirrors the geometry_smith pattern: two ``schlick_ggx`` calls
+        share ``roughness * roughness``, ``/ 2``, and ``1 - k`` —
+        without CSE the second call recomputes them all."""
+        def schlick_ggx(n_dot_x, roughness):
+            a = roughness
+            k = (a * a) / 2.0
+            return n_dot_x / (n_dot_x * (1.0 - k) + k)
+
+        def fn(x, y, roughness):
+            return schlick_ggx(x, roughness) + schlick_ggx(y, roughness)
+
+        torch.manual_seed(0)
+        x = torch.rand(1024, 1, device='cuda') + 0.1
+        y = torch.rand(1024, 1, device='cuda') + 0.1
+        r = torch.rand(1024, 1, device='cuda') * 0.9 + 0.1
+
+        ref = fn(x, y, r)
+        compiled = torch.compile(fn, backend="gint", options={"cuda_graphs": False})
+        got = compiled(x, y, r)
+        torch.testing.assert_close(got, ref, atol=1e-4, rtol=1e-3)
+
+        torch._dynamo.reset()
+        sgs = inspect_subgraphs(fn, x, y, r)
+        # Without CSE the chain would be 13 nodes (6+6+1 = two schlick_ggx
+        # bodies + final add). With CSE the three shared nodes
+        # (r*r, /2, 1-k) collapse → 10 nodes.
+        total_nodes = sum(len(sg.nodes) for sg in sgs)
+        self.assertLessEqual(total_nodes, 10,
+                             f"CSE didn't run — got {total_nodes} nodes, expected ≤ 10")
+
     def test_register_spill_fuses_long_chain(self):
         """A 14-node pointwise chain that exceeds the 8-slot stack must
         fuse into a single subgraph by spilling long-lived multi-user
