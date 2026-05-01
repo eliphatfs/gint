@@ -43,7 +43,7 @@ def _make_gint_backend(cuda_graphs: bool, num_warmup_iters: int) -> Callable:
     """
     def gint_backend_fn(gm: GraphModule, example_inputs: List[torch.Tensor],
                         **kwargs) -> Callable:
-        from torch._functorch.aot_autograd import aot_module
+        from torch._functorch.aot_autograd import aot_module_simplified
 
         _cuda_graphs, _num_warmup_iters = _resolve_options(
             kwargs, (cuda_graphs, num_warmup_iters))
@@ -52,7 +52,16 @@ def _make_gint_backend(cuda_graphs: bool, num_warmup_iters: int) -> Callable:
             compiler = GintCompiler(gm, example_inputs)
             return compiler.compile()
 
-        compiled = aot_module(gm, fw_compiler=compiler_fn)
+        # aot_module_simplified is the lighter wrapper used by Inductor —
+        # it skips the nn.Module-style trampolines that aot_module builds.
+        # `inference_compiler` is the fast path taken under no_grad /
+        # inference_mode; we use the same compiler for both since gint
+        # doesn't do training.
+        compiled = aot_module_simplified(
+            gm, example_inputs,
+            fw_compiler=compiler_fn,
+            inference_compiler=compiler_fn,
+        )
 
         if not _cuda_graphs:
             return compiled

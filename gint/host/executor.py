@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, Union, Optional, Sequence
 
 from ..kernel.interpreter.main import REG_WIDTH, VARIANTS, DEFAULT_VARIANT
-from .analyzer import analyze_bytecode
+from .analyzer import analyze_bytecode, BytecodeStats
 
 
 @dataclass
@@ -26,6 +26,13 @@ class ProgramData:
     program: numpy.ndarray[numpy.int32]
     input_infos: list[ProgramTensorInfo]
     input_indices: Optional[list[int]] = None
+    _stats: Optional[BytecodeStats] = field(default=None, repr=False, compare=False)
+
+    @property
+    def stats(self) -> BytecodeStats:
+        if self._stats is None:
+            self._stats = analyze_bytecode(self.program)
+        return self._stats
 
 
 @dataclass
@@ -96,15 +103,20 @@ def _convert_arg(arg):
         return TensorInterface.from_cuda_array_interface(arg)
 
 
-def select_variant(bytecode) -> str:
+def select_variant(bytecode_or_pd) -> str:
     """Pick the smallest kernel variant whose limits fit the given bytecode.
+
+    Accepts either a raw bytecode array or a ``ProgramData`` (in which case
+    the cached ``stats`` is reused — analyze_bytecode walks the whole stream
+    and is the dominant cost on the cache-miss path of execute()).
 
     Variants are ordered by ascending pool size; the first one that satisfies
     the program's measured stack depth and register usage wins. Falls back
     to DEFAULT_VARIANT if none fits (which currently shouldn't happen since
     the largest variant covers the full instruction set).
     """
-    stats = analyze_bytecode(bytecode)
+    stats = (bytecode_or_pd.stats if isinstance(bytecode_or_pd, ProgramData)
+             else analyze_bytecode(bytecode_or_pd))
     candidates = sorted(VARIANTS.items(), key=lambda kv: kv[1][0])  # by pool_size
     for name, (pool_size, num_regs, max_stack) in candidates:
         if stats.max_stack <= max_stack and (stats.max_reg_idx + 1) <= num_regs:

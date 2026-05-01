@@ -63,7 +63,7 @@ class HipExecutor(BaseExecutor):
             if pd.input_indices is None:
                 pd.input_indices = list(range(len(pd.input_infos)))
             assert len(pd.input_indices) == len(pd.input_infos), "Input indices must match input infos"
-            variant = select_variant(pd.program)
+            variant = select_variant(pd)
             _, dcode = check_hip_error(hip.hipMalloc(len(pd.program) * 4))
             check_hip_error(hip.hipMemcpyHtoD(dcode, pd.program, len(pd.program) * 4))
             _, hinfo = check_hip_error(hip.hipHostMalloc(ctypes.sizeof(HTensorInfo), 0))
@@ -109,7 +109,7 @@ class HipExecutor(BaseExecutor):
             pd = prog.get_program(*args)
             if pd.input_indices is None:
                 pd.input_indices = list(range(len(pd.input_infos)))
-            v = select_variant(pd.program)
+            v = select_variant(pd)
             batch_variant = v if batch_variant is None else _variant_max(batch_variant, v)
 
             _, dcode = check_hip_error(hip.hipMalloc(len(pd.program) * 4))
