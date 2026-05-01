@@ -1,6 +1,6 @@
 """
-Compile-and-runtime benchmark for two kernels — add3 (a+b+c) and rmsnorm —
-across:
+Compile-and-runtime benchmark for three kernels — add3 (a+b+c), rmsnorm,
+and geometry_smith (BRDF Smith geometry term from diffrp) — across:
   - eager torch
   - torch.jit.script
   - triton (inline kernel for add3, generalized_rms_norm from tests for rmsnorm)
@@ -24,6 +24,7 @@ numbers as a side effect.
 Usage:
     python benchmark/bench_compile.py --kernel add3
     python benchmark/bench_compile.py --kernel rmsnorm
+    python benchmark/bench_compile.py --kernel geometry_smith
     python benchmark/bench_compile.py --kernel add3 --clear-triton-cache
 """
 
@@ -347,9 +348,112 @@ def build_rmsnorm(M=4096, N=2048):
     return impls, ref, f"shape=({M}, {N})", 1e-4
 
 
+# ---------------------------------------------------------------------------
+# Kernel: geometry_smith (BRDF Smith geometry term, from diffrp)
+# ---------------------------------------------------------------------------
+# https://github.com/eliphatfs/diffrp/blob/main/diffrp/utils/light_transport.py
+#
+# Two inner-dim-3 dot products (sum-reductions on a tiny dim), each fed
+# through relu and a Schlick-GGX rational, then combined with a final
+# multiply. Reduction dim is 3 — the conductor's reduction kernel pads
+# OOB lanes with 0.0 so sum tolerates non-multiple-of-128. Exercises the
+# pre-reduction (n*v fused into the reduction) and post-reduction
+# (relu + schlick_ggx + roughness broadcast) fusion paths in one shot.
+
+def _gs_schlick_ggx(n_dot_x, roughness):
+    a = roughness
+    k = (a * a) / 2.0
+    return n_dot_x / (n_dot_x * (1.0 - k) + k)
+
+
+def geometry_smith_eager(n, v, L, roughness):
+    n_dot_v = torch.relu((n * v).sum(-1, keepdim=True))
+    n_dot_L = torch.relu((n * L).sum(-1, keepdim=True))
+    ggx2 = _gs_schlick_ggx(n_dot_v, roughness)
+    ggx1 = _gs_schlick_ggx(n_dot_L, roughness)
+    return ggx1 * ggx2
+
+
+@triton.jit
+def _gs_triton_kernel(n_ptr, v_ptr, L_ptr, r_ptr, out_ptr, M, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    base = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = base < M
+    idx3 = base[:, None] * 3 + tl.arange(0, 4)[None, :]
+    sub3 = tl.arange(0, 4)[None, :] < 3
+    mask3 = mask[:, None] & sub3
+    nv = tl.load(n_ptr + idx3, mask=mask3, other=0.0)
+    vv = tl.load(v_ptr + idx3, mask=mask3, other=0.0)
+    Lv = tl.load(L_ptr + idx3, mask=mask3, other=0.0)
+    r = tl.load(r_ptr + base, mask=mask, other=0.0)
+
+    n_dot_v = tl.maximum(tl.sum(nv * vv, axis=1), 0.0)
+    n_dot_L = tl.maximum(tl.sum(nv * Lv, axis=1), 0.0)
+    k = (r * r) * 0.5
+    om_k = 1.0 - k
+    ggx2 = n_dot_v / (n_dot_v * om_k + k)
+    ggx1 = n_dot_L / (n_dot_L * om_k + k)
+    tl.store(out_ptr + base, ggx1 * ggx2, mask=mask)
+
+
+def geometry_smith_triton_call(n, v, L, r):
+    M = n.shape[0]
+    out = torch.empty(M, 1, device=n.device, dtype=n.dtype)
+    BLOCK = 256
+    _gs_triton_kernel[(triton.cdiv(M, BLOCK),)](
+        n, v, L, r, out, M, BLOCK=BLOCK,
+    )
+    return out
+
+
+def build_geometry_smith(M=1 << 20):
+    """diffrp BRDF Smith geometry term. M=2^20 puts the (M, 3) inputs at
+    12 MB each (~44 MB total working set) — bandwidth-bound, so kernel
+    quality dominates. Tests reduction fusion + multi-launch dispatch."""
+    torch.manual_seed(7)
+    n = torch.randn(M, 3, device='cuda', dtype=torch.float32)
+    v = torch.randn(M, 3, device='cuda', dtype=torch.float32)
+    L = torch.randn(M, 3, device='cuda', dtype=torch.float32)
+    n = n / n.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+    v = v / v.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+    L = L / L.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+    r = torch.rand(M, 1, device='cuda', dtype=torch.float32) * 0.9 + 0.1
+    ref = geometry_smith_eager(n, v, L, r).clone()
+
+    impls = {}
+    impls['eager'] = lambda: geometry_smith_eager(n, v, L, r)
+
+    @torch.jit.script
+    def jit_fn(nn, vv, ll, rr):
+        n_dot_v = torch.relu((nn * vv).sum(-1, keepdim=True))
+        n_dot_L = torch.relu((nn * ll).sum(-1, keepdim=True))
+        a = rr
+        k = (a * a) / 2.0
+        om_k = 1.0 - k
+        ggx2 = n_dot_v / (n_dot_v * om_k + k)
+        ggx1 = n_dot_L / (n_dot_L * om_k + k)
+        return ggx1 * ggx2
+    impls['torch.jit'] = lambda: jit_fn(n, v, L, r)
+
+    impls['triton'] = lambda: geometry_smith_triton_call(n, v, L, r)
+
+    impls['inductor'] = (lambda f=torch.compile(geometry_smith_eager, backend='inductor'):
+                         f(n, v, L, r))
+    impls['inductor-rg'] = (lambda f=torch.compile(geometry_smith_eager, backend='inductor',
+                                                   mode='reduce-overhead'):
+                            f(n, v, L, r))
+    impls['gint'] = (lambda f=torch.compile(geometry_smith_eager, backend='gint'):
+                     f(n, v, L, r))
+    impls['gint-nocg'] = (lambda f=torch.compile(geometry_smith_eager,
+                                                 backend='gint', options={"cuda_graphs": False}):
+                          f(n, v, L, r))
+    return impls, ref, f"shape=(M={M}, 3)", 1e-4
+
+
 KERNELS = {
     'add3': build_add3,
     'rmsnorm': build_rmsnorm,
+    'geometry_smith': build_geometry_smith,
 }
 
 
@@ -377,8 +481,10 @@ def main():
 
     if args.kernel == 'add3':
         impls, ref, shape_str, atol = build_add3(args.n)
-    else:
+    elif args.kernel == 'rmsnorm':
         impls, ref, shape_str, atol = build_rmsnorm()
+    else:
+        impls, ref, shape_str, atol = build_geometry_smith()
 
     print(f"\n{args.kernel} benchmark  ({shape_str}, dtype=fp32, "
           f"device={torch.cuda.get_device_name()})")

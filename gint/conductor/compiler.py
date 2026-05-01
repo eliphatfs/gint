@@ -31,7 +31,10 @@ from ..host.executor import (
 )
 from ..host import frontend as fe
 from ..host.frontend import FrontendState, _frontend_state
-from .op_registry import OpDescriptor, OpKind, get_op_descriptor, resolve_arg_order
+from .op_registry import (
+    OpDescriptor, OpKind, get_op_descriptor, resolve_arg_order,
+    _emit_width_combine,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -66,6 +69,75 @@ def _c_contiguous_strides(shape):
         strides.append(prod)
         prod *= s
     return list(reversed(strides))
+
+
+def _merge_dims(shape, strides_list):
+    """Greedy-merge consecutive dims that are C-contiguous in *every* tensor.
+
+    For each adjacent pair (i, i+1), the dims are merged iff
+    ``stride[i] == stride[i+1] * shape[i+1]`` holds for *all* tensors in
+    ``strides_list``. Merging continues until no more pairs qualify.
+
+    Returns ``(merged_shape, [merged_strides_per_tensor])``. Unlike the all-
+    or-nothing merge in _compute_broadcast_plan, this is incremental — a
+    non-contiguous boundary stops the merge there but doesn't collapse it
+    back to length-1.
+    """
+    if len(shape) == 0:
+        return tuple(), [tuple() for _ in strides_list]
+    if len(shape) == 1:
+        return tuple(shape), [tuple(s) for s in strides_list]
+
+    out_shape = list(shape)
+    out_strides = [list(s) for s in strides_list]
+
+    i = 0
+    while i + 1 < len(out_shape):
+        can_merge = all(
+            s[i] == s[i + 1] * out_shape[i + 1]
+            for s in out_strides
+        )
+        if can_merge:
+            out_shape[i] = out_shape[i] * out_shape[i + 1]
+            del out_shape[i + 1]
+            for s in out_strides:
+                s[i] = s[i + 1]
+                del s[i + 1]
+        else:
+            i += 1
+
+    return tuple(out_shape), [tuple(s) for s in out_strides]
+
+
+def _select_reduction_tiling(N: int) -> dict:
+    """Select reduction tile parameters based on innermost-dim size N.
+
+    Returns a dict with::
+        B    – batches handled per warp (B * R == 128)
+        R    – reduction elements per chunk-load
+        mode – '1d', '2dt', or '2dw' (matches the load instruction family)
+        do_warp_reduce  – emit warp_allreduce after the chunk loop
+        do_width_combine – emit the 4-wide width-lane combine sequence
+        warp_axis  – which load-tile dim ('thread' or 'width') carries
+                     the *reduction* axis (drives stride placement)
+        batch_axis – which load-tile dim carries the *batch* axis
+
+    The four cases (B, R, mode):
+      N >= 128 → (1, 128, '1d')   threads+width flatten over reduction
+      16-127   → (4, 32,  '2dt')  threads scan reduction, width carries batches
+      <16      → (32, 4,  '2dw')  threads carry batches, width scans reduction
+    """
+    if N >= 128:
+        return dict(B=1, R=128, mode='1d',
+                    do_warp_reduce=True, do_width_combine=True,
+                    warp_axis='thread', batch_axis=None)
+    if N >= 16:
+        return dict(B=4, R=32, mode='2dt',
+                    do_warp_reduce=True, do_width_combine=False,
+                    warp_axis='thread', batch_axis='width')
+    return dict(B=32, R=4, mode='2dw',
+                do_warp_reduce=False, do_width_combine=True,
+                warp_axis='width', batch_axis='thread')
 
 
 def _compute_broadcast_plan(output_shape, tensor_shapes, tensor_strides=None):
@@ -798,6 +870,28 @@ class GintCompiler:
         if not broadcast_suffix:
             return False
 
+        # 3b. Every node in pw_schedule must transitively depend on the
+        # reduction. Without this, an unrelated pointwise op that happens
+        # to share the reduction dim's last-dim size (e.g. the *next*
+        # dot product's pre-reduction `n*L` when reduction_size=3) gets
+        # pulled into broadcast_suffix; the fused kernel then drops the
+        # scalar_prefix output that downstream subgraphs depend on.
+        reachable = {reduction_node}
+        changed = True
+        while changed:
+            changed = False
+            for node in pw_schedule:
+                if node in reachable:
+                    continue
+                for arg in node.args:
+                    if isinstance(arg, Node) and arg in reachable:
+                        reachable.add(node)
+                        changed = True
+                        break
+        for node in pw_schedule:
+            if node not in reachable:
+                return False
+
         # 4. All external global inputs to broadcast_suffix must share the
         #    reduction dimension.
         reduction_input = reduction_node.args[0]
@@ -1006,14 +1100,54 @@ class GintCompiler:
     def _compile_reduction_subgraph(
         self, node: Node, partitioner: GraphPartitioner
     ) -> GintCompiledSubgraph:
+        """Compile a single innermost-dim reduction.
+
+        Tile decomposition selects (B batches, R reduction-elts) per warp such
+        that B * R == 128. Three modes (see _select_reduction_tiling):
+
+          mode '1d'  (B=1,  R=128): threads+width flatten over reduction dim.
+                                    Final = warp_allreduce + width-combine.
+          mode '2dt' (B=4,  R=32):  threads scan reduction, width-lanes carry
+                                    4 batches. Final = warp_allreduce only.
+          mode '2dw' (B=32, R=4):   threads carry 32 batches, width-lanes scan
+                                    reduction. Final = width-combine only.
+
+        Outer batch dims are merged via _merge_dims; the innermost merged batch
+        dim is placed in block_grid (dim_2 for 1d/2dt, dim_1 for 2dw) so the
+        kernel's per-warp shape clamping handles partial last tiles when the
+        batch count isn't a multiple of B.
+        """
         input_node = node.args[0]
         input_shape = list(partitioner._get_shape(input_node))
         output_shape = list(partitioner._get_shape(node))
 
-        reduction_size = input_shape[-1]
-        n_chunks = math.ceil(reduction_size / 128)
+        N = input_shape[-1]
+        keepdim = (node.args[2] if len(node.args) > 2
+                   else node.kwargs.get('keepdim', False))
 
-        # Determine tensor slot ordering — input first, output second
+        in_strides = list(partitioner._get_strides(input_node) or
+                          _c_contiguous_strides(input_shape))
+        out_strides_full = list(partitioner._get_strides(node) or
+                                _c_contiguous_strides(output_shape))
+
+        red_stride = in_strides[-1] if in_strides else 1
+
+        batch_shape_raw = list(input_shape[:-1])
+        in_batch_strides = list(in_strides[:-1]) if in_strides else []
+        if keepdim:
+            out_batch_strides = (list(out_strides_full[:-1])
+                                 if out_strides_full else [])
+        else:
+            out_batch_strides = list(out_strides_full)
+
+        merged_shape, merged_strides = _merge_dims(
+            batch_shape_raw, [in_batch_strides, out_batch_strides])
+        merged_in_bs, merged_out_bs = merged_strides
+
+        tile = _select_reduction_tiling(N)
+        B, R, mode = tile['B'], tile['R'], tile['mode']
+        n_chunks = math.ceil(N / R)
+
         global_nodes = self._sorted_globals(partitioner._required_globals([node]))
         tensor_map = {n: i for i, n in enumerate(global_nodes)}
         input_slot = tensor_map[input_node]
@@ -1022,56 +1156,109 @@ class GintCompiler:
         op_desc = get_op_descriptor(node)
         combine_fn = op_desc.combine_fn
 
+        if mode == '1d':
+            load_fn, store_fn = fe.fldg_1d, fe.fstg_1d
+        elif mode == '2dt':
+            load_fn, store_fn = fe.fldg_2dt, fe.fstg_2dt
+        else:  # '2dw' input; 2dt store (only width-lane 0 writes)
+            load_fn, store_fn = fe.fldg_2dw, fe.fstg_2dt
+
         fe_state = FrontendState([])
         token = _frontend_state.set(fe_state)
         try:
-            # Load and accumulate chunks using the reduction's combine op.
-            fe.fldg_1d(0, input_slot)
+            # Phase 1: load + accumulate all reduction chunks.
+            load_fn(0, input_slot)
             for k in range(1, n_chunks):
-                fe.fldg_1d(k * 128, input_slot)
+                load_fn(k * R, input_slot)
                 combine_fn()
-            # Warp reduce + width-lane combine
-            op_desc.emit_fn(node)
-            # Store
-            fe.fstg_1d(0, output_slot)
+
+            # Phase 2: warp_allreduce / width-combine subset per tile.
+            if tile['do_warp_reduce'] and op_desc.warp_reduce_fn is not None:
+                op_desc.warp_reduce_fn()
+            if tile['do_width_combine']:
+                _emit_width_combine(combine_fn)
+
+            # Phase 2b: post step (e.g. mean's *(1/N)).
+            if op_desc.post_reduce_fn is not None:
+                op_desc.post_reduce_fn(node)
+
+            # Phase 3: store.
+            store_fn(0, output_slot)
             fe.halt()
             bytecode = fe_state.bc
         finally:
             _frontend_state.reset(token)
 
-        # Build tensor infos for each global node
-        batch_dims = input_shape[:-1] if len(input_shape) > 1 else []
+        # Innermost merged batch dim drives the per-warp B-tile; outer dims
+        # stay in batch_shape and iterate via the kernel's batch decomposition.
+        if not merged_shape:
+            m_inner = 1
+            in_inner_stride = 1
+            out_inner_stride = 1
+            outer_shape: tuple = ()
+            outer_in_bs: tuple = ()
+            outer_out_bs: tuple = ()
+        else:
+            m_inner = merged_shape[-1]
+            in_inner_stride = merged_in_bs[-1] if merged_in_bs else 1
+            out_inner_stride = merged_out_bs[-1] if merged_out_bs else 1
+            outer_shape = merged_shape[:-1]
+            outer_in_bs = merged_in_bs[:-1] if merged_in_bs else ()
+            outer_out_bs = merged_out_bs[:-1] if merged_out_bs else ()
+
         tensor_infos = []
         for gn in global_nodes:
-            if gn is input_node:
-                bstrides = _c_contiguous_strides(input_shape)[:-1] if len(input_shape) > 1 else []
-                tensor_infos.append(ProgramTensorInfo(
-                    elm_size=4,
-                    batch_strides=bstrides,
-                    batch_shape=list(batch_dims),
-                    block_shape_stride_1=[reduction_size, 1],
-                    block_shape_stride_2=[1, 0],
-                    block_grid_dims=[1, 1],
-                    block_grid_steps=[128, 1],
-                ))
-            else:  # output node
-                keepdim = node.args[2] if len(node.args) > 2 else node.kwargs.get('keepdim', False)
-                if keepdim:
-                    out_batch = output_shape[:-1] if len(output_shape) > 1 else []
-                else:
-                    out_batch = list(output_shape) if output_shape else []
-                bstrides = _c_contiguous_strides(out_batch) if out_batch else []
-                tensor_infos.append(ProgramTensorInfo(
-                    elm_size=4,
-                    batch_strides=bstrides,
-                    batch_shape=list(batch_dims),
-                    block_shape_stride_1=[1, 1],
-                    block_shape_stride_2=[1, 0],
-                    block_grid_dims=[1, 1],
-                    block_grid_steps=[1, 1],
-                ))
+            is_input = gn is input_node
+            bs_inner = in_inner_stride if is_input else out_inner_stride
+            bs_outer = list(outer_in_bs) if is_input else list(outer_out_bs)
 
-        grid_dim = max(1, int(np.prod(batch_dims))) if batch_dims else 1
+            if mode == '1d':
+                if is_input:
+                    bsst1 = [N, red_stride]
+                    bsst2 = [m_inner, bs_inner]
+                else:
+                    bsst1 = [1, 1]
+                    bsst2 = [m_inner, bs_inner]
+                grid_dim_1, grid_dim_2 = 1, m_inner
+                grid_step_1 = 128 if is_input else 1
+                grid_step_2 = 1
+            elif mode == '2dt':
+                if is_input:
+                    bsst1 = [N, red_stride]
+                    bsst2 = [m_inner, bs_inner]
+                else:
+                    bsst1 = [1, 0]
+                    bsst2 = [m_inner, bs_inner]
+                grid_dim_1 = 1
+                grid_dim_2 = (m_inner + B - 1) // B
+                grid_step_1 = 32 if is_input else 1
+                grid_step_2 = B
+            else:  # '2dw'
+                if is_input:
+                    bsst1 = [m_inner, bs_inner]
+                    bsst2 = [N, red_stride]
+                else:
+                    bsst1 = [m_inner, bs_inner]
+                    bsst2 = [1, 0]
+                grid_dim_1 = (m_inner + B - 1) // B
+                grid_dim_2 = 1
+                grid_step_1 = B
+                grid_step_2 = 4 if is_input else 1
+
+            tensor_infos.append(ProgramTensorInfo(
+                elm_size=4,
+                batch_strides=list(bs_outer),
+                batch_shape=list(outer_shape),
+                block_shape_stride_1=bsst1,
+                block_shape_stride_2=bsst2,
+                block_grid_dims=[grid_dim_1, grid_dim_2],
+                block_grid_steps=[grid_step_1, grid_step_2],
+            ))
+
+        grid_dim = grid_dim_1 * grid_dim_2
+        for d in outer_shape:
+            grid_dim *= d
+        grid_dim = max(1, grid_dim)
 
         return GintCompiledSubgraph(
             bytecode, tensor_infos,
@@ -1334,7 +1521,17 @@ class GintCompiler:
         output_tensors = []
         ref = input_tensors[0] if input_tensors else results[next(iter(results))]
         for node in outputs:
-            t = torch.empty(compiled.output_shape, dtype=ref.dtype, device=ref.device)
+            # Each output gets its FX-declared shape, not the subgraph's
+            # broadcast iteration shape. Otherwise an (M, 1) output mixed
+            # with an (M, 3) output in the same pointwise subgraph would
+            # be allocated (M, 3); the kernel's per-tensor TensorInfo
+            # already encodes the correct stride-0 broadcast write, but
+            # the surplus columns would never be touched and downstream
+            # consumers would see garbage in the wrong-shaped tensor.
+            out_shape = partitioner._get_shape(node)
+            if out_shape is None:
+                out_shape = compiled.output_shape
+            t = torch.empty(out_shape, dtype=ref.dtype, device=ref.device)
             output_tensors.append(t)
             results[node] = t
 

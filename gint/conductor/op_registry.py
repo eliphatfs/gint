@@ -45,6 +45,14 @@ class OpDescriptor:
     # (e.g. fadd for sum, fmul for prod, max(a,b) sequence for amax).
     # Stack contract: [a, b] → [combine(a, b)].
     combine_fn:       Optional[Callable]  = None
+    # Reduction-only: emits the warp-allreduce primitive (1 insn) — the
+    # 32-thread reduction. Distinct from combine_fn because it's a single
+    # opcode rather than a pairwise stack op.
+    warp_reduce_fn:   Optional[Callable]  = None
+    # Reduction-only: optional final fix-up that runs once after the
+    # warp/width reduction (e.g. mean's `* 1/N`). Takes the FX node so it
+    # can read shape-dependent constants. None = no post step.
+    post_reduce_fn:   Optional[Callable]  = None
 
 
 # ---------------------------------------------------------------------------
@@ -285,19 +293,33 @@ def _check_reduction_feasible(node) -> bool:
     return dim == len(shape) - 1  # innermost only
 
 
-def _check_reduction_feasible_multiple_of_128(node) -> bool:
-    """As above, but additionally require N % 128 == 0.
+def _reduction_chunk_size(N: int) -> int:
+    """Number of reduction elements covered per warp-load chunk.
+
+    Mirrors the tile dispatch in conductor.compiler._select_reduction_tiling.
+    Kept here so feasibility checks can compute the OOB-padding alignment
+    constraint without importing the conductor-internal selector.
+    """
+    if N >= 128:
+        return 128
+    if N >= 16:
+        return 32
+    return 4
+
+
+def _check_reduction_feasible_clean_chunks(node) -> bool:
+    """As above, but additionally require N to be a multiple of the chunk size.
 
     Sum/mean tolerate the kernel's 0.0 OOB padding because adding zero is a
     no-op.  Prod (multiplies by zero), amax (max-with-zero clamps negative
     values), and amin (min-with-zero clamps positive values) do NOT tolerate
     it.  Until the kernel grows per-op OOB defaults, restrict these to
-    reduction sizes that align with the warp's 32*4-lane chunk.
+    reduction sizes that align with the chosen tile's chunk size.
     """
     if not _check_reduction_feasible(node):
         return False
     shape = node.args[0].meta['tensor_meta'].shape
-    return shape[-1] % 128 == 0
+    return shape[-1] % _reduction_chunk_size(shape[-1]) == 0
 
 
 def _emit_max_pair(_node=None):
@@ -314,55 +336,56 @@ def _emit_min_pair(_node=None):
     fe.fselect()
 
 
-def _emit_sum(_node):
-    """7-instruction full reduction: warp_allreduce + width-lane combine."""
-    fe.warp_allreduce_fsum()
+def _emit_width_combine(combine_fn):
+    """Width-lane reduction: 4-wide vector → 1 (broadcast back to all 4 lanes).
+
+    [v0,v1,v2,v3] → dup → fperm_w(2,3,0,1) → combine
+                  → [v0+v2, v1+v3, v0+v2, v1+v3] (for fadd)
+                  → dup → fperm_w(1,0,3,2) → combine
+                  → all 4 lanes hold sum.
+    """
     fe.dup()
     fe.fperm_w(2, 3, 0, 1)
-    fe.fadd()
+    combine_fn()
     fe.dup()
     fe.fperm_w(1, 0, 3, 2)
-    fe.fadd()
+    combine_fn()
+
+
+def _emit_mean_post(node):
+    """Final * 1/N for mean."""
+    shape = node.args[0].meta['tensor_meta'].shape
+    fe.fmulimm(1.0 / float(shape[-1]))
+
+
+def _emit_sum(_node):
+    """Full reduction: warp_allreduce + width-lane combine."""
+    fe.warp_allreduce_fsum()
+    _emit_width_combine(fe.fadd)
 
 
 def _emit_mean(node):
     """Sum + divide by count."""
     _emit_sum(node)
-    shape = node.args[0].meta['tensor_meta'].shape
-    fe.fmulimm(1.0 / float(shape[-1]))
+    _emit_mean_post(node)
 
 
 def _emit_prod(_node):
     """warp_allreduce_fprod + width-lane combine via fmul."""
     fe.warp_allreduce_fprod()
-    fe.dup()
-    fe.fperm_w(2, 3, 0, 1)
-    fe.fmul()
-    fe.dup()
-    fe.fperm_w(1, 0, 3, 2)
-    fe.fmul()
+    _emit_width_combine(fe.fmul)
 
 
 def _emit_amax(_node):
     """warp_allreduce_fmax + width-lane combine via pairwise max."""
     fe.warp_allreduce_fmax()
-    fe.dup()
-    fe.fperm_w(2, 3, 0, 1)
-    _emit_max_pair()
-    fe.dup()
-    fe.fperm_w(1, 0, 3, 2)
-    _emit_max_pair()
+    _emit_width_combine(_emit_max_pair)
 
 
 def _emit_amin(_node):
     """warp_allreduce_fmin + width-lane combine via pairwise min."""
     fe.warp_allreduce_fmin()
-    fe.dup()
-    fe.fperm_w(2, 3, 0, 1)
-    _emit_min_pair()
-    fe.dup()
-    fe.fperm_w(1, 0, 3, 2)
-    _emit_min_pair()
+    _emit_width_combine(_emit_min_pair)
 
 
 # ---------------------------------------------------------------------------
@@ -940,26 +963,32 @@ OP_REGISTRY: dict = {
     torch.ops.aten.sum.dim_IntList:
         OpDescriptor(1, OpKind.REDUCTION, _emit_sum,
                      arg_order=[0], check_fn=_check_reduction_feasible,
-                     peak_stack_extra=2, combine_fn=fe.fadd),
+                     peak_stack_extra=2, combine_fn=fe.fadd,
+                     warp_reduce_fn=fe.warp_allreduce_fsum),
     torch.ops.aten.mean.dim:
         OpDescriptor(1, OpKind.REDUCTION, _emit_mean,
                      arg_order=[0], check_fn=_check_reduction_feasible,
-                     peak_stack_extra=2, combine_fn=fe.fadd),
+                     peak_stack_extra=2, combine_fn=fe.fadd,
+                     warp_reduce_fn=fe.warp_allreduce_fsum,
+                     post_reduce_fn=_emit_mean_post),
     torch.ops.aten.prod.dim_int:
         OpDescriptor(1, OpKind.REDUCTION, _emit_prod,
                      arg_order=[0],
-                     check_fn=_check_reduction_feasible_multiple_of_128,
-                     peak_stack_extra=2, combine_fn=fe.fmul),
+                     check_fn=_check_reduction_feasible_clean_chunks,
+                     peak_stack_extra=2, combine_fn=fe.fmul,
+                     warp_reduce_fn=fe.warp_allreduce_fprod),
     torch.ops.aten.amax.default:
         OpDescriptor(1, OpKind.REDUCTION, _emit_amax,
                      arg_order=[0],
-                     check_fn=_check_reduction_feasible_multiple_of_128,
-                     peak_stack_extra=3, combine_fn=_emit_max_pair),
+                     check_fn=_check_reduction_feasible_clean_chunks,
+                     peak_stack_extra=3, combine_fn=_emit_max_pair,
+                     warp_reduce_fn=fe.warp_allreduce_fmax),
     torch.ops.aten.amin.default:
         OpDescriptor(1, OpKind.REDUCTION, _emit_amin,
                      arg_order=[0],
-                     check_fn=_check_reduction_feasible_multiple_of_128,
-                     peak_stack_extra=3, combine_fn=_emit_min_pair),
+                     check_fn=_check_reduction_feasible_clean_chunks,
+                     peak_stack_extra=3, combine_fn=_emit_min_pair,
+                     warp_reduce_fn=fe.warp_allreduce_fmin),
 }
 
 

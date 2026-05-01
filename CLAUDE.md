@@ -156,17 +156,23 @@ Supported GPU backends:
 #### Reduction Support (sum, mean, prod, amax, amin)
 - Registered as `OpKind.REDUCTION` in `op_registry.py` for `aten.sum.dim_IntList`, `aten.mean.dim`, `aten.prod.dim_int`, `aten.amax.default`, `aten.amin.default`
 - **Constraint**: Innermost-dim only, single reduction dim. Non-innermost reductions fall back to eager
-- **`combine_fn`**: each reduction descriptor names the pairwise op the multi-chunk accumulation loop should use. `fadd` for sum/mean, `fmul` for prod, the 3-insn `dup2; fgt/flt; fselect` pair sequence for amax/amin. Both `_compile_reduction_subgraph` and `_compile_fused_reduction_subgraph` consult this instead of hardcoding `fadd`
-- **OOB padding caveat**: kernel pads OOB lanes with `0.0`. Sum/mean tolerate this (adding zero is a no-op); prod (multiplies by zero), amax (max-with-zero clamps negatives), and amin (min-with-zero clamps positives) do NOT. Those three are gated by `_check_reduction_feasible_multiple_of_128` (rejects N % 128 != 0). To lift this, the kernel would need per-op OOB defaults
+- **Tile dispatch (`_select_reduction_tiling`)**: Each warp packs `B * R == 128` lanes covering `B` batches × `R` reduction elements. Choice driven by innermost dim N:
+  - `N >= 128` → (B=1, R=128, mode `1d`); threads+width flatten over reduction; final = warp_allreduce + width-combine.
+  - `16 <= N < 128` → (B=4, R=32, mode `2dt`); threads scan reduction, width-lanes carry 4 batches; final = warp_allreduce only.
+  - `N < 16` → (B=32, R=4, mode `2dw`); threads carry 32 batches, width-lanes scan reduction; final = width-combine only.
+  - Standalone `_compile_reduction_subgraph` uses this dispatch; the fused-reduction path still emits the (B=1, R=128) layout — see Future Work
+- **`combine_fn` / `warp_reduce_fn` / `post_reduce_fn`**: descriptor splits the reduction's emit into pieces so the compiler can call only the relevant ones per tile. `combine_fn` is the pairwise multi-chunk accumulator (fadd for sum/mean, fmul for prod, `dup2; fgt/flt; fselect` pair for amax/amin). `warp_reduce_fn` is the 1-instr `warp_allreduce_*`. `post_reduce_fn(node)` is the optional final fix-up (mean's `* 1/N`)
+- **OOB padding caveat**: kernel pads OOB lanes with `0.0`. Sum/mean tolerate this; prod (× 0), amax (max-with-0 clamps negatives), amin (min-with-0 clamps positives) do NOT. Those three are gated by `_check_reduction_feasible_clean_chunks`, which now requires `N % R == 0` for the chosen tile (was `N % 128 == 0`). E.g. N=64 with tile R=32 is now accepted; previously rejected
 - **No kernel changes required** — width-lane combining is composed from existing instructions:
   ```
   warp_allreduce_fsum     ; [p0, p1, p2, p3] per thread
   dup; fperm_w(2,3,0,1); fadd   ; [p0+p2, p1+p3, ...]
   dup; fperm_w(1,0,3,2); fadd   ; [total, total, total, total]
   ```
-  7 insns for sum/prod (using fadd/fmul); 9 for amax/amin (each fadd replaced by `dup2; fgt/flt; fselect`). Mean adds `fmulimm(1/N)`.
-- **Reduction grid model**: One warp per batch element (not per 128 output elements). Each warp consumes the entire reduction dim via unrolled multi-chunk loads: `fldg_1d(0, slot); fldg_1d(128, slot); combine_fn; ...`
-- **Multi-chunk loads**: For reduction dims > 128, loads are unrolled at Python codegen time (not kernel runtime). `block_shape_stride_1[0] = N` (full reduction dim) so OOB masking returns 0.0 for partial last chunks. Practical for N up to ~16K.
+  Factored as `_emit_width_combine(combine_fn)` and reused per-tile by `_compile_reduction_subgraph`. Mean appends `fmulimm(1/N)` via `post_reduce_fn`
+- **Batch-dim merge (`_merge_dims`)**: greedy incremental merge of consecutive batch dims that are C-contiguous in *every* tensor of the subgraph. Unlike `_compute_broadcast_plan`'s all-or-nothing merge, this stops at non-contiguous boundaries without collapsing back to length-1, so partial merges still help
+- **Per-warp tile clamping**: the innermost merged batch dim is placed in `block_grid_dim_2` (modes 1d/2dt) or `block_grid_dim_1` (mode 2dw) with step=B, so the kernel's `b_shape - b_idx*step` clamping handles partial last tiles when `M % B != 0`. Outer batch dims stay in `batch_shape`
+- **Multi-chunk loads**: For reduction dim > R, loads are unrolled at Python codegen time: `fldg_1d/2dt/2dw(0, slot)`, `(R, slot)`, `(2R, slot)`, … Each followed by `combine_fn`. Practical for N up to ~16K
 - **Partitioner**: Reduction nodes are isolated as single-node subgraphs (flush any current pointwise subgraph)
 
 #### Fused Reduction+Broadcast+Pointwise
@@ -183,6 +189,8 @@ Supported GPU backends:
 - Examples: `x - mean(x)` (single binary op, existing pattern). `x * rsqrt(mean(x*x) + eps) * w` (full RMSNorm, 6 nodes fused into 1 kernel)
 
 #### Reduction Future Work
+- **Tile dispatch for fused reduction** — `_compile_fused_reduction_subgraph` still uses the legacy (B=1, R=128) layout regardless of N. Lifting `_select_reduction_tiling` into Phase 1 (and Phase 2's broadcast suffix) would help small-N cases (e.g. geometry_smith with N=3)
+- **Pointwise tile dispatch** — when the partitioner joins mismatched-shape ops (e.g. `(M, 1) + (M, K)`), `_compute_broadcast_plan`'s merge stops at the inner-dim mismatch and `block_size` collapses to K. Applying the same B*R=128 tile dispatch on the pointwise path (2dt for K in [16, 127], 2dw for K < 16) would recover lane utilization
 - **Dedicated `WarpFullReduceSum` instruction** — single opcode replacing the 7-instruction width-lane combine sequence
 - **Kernel loop instruction** — for reduction dims > ~16K without bytecode bloat
 - **Non-innermost reductions** — would require transposing the tensor or a different grid decomposition
