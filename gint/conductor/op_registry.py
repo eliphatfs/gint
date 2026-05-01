@@ -29,8 +29,11 @@ class OpDescriptor:
     emit_fn:          Callable            # emit_fn(node) – called inside _frontend_state context
     # arg_order: if set, args are handled in this index order before emitting.
     # None means natural order (0, 1, …).  Useful for non-commutative ops where
-    # the stack convention differs from the ATen arg order.
-    arg_order:        Optional[List[int]] = None
+    # the stack convention differs from the ATen arg order.  May also be a
+    # callable(node) → list[int] for descriptors that need to choose at emit
+    # time (e.g. binary ops that fold a scalar second arg into an immediate
+    # instruction and therefore want to skip the scalar push).
+    arg_order:        Optional[object]    = None
     # check_fn: optional extra predicate – returns True when the op is supported
     # for this particular node (e.g. checking kwargs).
     check_fn:         Optional[Callable]  = None
@@ -185,20 +188,79 @@ def _emit_leaky_relu(node):
     fe.fselect()
 
 
+def _is_scalar(x):
+    return isinstance(x, (int, float)) and not isinstance(x, bool)
+
+
+def _arg_order_scalar_fold(node):
+    """Push only args[0] when args[1] is a Python scalar so the emit_fn can
+    fold it into an immediate instruction.  Otherwise push both args."""
+    return [0] if _is_scalar(node.args[1]) else [0, 1]
+
+
 def _emit_add_tensor(node):
-    """add.Tensor with optional alpha scaling: a + alpha*b."""
+    """add.Tensor / add.Scalar: a + alpha*b.
+
+    Scalar fold: when b is a Python scalar (the common case in FX graphs
+    for ``x + 1.0`` and friends), emit a single ``faddimm(alpha*b)`` —
+    one instruction in place of fpush + fmulimm + fadd.
+    """
     alpha = node.kwargs.get('alpha', 1)
-    if alpha != 1:
-        fe.fmulimm(float(alpha))   # scale top (b) before adding
-    fe.fadd()
+    other = node.args[1]
+    if _is_scalar(other):
+        fe.faddimm(float(alpha) * float(other))
+    else:
+        if alpha != 1:
+            fe.fmulimm(float(alpha))
+        fe.fadd()
 
 
 def _emit_sub_tensor(node):
-    """sub.Tensor with optional alpha scaling: a - alpha*b."""
+    """sub.Tensor / sub.Scalar: a - alpha*b.
+
+    Scalar fold: emit ``faddimm(-alpha*b)`` when b is a Python scalar.
+    """
     alpha = node.kwargs.get('alpha', 1)
-    if alpha != 1:
-        fe.fmulimm(float(alpha))
-    fe.frsub()   # second - top = a - (alpha*b)
+    other = node.args[1]
+    if _is_scalar(other):
+        fe.faddimm(-float(alpha) * float(other))
+    else:
+        if alpha != 1:
+            fe.fmulimm(float(alpha))
+        fe.frsub()   # second - top = a - (alpha*b)
+
+
+def _emit_mul_binary(node):
+    """mul.Tensor / mul.Scalar.  Scalar fold: ``fmulimm(b)``."""
+    other = node.args[1]
+    if _is_scalar(other):
+        fe.fmulimm(float(other))
+    else:
+        fe.fmul()
+
+
+def _emit_div_binary(node):
+    """div.Tensor / div.Scalar: a / b.  Scalar fold: ``fmulimm(1/b)``.
+
+    For b=0 this collapses to ``fmulimm(inf)`` which gives the same IEEE
+    result as ``a / 0`` (±inf for nonzero a, NaN for zero a).
+    """
+    other = node.args[1]
+    if _is_scalar(other):
+        fe.fmulimm(1.0 / float(other))
+    else:
+        fe.frdiv()
+
+
+def _emit_rsub_scalar(node):
+    """rsub.Scalar(self, other, alpha=1) = other - alpha*self.
+    Folds to ``fmulimm(-alpha); faddimm(other)`` — 2 insns vs 3 in the
+    naive ``fpush + frsub`` lowering.
+    """
+    other = float(node.args[1])
+    alpha = float(node.kwargs.get('alpha', 1))
+    fe.fmulimm(-alpha)
+    fe.faddimm(other)
 
 
 # ---------------------------------------------------------------------------
@@ -655,29 +717,44 @@ def _emit_hardshrink(node):
 
 OP_REGISTRY: dict = {
     # --- Binary arithmetic ---
-    # Note: args are pushed left-to-right so top=b, second=a.
+    # Note: args are pushed left-to-right so top=b, second=a (when b is a tensor).
     # FRSub = second-top = a-b; FRDiv = second/top = a/b.
+    # When b is a Python scalar, the descriptors fold it into a single
+    # immediate-form instruction (faddimm/fmulimm) and arg_order skips the
+    # would-be fpush so codegen stays consistent.
     torch.ops.aten.add.Tensor:
-        OpDescriptor(2, OpKind.ELEMENTWISE, _emit_add_tensor),
+        OpDescriptor(2, OpKind.ELEMENTWISE, _emit_add_tensor,
+                     arg_order=_arg_order_scalar_fold),
     torch.ops.aten.mul.Tensor:
-        _ew2(fe.fmul),
+        OpDescriptor(2, OpKind.ELEMENTWISE, _emit_mul_binary,
+                     arg_order=_arg_order_scalar_fold),
     torch.ops.aten.sub.Tensor:
-        OpDescriptor(2, OpKind.ELEMENTWISE, _emit_sub_tensor),
+        OpDescriptor(2, OpKind.ELEMENTWISE, _emit_sub_tensor,
+                     arg_order=_arg_order_scalar_fold),
     torch.ops.aten.div.Tensor:
-        _ew2(fe.frdiv),
+        OpDescriptor(2, OpKind.ELEMENTWISE, _emit_div_binary,
+                     arg_order=_arg_order_scalar_fold),
     torch.ops.aten.remainder.Tensor:
         _ew2(fe.frem),
 
-    # Scalar variants: self is a tensor, other is a scalar constant.
-    # Stack order: [self, scalar_constant] — fadd/frsub/frdiv handle this correctly.
+    # Scalar variants: self is a tensor, other is a Python scalar.  Reuse
+    # the same emitters; the dynamic arg_order folds the scalar in all cases.
     torch.ops.aten.add.Scalar:
-        OpDescriptor(2, OpKind.ELEMENTWISE, _emit_add_tensor),
+        OpDescriptor(2, OpKind.ELEMENTWISE, _emit_add_tensor,
+                     arg_order=_arg_order_scalar_fold),
     torch.ops.aten.sub.Scalar:
-        OpDescriptor(2, OpKind.ELEMENTWISE, _emit_sub_tensor),
+        OpDescriptor(2, OpKind.ELEMENTWISE, _emit_sub_tensor,
+                     arg_order=_arg_order_scalar_fold),
     torch.ops.aten.mul.Scalar:
-        _ew2(fe.fmul),
+        OpDescriptor(2, OpKind.ELEMENTWISE, _emit_mul_binary,
+                     arg_order=_arg_order_scalar_fold),
     torch.ops.aten.div.Scalar:
-        _ew2(fe.frdiv),
+        OpDescriptor(2, OpKind.ELEMENTWISE, _emit_div_binary,
+                     arg_order=_arg_order_scalar_fold),
+    # rsub.Scalar(self, other) = other - self.  arg_order=[0]: only push self;
+    # the scalar `other` is read from the FX node and emitted as faddimm.
+    torch.ops.aten.rsub.Scalar:
+        OpDescriptor(1, OpKind.ELEMENTWISE, _emit_rsub_scalar, arg_order=[0]),
 
     # --- Comparison (produce 0.0/1.0 float) ---
     # Tensor variants: aten.gt(self, other) = self > other.
@@ -894,3 +971,18 @@ def get_op_descriptor(node) -> Optional[OpDescriptor]:
     if desc.check_fn is not None and not desc.check_fn(node):
         return None
     return desc
+
+
+def resolve_arg_order(desc: OpDescriptor, node) -> List[int]:
+    """Resolve the descriptor's ``arg_order`` for this node.
+
+    ``arg_order`` may be a static list, a callable(node) → list[int], or
+    ``None`` (natural order).  Centralising this lets the codegen and the
+    fused-reduction phases share one resolution rule.
+    """
+    order = desc.arg_order
+    if order is None:
+        return list(range(len(node.args)))
+    if callable(order):
+        return order(node)
+    return order

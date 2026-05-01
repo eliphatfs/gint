@@ -779,6 +779,67 @@ class TestConductorNewOps(unittest.TestCase):
         b = torch.randn(1024, device='cuda')
         self._check(lambda x, y: torch.lerp(x, y, 0.3), a, b)
 
+    # --- rsub.Scalar (newly supported via the scalar-fold path) ---
+
+    def test_rsub_scalar(self):
+        x = torch.randn(1024, device='cuda')
+        self._check(lambda t: 1.0 - t, x)
+        self._check(lambda t: 3.5 - t, x)
+
+    # --- Scalar fold: assert immediate insns are actually emitted ---
+
+    def test_scalar_fold_x_plus_1_is_single_faddimm(self):
+        """``x + 1.0`` must lower to exactly one FAddImm — not LoadImm + FAdd.
+
+        Full expected bytecode: load, faddimm, store, halt.
+        """
+        import gint.kernel.interpreter.instructions.immediate as _imm
+        import gint.kernel.interpreter.instructions.arith as _arith
+        from gint.conductor.debug import inspect_subgraphs
+        from gint.kernel.interpreter.main import INSNS
+
+        FAddImm = INSNS[_imm.FAddImm]
+        FMulImm = INSNS[_imm.FMulImm]
+        LoadImm = INSNS[_imm.LoadImm]
+        FAdd    = INSNS[_arith.FAdd]
+        FMul    = INSNS[_arith.FMul]
+
+        x = torch.randn(1024, device='cuda')
+        torch._dynamo.reset()
+        info = inspect_subgraphs(lambda t: t + 1.0, x)
+        ops = [op for op, _ in info[0].bytecode]
+
+        self.assertEqual(ops.count(FAddImm), 1,
+                         f"expected exactly 1 FAddImm, got bytecode={ops}")
+        self.assertEqual(ops.count(LoadImm), 0,
+                         f"expected no LoadImm (scalar should fold), got bytecode={ops}")
+        self.assertEqual(ops.count(FAdd), 0,
+                         f"expected no FAdd (folded into faddimm), got bytecode={ops}")
+        # 4 insns total: load, faddimm, store, halt.
+        self.assertEqual(len(ops), 4,
+                         f"expected 4 instructions, got {len(ops)}: {ops}")
+
+    def test_scalar_fold_x_times_2_is_single_fmulimm(self):
+        """``x * 2.0`` must lower to exactly one FMulImm."""
+        import gint.kernel.interpreter.instructions.immediate as _imm
+        import gint.kernel.interpreter.instructions.arith as _arith
+        from gint.conductor.debug import inspect_subgraphs
+        from gint.kernel.interpreter.main import INSNS
+
+        FMulImm = INSNS[_imm.FMulImm]
+        LoadImm = INSNS[_imm.LoadImm]
+        FMul    = INSNS[_arith.FMul]
+
+        x = torch.randn(1024, device='cuda')
+        torch._dynamo.reset()
+        info = inspect_subgraphs(lambda t: t * 2.0, x)
+        ops = [op for op, _ in info[0].bytecode]
+
+        self.assertEqual(ops.count(FMulImm), 1, f"bytecode={ops}")
+        self.assertEqual(ops.count(LoadImm), 0, f"bytecode={ops}")
+        self.assertEqual(ops.count(FMul), 0, f"bytecode={ops}")
+        self.assertEqual(len(ops), 4, f"bytecode={ops}")
+
 
 if __name__ == "__main__":
     if torch.cuda.is_available():

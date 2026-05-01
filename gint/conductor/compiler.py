@@ -31,7 +31,7 @@ from ..host.executor import (
 )
 from ..host import frontend as fe
 from ..host.frontend import FrontendState, _frontend_state
-from .op_registry import OpDescriptor, OpKind, get_op_descriptor
+from .op_registry import OpDescriptor, OpKind, get_op_descriptor, resolve_arg_order
 
 
 # ---------------------------------------------------------------------------
@@ -374,16 +374,24 @@ class StackCodegen:
 
     # --- Operation emission ---
 
-    def emit_op(self, node: Node, op_desc: OpDescriptor):
+    def emit_op(self, node: Node, op_desc: OpDescriptor, num_pushed: Optional[int] = None):
         """
         Emit the operation, update the virtual stack (pop inputs, push result),
         then handle result storage / cleanup.
+
+        ``num_pushed`` is how many items the caller actually pushed for this
+        op (which may differ from ``op_desc.arity`` when the descriptor folds
+        a scalar arg into an immediate instruction and skips its push).
+        Defaults to ``op_desc.arity`` for callers that don't track it.
         """
+        if num_pushed is None:
+            num_pushed = op_desc.arity
+
         # Emit the instruction(s) for this operation.
         op_desc.emit_fn(node)
 
         # Pop consumed inputs from the virtual stack.
-        for _ in range(op_desc.arity):
+        for _ in range(num_pushed):
             self.vstack.pop()
 
         # Push result.
@@ -914,15 +922,16 @@ class GintCompiler:
                     raise RuntimeError(f"Unsupported op reached compiler: {node.target}")
 
                 # Handle operands in the prescribed arg order.
-                arg_indices = op_desc.arg_order if op_desc.arg_order is not None \
-                              else list(range(len(node.args)))
+                arg_indices = resolve_arg_order(op_desc, node)
+                pushed = 0
                 for idx in arg_indices:
                     arg = node.args[idx]
                     if isinstance(arg, (Node, int, float)):
                         codegen.handle_operand(arg)
+                        pushed += 1
 
                 # Emit the operation and manage the result.
-                codegen.emit_op(node, op_desc)
+                codegen.emit_op(node, op_desc, num_pushed=pushed)
 
             fe.halt()
             bytecode = fe_state.bc
@@ -1122,8 +1131,7 @@ class GintCompiler:
                 for k in range(n_chunks):
                     for node in pre_prefix:
                         desc = get_op_descriptor(node)
-                        arg_order = desc.arg_order if desc.arg_order is not None \
-                                    else list(range(len(node.args)))
+                        arg_order = resolve_arg_order(desc, node)
                         for idx in arg_order:
                             arg = node.args[idx]
                             if isinstance(arg, (int, float)):
@@ -1147,8 +1155,7 @@ class GintCompiler:
             # Phase 1b: Emit scalar prefix ops (once, before the chunk loop).
             for node in scalar_prefix:
                 desc = get_op_descriptor(node)
-                arg_order = desc.arg_order if desc.arg_order is not None \
-                            else list(range(len(node.args)))
+                arg_order = resolve_arg_order(desc, node)
                 # Count Node-arg appearances to emit dup when the same arg is
                 # used multiple times by the same op (e.g. mul(s, s)).
                 arg_counts: Dict[Node, int] = {}
@@ -1178,19 +1185,21 @@ class GintCompiler:
 
                     for node in broadcast_suffix:
                         desc = get_op_descriptor(node)
-                        arg_order = desc.arg_order if desc.arg_order is not None \
-                                    else list(range(len(node.args)))
+                        arg_order = resolve_arg_order(desc, node)
 
+                        pushed = 0
                         for idx in arg_order:
                             arg = node.args[idx]
                             if isinstance(arg, (int, float)):
                                 fe.fpush(float(arg))
                                 chunk_vstack.append(None)
+                                pushed += 1
                             elif isinstance(arg, Node):
                                 if arg in tensor_map:
                                     # Global tensor: load with chunk offset
                                     fe.fldg_1d(k * 128, tensor_map[arg])
                                     chunk_vstack.append(arg)
+                                    pushed += 1
                                 else:
                                     # Scalar / intermediate: on chunk_vstack
                                     depth = GintCompiler._vstack_depth(chunk_vstack, arg)
@@ -1210,9 +1219,10 @@ class GintCompiler:
                                         raise RuntimeError(
                                             f"Arg {arg.name} buried at depth {depth} "
                                             f"for {node.name}")
+                                    pushed += 1
 
                         desc.emit_fn(node)
-                        for _ in range(desc.arity):
+                        for _ in range(pushed):
                             chunk_vstack.pop()
                         chunk_vstack.append(node)
 

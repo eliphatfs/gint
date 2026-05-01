@@ -103,7 +103,8 @@ Supported GPU backends:
 - `gint/conductor/compiler.py`: FX graph → bytecode conversion, graph partitioning, and broadcasting
 - `gint/conductor/debug.py`: `inspect_subgraphs(fn, *args)` runs `fn` through the gint backend and returns one `SubgraphInfo` per compiled subgraph (kind, FX nodes, bytecode, output shape, grid dim). Pair with `print_subgraphs` to dump the bytecode of each subgraph — the right tool when a torch.compile path looks slower than expected or you want to verify partitioning / fusion behavior
 - Supported op surface (full list in `op_registry.py`; unsupported ops fall back to eager):
-  - Arithmetic: add, sub, mul, div, remainder, neg, abs, square, reciprocal, pow, atan2
+  - Arithmetic: add, sub, mul, div, remainder, neg, abs, square, reciprocal, pow, atan2, rsub.Scalar
+    - **Scalar fold**: `add/sub/mul/div` with a Python-scalar second arg lower to a single immediate insn (`faddimm` / `fmulimm`) instead of `LoadImm + fadd/fmul`. Driven by `OpDescriptor.arg_order` accepting a callable so the descriptor decides at emit time whether to push the scalar or skip it. `emit_op` takes a `num_pushed` count instead of relying on static `arity` so the codegen pop matches actual pushes
   - Comparisons + ternary: gt/lt/ge/le/eq/ne (Tensor + Scalar), `where`
   - Transcendentals: sqrt, rsqrt, exp, exp2, expm1, log, log2, log10, log1p, sin/cos/tan, asin/acos/atan, sinh/cosh, atanh/asinh/acosh, erf
   - Activations: relu, gelu, silu, leaky_relu, tanh, sigmoid, hardtanh, relu6, hardsigmoid, hardswish, softplus (beta=1), mish, elu, selu, threshold, hardshrink
