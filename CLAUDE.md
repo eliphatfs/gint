@@ -102,7 +102,15 @@ Supported GPU backends:
 - `gint/conductor/backend.py`: Backend registration and entry point
 - `gint/conductor/compiler.py`: FX graph → bytecode conversion, graph partitioning, and broadcasting
 - `gint/conductor/debug.py`: `inspect_subgraphs(fn, *args)` runs `fn` through the gint backend and returns one `SubgraphInfo` per compiled subgraph (kind, FX nodes, bytecode, output shape, grid dim). Pair with `print_subgraphs` to dump the bytecode of each subgraph — the right tool when a torch.compile path looks slower than expected or you want to verify partitioning / fusion behavior
-- Supports basic arithmetic ops (add, sub, mul, div), unary transcendentals, activations (relu, gelu, silu, leaky_relu), comparisons, `where`, metadata ops (view, unsqueeze, squeeze, expand, permute, transpose, t), and reduction ops (sum, mean on innermost dim); fallback to eager mode for unsupported ops
+- Supported op surface (full list in `op_registry.py`; unsupported ops fall back to eager):
+  - Arithmetic: add, sub, mul, div, remainder, neg, abs, square, reciprocal, pow, atan2
+  - Comparisons + ternary: gt/lt/ge/le/eq/ne (Tensor + Scalar), `where`
+  - Transcendentals: sqrt, rsqrt, exp, exp2, expm1, log, log2, log10, log1p, sin/cos/tan, asin/acos/atan, sinh/cosh, atanh/asinh/acosh, erf
+  - Activations: relu, gelu, silu, leaky_relu, tanh, sigmoid, hardtanh, relu6, hardsigmoid, hardswish, softplus (beta=1), mish, elu, selu, threshold, hardshrink
+  - Pairwise + clamp: minimum, maximum, clamp/clamp_min/clamp_max (scalar + Tensor)
+  - Composite: addcmul, addcdiv, lerp.Scalar
+  - Metadata: view, unsqueeze, squeeze, expand, permute, transpose, t, slice
+  - Reductions (innermost dim only): sum, mean, prod, amax, amin
 - Partitioner constraints per subgraph: max 8 global tensor slots, max stack depth 8, broadcast-compatible shapes
 
 #### Backend Registration
@@ -144,17 +152,19 @@ Supported GPU backends:
 - **Partitioner safety**: When a metadata op's global input shape is not broadcast-compatible with the output shape (e.g., `view(1024) → (32, 32)`), the node is skipped and falls back to eager execution. The `_compute_broadcast_plan` validates that each tensor dim is either 1 or equal to the output dim. Slice ops are forced to start a new subgraph (they shrink a dimension which isn't broadcast-compatible).
 - **Current limitation**: Non-contiguous input strides (e.g. transpose) are correctly read and used for the input tensors, but the output tensor is still created as C-contiguous. The output stride doesn't match the input stride for transposed views, so `x.t().relu()` still falls back to eager.
 
-#### Reduction Support (sum, mean)
-- Registered as `OpKind.REDUCTION` in `op_registry.py` for `aten.sum.dim_IntList` and `aten.mean.dim`
+#### Reduction Support (sum, mean, prod, amax, amin)
+- Registered as `OpKind.REDUCTION` in `op_registry.py` for `aten.sum.dim_IntList`, `aten.mean.dim`, `aten.prod.dim_int`, `aten.amax.default`, `aten.amin.default`
 - **Constraint**: Innermost-dim only, single reduction dim. Non-innermost reductions fall back to eager
+- **`combine_fn`**: each reduction descriptor names the pairwise op the multi-chunk accumulation loop should use. `fadd` for sum/mean, `fmul` for prod, the 3-insn `dup2; fgt/flt; fselect` pair sequence for amax/amin. Both `_compile_reduction_subgraph` and `_compile_fused_reduction_subgraph` consult this instead of hardcoding `fadd`
+- **OOB padding caveat**: kernel pads OOB lanes with `0.0`. Sum/mean tolerate this (adding zero is a no-op); prod (multiplies by zero), amax (max-with-zero clamps negatives), and amin (min-with-zero clamps positives) do NOT. Those three are gated by `_check_reduction_feasible_multiple_of_128` (rejects N % 128 != 0). To lift this, the kernel would need per-op OOB defaults
 - **No kernel changes required** — width-lane combining is composed from existing instructions:
   ```
   warp_allreduce_fsum     ; [p0, p1, p2, p3] per thread
   dup; fperm_w(2,3,0,1); fadd   ; [p0+p2, p1+p3, ...]
   dup; fperm_w(1,0,3,2); fadd   ; [total, total, total, total]
   ```
-  7 instructions total. Mean adds `fmulimm(1/N)`.
-- **Reduction grid model**: One warp per batch element (not per 128 output elements). Each warp consumes the entire reduction dim via unrolled multi-chunk loads: `fldg_1d(0, slot); fldg_1d(128, slot); fadd; ...`
+  7 insns for sum/prod (using fadd/fmul); 9 for amax/amin (each fadd replaced by `dup2; fgt/flt; fselect`). Mean adds `fmulimm(1/N)`.
+- **Reduction grid model**: One warp per batch element (not per 128 output elements). Each warp consumes the entire reduction dim via unrolled multi-chunk loads: `fldg_1d(0, slot); fldg_1d(128, slot); combine_fn; ...`
 - **Multi-chunk loads**: For reduction dims > 128, loads are unrolled at Python codegen time (not kernel runtime). `block_shape_stride_1[0] = N` (full reduction dim) so OOB masking returns 0.0 for partial last chunks. Practical for N up to ~16K.
 - **Partitioner**: Reduction nodes are isolated as single-node subgraphs (flush any current pointwise subgraph)
 

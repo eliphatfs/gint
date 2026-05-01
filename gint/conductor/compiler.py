@@ -1010,16 +1010,18 @@ class GintCompiler:
         input_slot = tensor_map[input_node]
         output_slot = tensor_map[node]
 
+        op_desc = get_op_descriptor(node)
+        combine_fn = op_desc.combine_fn
+
         fe_state = FrontendState([])
         token = _frontend_state.set(fe_state)
         try:
-            # Load and accumulate chunks
+            # Load and accumulate chunks using the reduction's combine op.
             fe.fldg_1d(0, input_slot)
             for k in range(1, n_chunks):
                 fe.fldg_1d(k * 128, input_slot)
-                fe.fadd()
+                combine_fn()
             # Warp reduce + width-lane combine
-            op_desc = get_op_descriptor(node)
             op_desc.emit_fn(node)
             # Store
             fe.fstg_1d(0, output_slot)
@@ -1110,6 +1112,9 @@ class GintCompiler:
         fe_state = FrontendState([])
         token = _frontend_state.set(fe_state)
         try:
+            red_desc = get_op_descriptor(reduction_node)
+            combine_fn = red_desc.combine_fn
+
             # Phase 1: Load, apply pre-prefix ops, accumulate, warp-reduce
             if pre_prefix:
                 # Emit pre-prefix ops inside the accumulation loop: each
@@ -1129,14 +1134,13 @@ class GintCompiler:
                     if k == 0:
                         pass  # first value starts the accumulator
                     else:
-                        fe.fadd()
+                        combine_fn()
             else:
                 input_slot = tensor_map[reduction_input]
                 fe.fldg_1d(0, input_slot)
                 for k in range(1, n_chunks):
                     fe.fldg_1d(k * 128, input_slot)
-                    fe.fadd()
-            red_desc = get_op_descriptor(reduction_node)
+                    combine_fn()
             red_desc.emit_fn(reduction_node)
             # Stack now: [scalar_reduction_result]
 

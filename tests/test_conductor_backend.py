@@ -596,6 +596,190 @@ class TestConductorBackend(unittest.TestCase):
                                    atol=1e-3, rtol=1e-3)
 
 
+@requires_gpu
+class TestConductorNewOps(unittest.TestCase):
+    """Coverage for ops added in the easy-wins pass: reciprocal/atan2,
+    amax/amin/prod reductions, composed activations and clamp, composed
+    unary math, and addcmul/addcdiv/lerp."""
+
+    def setUp(self):
+        # Many small compiles in one process cross Dynamo's cache_size_limit
+        # which then flips to dynamic shapes — gint doesn't support symints.
+        # Reset between tests so each compile starts fresh.
+        torch._dynamo.reset()
+
+    def _check(self, fn, *args, atol=1e-5, rtol=1e-5):
+        # Wrap fn in a Python def so Dynamo's trace_rules don't try to special-case
+        # bare torch.* / torch.nn.functional.* references.
+        def wrapped(*a):
+            return fn(*a)
+        compiled = torch.compile(wrapped, backend="gint", options={"cuda_graphs": False})
+        torch.testing.assert_close(compiled(*args), fn(*args), atol=atol, rtol=rtol)
+
+    # --- Wired-from-existing kernel ops ---
+
+    def test_reciprocal(self):
+        x = torch.rand(1024, device='cuda') + 0.1
+        self._check(torch.reciprocal, x)
+
+    def test_atan2(self):
+        y = torch.randn(1024, device='cuda')
+        x = torch.randn(1024, device='cuda')
+        self._check(torch.atan2, y, x, atol=1e-5, rtol=1e-5)
+
+    # --- New reductions ---
+
+    def test_amax_innermost(self):
+        x = torch.randn(8, 256, device='cuda')
+        self._check(lambda t: torch.amax(t, dim=-1), x)
+
+    def test_amax_keepdim(self):
+        x = torch.randn(8, 256, device='cuda')
+        self._check(lambda t: torch.amax(t, dim=-1, keepdim=True), x)
+
+    def test_amin_innermost(self):
+        x = torch.randn(8, 256, device='cuda')
+        self._check(lambda t: torch.amin(t, dim=-1), x)
+
+    def test_prod_innermost(self):
+        x = torch.rand(8, 128, device='cuda') * 0.9 + 0.1   # avoid huge product
+        self._check(lambda t: torch.prod(t, dim=-1), x, atol=1e-3, rtol=1e-3)
+
+    def test_amax_n_not_multiple_of_128_falls_back(self):
+        # check_fn rejects n%128 != 0 — this should still work via eager fallback.
+        x = torch.randn(8, 100, device='cuda')
+        self._check(lambda t: torch.amax(t, dim=-1), x)
+
+    # --- Composed activations ---
+
+    def test_tanh(self):
+        x = torch.randn(1024, device='cuda') * 2.0
+        self._check(torch.tanh, x)
+
+    def test_sigmoid(self):
+        x = torch.randn(1024, device='cuda') * 2.0
+        self._check(torch.sigmoid, x)
+
+    def test_hardtanh(self):
+        x = torch.randn(1024, device='cuda') * 2.0
+        self._check(torch.nn.functional.hardtanh, x)
+
+    def test_relu6(self):
+        x = torch.randn(1024, device='cuda') * 4.0
+        self._check(torch.nn.functional.relu6, x)
+
+    def test_hardsigmoid(self):
+        x = torch.randn(1024, device='cuda') * 4.0
+        self._check(torch.nn.functional.hardsigmoid, x)
+
+    def test_hardswish(self):
+        x = torch.randn(1024, device='cuda') * 4.0
+        self._check(torch.nn.functional.hardswish, x)
+
+    def test_softplus(self):
+        x = torch.randn(1024, device='cuda') * 1.5
+        self._check(torch.nn.functional.softplus, x, atol=1e-4, rtol=1e-4)
+
+    def test_mish(self):
+        x = torch.randn(1024, device='cuda') * 1.5
+        self._check(torch.nn.functional.mish, x, atol=1e-4, rtol=1e-4)
+
+    def test_elu(self):
+        x = torch.randn(1024, device='cuda') * 1.5
+        self._check(torch.nn.functional.elu, x)
+
+    def test_selu(self):
+        x = torch.randn(1024, device='cuda') * 1.5
+        self._check(torch.nn.functional.selu, x, atol=1e-5, rtol=1e-5)
+
+    def test_threshold(self):
+        x = torch.randn(1024, device='cuda')
+        self._check(lambda t: torch.nn.functional.threshold(t, 0.3, -1.0), x)
+
+    def test_hardshrink(self):
+        x = torch.randn(1024, device='cuda')
+        self._check(lambda t: torch.nn.functional.hardshrink(t, 0.5), x)
+
+    # --- Pairwise min/max + clamp ---
+
+    def test_minimum(self):
+        a = torch.randn(1024, device='cuda')
+        b = torch.randn(1024, device='cuda')
+        self._check(torch.minimum, a, b)
+
+    def test_maximum(self):
+        a = torch.randn(1024, device='cuda')
+        b = torch.randn(1024, device='cuda')
+        self._check(torch.maximum, a, b)
+
+    def test_clamp_both_bounds(self):
+        x = torch.randn(1024, device='cuda') * 3.0
+        self._check(lambda t: torch.clamp(t, -1.0, 1.0), x)
+
+    def test_clamp_min_only(self):
+        x = torch.randn(1024, device='cuda') * 3.0
+        self._check(lambda t: torch.clamp(t, min=0.0), x)
+
+    def test_clamp_max_only(self):
+        x = torch.randn(1024, device='cuda') * 3.0
+        self._check(lambda t: torch.clamp(t, max=2.0), x)
+
+    # --- Composed unary math ---
+
+    def test_square(self):
+        x = torch.randn(1024, device='cuda')
+        self._check(torch.square, x)
+
+    def test_log1p(self):
+        x = torch.rand(1024, device='cuda') * 5.0
+        self._check(torch.log1p, x, atol=1e-5, rtol=1e-5)
+
+    def test_expm1(self):
+        x = torch.randn(1024, device='cuda') * 0.8
+        self._check(torch.expm1, x, atol=1e-5, rtol=1e-5)
+
+    def test_log10(self):
+        x = torch.rand(1024, device='cuda') * 10.0 + 0.1
+        self._check(torch.log10, x, atol=1e-5, rtol=1e-5)
+
+    def test_sinh_cosh(self):
+        x = torch.randn(1024, device='cuda') * 1.0
+        self._check(torch.sinh, x, atol=1e-4, rtol=1e-4)
+        self._check(torch.cosh, x, atol=1e-4, rtol=1e-4)
+
+    def test_atanh(self):
+        x = torch.rand(1024, device='cuda') * 1.6 - 0.8   # in (-1, 1)
+        self._check(torch.atanh, x, atol=1e-5, rtol=1e-5)
+
+    def test_asinh(self):
+        x = torch.randn(1024, device='cuda')
+        self._check(torch.asinh, x, atol=1e-5, rtol=1e-5)
+
+    def test_acosh(self):
+        x = torch.rand(1024, device='cuda') * 5.0 + 1.0   # >= 1
+        self._check(torch.acosh, x, atol=1e-5, rtol=1e-5)
+
+    # --- Composite scalar ops ---
+
+    def test_addcmul(self):
+        a = torch.randn(1024, device='cuda')
+        b = torch.randn(1024, device='cuda')
+        c = torch.randn(1024, device='cuda')
+        self._check(lambda x, y, z: torch.addcmul(x, y, z, value=0.5), a, b, c)
+
+    def test_addcdiv(self):
+        a = torch.randn(1024, device='cuda')
+        b = torch.randn(1024, device='cuda')
+        c = torch.rand(1024, device='cuda') + 0.1
+        self._check(lambda x, y, z: torch.addcdiv(x, y, z, value=0.5), a, b, c,
+                    atol=1e-5, rtol=1e-5)
+
+    def test_lerp_scalar(self):
+        a = torch.randn(1024, device='cuda')
+        b = torch.randn(1024, device='cuda')
+        self._check(lambda x, y: torch.lerp(x, y, 0.3), a, b)
+
+
 if __name__ == "__main__":
     if torch.cuda.is_available():
         unittest.main()
