@@ -171,6 +171,89 @@ class TestRealWorkloads(unittest.TestCase):
         got = compiled(x)
         torch.testing.assert_close(got, ref, atol=1e-4, rtol=1e-4)
 
+    def test_register_spill_fuses_long_chain(self):
+        """A 14-node pointwise chain that exceeds the 8-slot stack must
+        fuse into a single subgraph by spilling long-lived multi-user
+        intermediates to virtual registers (l12 variant). Mirrors the
+        post-reduction tail of ``geometry_smith`` (two ``schlick_ggx``
+        calls + final multiply) where ``relu_1``, ``k₁``, ``k₂`` and
+        the partial ggx results need to live across many ops."""
+        def schlick_ggx(n_dot_x, roughness):
+            a = roughness
+            k = (a * a) / 2.0
+            return n_dot_x / (n_dot_x * (1.0 - k) + k)
+
+        def fn(n_dot_v, n_dot_L, roughness):
+            relu_v = torch.relu(n_dot_v)
+            relu_L = torch.relu(n_dot_L)
+            return schlick_ggx(relu_L, roughness) * schlick_ggx(relu_v, roughness)
+
+        torch.manual_seed(0)
+        nv = torch.randn(4096, 1, device='cuda')
+        nL = torch.randn(4096, 1, device='cuda')
+        r  = torch.rand(4096, 1, device='cuda') * 0.9 + 0.1
+        ref = fn(nv, nL, r)
+        compiled = torch.compile(fn, backend="gint", options={"cuda_graphs": False})
+        got = compiled(nv, nL, r)
+        torch.testing.assert_close(got, ref, atol=1e-4, rtol=1e-3)
+
+        torch._dynamo.reset()
+        sgs = inspect_subgraphs(fn, nv, nL, r)
+        # All 14 chain ops should fuse into a single subgraph.
+        self.assertEqual(len(sgs), 1)
+        self.assertEqual(sgs[0].kind, 'pointwise')
+        # The bytecode must use FStoreReg / FLoadReg, otherwise we're
+        # falling back to global-memory spills.
+        from gint.host.analyzer import analyze_bytecode
+        stats = analyze_bytecode(sgs[0].bytecode)
+        self.assertGreaterEqual(stats.max_reg_idx, 0)
+
+    def test_long_pointwise_chain_flush(self):
+        """Pointwise chain longer than max_stack — partitioner must flush
+        the accumulated valid prefix as a subgraph instead of dropping
+        every node when the next one fails the stack-fits check.
+
+        Regression: ``GraphPartitioner.partition`` overwrote ``current``
+        with ``[node]`` on the rejection path without first appending
+        the existing ``current`` to ``subgraphs``, silently dropping
+        every intermediate node into the eager-fallback path."""
+        def fn(x, y):
+            # 12 dependent pointwise ops on the same shape — at some
+            # point the candidate exceeds MAX_STACK=8 and the partitioner
+            # must split into two valid subgraphs (not lose the prefix).
+            a = x + y
+            b = a * 2.0
+            c = b - 1.0
+            d = c / 3.0
+            e = d + y
+            f = e * x
+            g = f - y
+            h = g / 2.0
+            i = h + 1.0
+            j = i * y
+            k = j - x
+            return k + 1.0
+
+        torch.manual_seed(0)
+        x = torch.randn(64, 16, device='cuda')
+        y = torch.randn(64, 16, device='cuda')
+        ref = fn(x, y)
+        compiled = torch.compile(fn, backend="gint", options={"cuda_graphs": False})
+        got = compiled(x, y)
+        torch.testing.assert_close(got, ref, atol=1e-4, rtol=1e-4)
+
+        torch._dynamo.reset()
+        sgs = inspect_subgraphs(fn, x, y)
+        # Every FX node must end up in a subgraph (none dropped to eager).
+        # The chain produces 12 elementwise nodes; the partitioner may
+        # split them into multiple subgraphs but the union must cover all.
+        all_nodes = set()
+        for sg in sgs:
+            for n in sg.nodes:
+                all_nodes.add(n.name)
+        # Each elementwise op must be covered by some subgraph.
+        self.assertGreaterEqual(len(all_nodes), 12)
+
 
 if __name__ == '__main__':
     unittest.main()

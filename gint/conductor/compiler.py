@@ -338,6 +338,125 @@ class ForestTraverser:
 
 
 # ---------------------------------------------------------------------------
+# Register-spill planner
+# ---------------------------------------------------------------------------
+
+# Hardware budget for the l12 kernel variant: POOL_SIZE=12 slots are shared
+# between stack and registers. Stack occupies pool[0..7], reg N occupies
+# pool[POOL_SIZE-1-N]. We keep ``stack_depth + active_regs <= 11`` so there
+# is one slot of headroom for transient ``dup``/``swap`` shuffling.
+_SPILL_MAX_STACK = 8
+_SPILL_NUM_REGS  = 8
+_SPILL_POOL_LIMIT = 11
+
+
+def _plan_spills(
+    nodes: List[Node],
+    ext_io: Set[Node],
+    max_stack: int = _SPILL_MAX_STACK,
+    num_regs: int = _SPILL_NUM_REGS,
+    pool_limit: int = _SPILL_POOL_LIMIT,
+):
+    """Decide which multi-user intermediates should live in virtual registers.
+
+    Walks the schedule and assigns a virtual register to every node with
+    >1 distinct downstream user inside the subgraph (i.e. values that
+    would otherwise need a global-memory round-trip to handle the
+    "buried at depth ≥ 2" reload case in ``StackCodegen.handle_operand``).
+
+    Registers are reused across non-overlapping live ranges via a simple
+    Belady-style allocator: free registers whose owner just died, then
+    allocate the smallest free index for the new result. If the live
+    multi-user set ever exceeds ``num_regs``, the overflow nodes go back
+    to a global-tensor slot (returned in ``overflow``).
+
+    Concurrently simulates the abstract stack to verify pool feasibility:
+      - stack_peak (during op emission) ≤ max_stack
+      - on_stack_live + active_regs ≤ pool_limit (slot conflicts in the
+        pool happen otherwise — stack and registers share pool[0..11]).
+
+    Returns ``(node_to_reg, overflow, feasible)``."""
+    node_set = set(nodes)
+    node_idx = {n: i for i, n in enumerate(nodes)}
+
+    # Distinct downstream users inside the subgraph + last-use index.
+    later_user_count: Dict[Node, int] = {}
+    last_use: Dict[Node, int] = {}
+    for n in nodes:
+        users_after = [u for u in n.users
+                       if u in node_set and node_idx[u] > node_idx[n]]
+        later_user_count[n] = len(users_after)
+        if users_after:
+            last_use[n] = max(node_idx[u] for u in users_after)
+
+    # External-IO nodes with at least one in-subgraph consumer also occupy
+    # a stack slot until that last consumer (codegen does ``dup; store``
+    # so a copy stays on stack). Track them like any other live value.
+    candidate_set: Set[Node] = {
+        n for n in nodes
+        if later_user_count.get(n, 0) > 1 and n not in ext_io
+    }
+
+    free_regs = list(range(num_regs))
+    in_reg: Dict[Node, int] = {}
+    node_to_reg: Dict[Node, int] = {}
+    overflow: Set[Node] = set()
+    on_stack_live: Set[Node] = set()
+    feasible = True
+
+    for i, node in enumerate(nodes):
+        op_desc = get_op_descriptor(node)
+        arity = op_desc.arity if op_desc else 0
+        peak_extra = op_desc.peak_stack_extra if op_desc else 0
+
+        # Peak during emission: pre-existing on-stack live + freshly pushed
+        # args + op's internal peak. Conservative — every arg push counts
+        # as +1 even when the codegen could skip the dup at depth 0.
+        peak = len(on_stack_live) + arity + peak_extra
+        if peak > max_stack:
+            feasible = False
+        if peak + len(in_reg) > pool_limit:
+            feasible = False
+
+        # Free dying args (last use at this step). Args may be in regs,
+        # on the stack-live set, or both for the rare ext-IO case.
+        for arg in node.args:
+            if not isinstance(arg, Node):
+                continue
+            if last_use.get(arg, -1) != i:
+                continue
+            if arg in in_reg:
+                free_regs.append(in_reg.pop(arg))
+                free_regs.sort()
+            if arg in on_stack_live:
+                on_stack_live.discard(arg)
+
+        # Result placement.
+        has_internal_use = later_user_count.get(node, 0) > 0
+        if not has_internal_use:
+            # Stored to global (ext_io) or popped immediately. No slot.
+            pass
+        elif node in candidate_set:
+            if free_regs:
+                reg = free_regs.pop(0)
+                in_reg[node] = reg
+                node_to_reg[node] = reg
+            else:
+                overflow.add(node)
+                on_stack_live.add(node)
+        else:
+            # Single-user internal, OR ext_io with internal uses.
+            on_stack_live.add(node)
+
+        if len(on_stack_live) > max_stack:
+            feasible = False
+        if len(on_stack_live) + len(in_reg) > pool_limit:
+            feasible = False
+
+    return node_to_reg, overflow, feasible
+
+
+# ---------------------------------------------------------------------------
 # Virtual-stack code generator
 # ---------------------------------------------------------------------------
 
@@ -352,7 +471,8 @@ class StackCodegen:
 
     def __init__(self, max_stack: int, tensor_map: Dict[Node, int],
                  load_fn: Optional[Callable] = None,
-                 store_fn: Optional[Callable] = None):
+                 store_fn: Optional[Callable] = None,
+                 node_to_reg: Optional[Dict[Node, int]] = None):
         self.max_stack = max_stack
         self.tensor_map = tensor_map
         # Tile-aware load/store entry points. Default to fldg_1d/fstg_1d
@@ -375,6 +495,11 @@ class StackCodegen:
         # depth==0) from "top is the slot I just pushed for arg #i, and
         # arg #i+1 wants the same value" (must dup).
         self._current_op_pushed: Dict[Node, int] = {}
+        # Spill plan: nodes mapped here go to virtual registers instead of
+        # staying on the stack. The codegen emits ``fstore_reg(N)`` after
+        # computing such a node, and ``fload_reg(N)`` to load it as an
+        # operand.
+        self.node_to_reg: Dict[Node, int] = node_to_reg or {}
 
     def set_subgraph_nodes(self, nodes: List[Node], graph_outputs: Set[Node]):
         node_set = set(nodes)
@@ -425,11 +550,17 @@ class StackCodegen:
         self._current_op_pushed[arg] = already_claimed + 1
 
         if depth == -1:
-            # Not on virtual stack: load from global memory.
-            if arg not in self.tensor_map:
-                raise RuntimeError(f"Node {arg.name} not on stack and has no global tensor entry")
-            self.load_fn(0, self.tensor_map[arg])
-            self.vstack.append(arg)
+            # Not on virtual stack: load from register (if spilled there)
+            # or from global memory. Register loads are 1 instruction and
+            # don't go through L1/L2; preferred over a global reload.
+            if arg in self.node_to_reg:
+                fe.fload_reg(self.node_to_reg[arg])
+                self.vstack.append(arg)
+            elif arg in self.tensor_map:
+                self.load_fn(0, self.tensor_map[arg])
+                self.vstack.append(arg)
+            else:
+                raise RuntimeError(f"Node {arg.name} not on stack, not in register, and has no global tensor entry")
 
         elif depth == 0:
             # Already on top. Duplicate when:
@@ -442,7 +573,11 @@ class StackCodegen:
 
         elif depth == 1:
             # One slot below top.
-            if arg in self.tensor_map:
+            if arg in self.node_to_reg:
+                # A reg-load is cheaper than reshuffling the stack.
+                fe.fload_reg(self.node_to_reg[arg])
+                self.vstack.append(arg)
+            elif arg in self.tensor_map:
                 # Cheaper to reload from global than shuffle the stack (avoids a
                 # Swap that would displace the current top for later ops).
                 self.load_fn(0, self.tensor_map[arg])
@@ -468,8 +603,11 @@ class StackCodegen:
                     self.vstack.append(v1)   # top copy consumed by current op
 
         else:
-            # Depth >= 2: reload from global if possible, otherwise error.
-            if arg in self.tensor_map:
+            # Depth >= 2: reload from register or global if possible.
+            if arg in self.node_to_reg:
+                fe.fload_reg(self.node_to_reg[arg])
+                self.vstack.append(arg)
+            elif arg in self.tensor_map:
                 self.load_fn(0, self.tensor_map[arg])
                 self.vstack.append(arg)
             else:
@@ -509,22 +647,36 @@ class StackCodegen:
         # Push result.
         self.vstack.append(node)
 
-        # Handle result: store to global and/or keep/discard from virtual stack.
+        # Handle result: store to global, store to register, and/or keep/discard
+        # from the virtual stack. The order matters because each store consumes
+        # the top of stack; ``dup`` is used to fan out to multiple destinations.
         internal_uses = self.uses_left.get(node, 0)
         in_global     = node in self.tensor_map
+        in_reg        = node in self.node_to_reg
 
         if in_global:
-            if internal_uses > 0:
-                # Write to global AND keep on stack for future internal consumers.
-                # Dup first so the store doesn't consume our only copy.
+            # External outputs go to global. If they ALSO need a register
+            # (rare — partitioner usually reloads from global instead), we'd
+            # need a dup. ``_plan_spills`` skips tensor_map nodes so this
+            # branch shouldn't fire, but keep it explicit for safety.
+            if in_reg:
                 fe.dup()
-                self.vstack.append(node)     # virtual: result×2
-                self.store_fn(0, self.tensor_map[node])
-                self.vstack.pop()            # store pops one → result×1 remains
-            else:
-                # Last internal use (or no internal use): just store and remove.
+                self.vstack.append(node)
+                fe.fstore_reg(self.node_to_reg[node])
+                self.vstack.pop()
+            if internal_uses > 0:
+                # Keep on stack for upcoming internal consumers.
+                fe.dup()
+                self.vstack.append(node)
                 self.store_fn(0, self.tensor_map[node])
                 self.vstack.pop()
+            else:
+                self.store_fn(0, self.tensor_map[node])
+                self.vstack.pop()
+        elif in_reg:
+            # Spill to register. The store_reg pops the top of stack.
+            fe.fstore_reg(self.node_to_reg[node])
+            self.vstack.pop()
         elif internal_uses == 0:
             # Result is not needed by anyone: discard.
             fe.pop()
@@ -693,6 +845,10 @@ class GraphPartitioner:
                 current_shape = _broadcast_shapes(current_shape, shape) if current_shape else shape
                 current.append(node)
             else:
+                # Flush whatever valid subgraph we already accumulated; the
+                # rejected node forces a new one (or eager fallback).
+                if current:
+                    subgraphs.append(ForestTraverser(current).get_schedule())
                 # Check if the rejected node can start a new subgraph on its own
                 # (its globals must be broadcast-compatible with its shape).
                 solo = ForestTraverser([node]).get_schedule()
@@ -716,27 +872,45 @@ class GraphPartitioner:
             subgraphs.append(ForestTraverser(current).get_schedule())
         return subgraphs
 
-    def _required_globals(self, nodes: List[Node]) -> Set[Node]:
-        """Nodes that need a global tensor slot (external inputs/outputs + multi-use intermediates)."""
+    def _ext_io(self, nodes: List[Node]) -> Set[Node]:
+        """External IO of a subgraph: inputs from outside + values consumed
+        outside the subgraph (graph outputs or subgraph-external users).
+
+        These always need a global-tensor slot. Multi-user *internal*
+        intermediates are handled by the register-spill planner instead;
+        the planner returns an ``overflow`` set when its registers run
+        out, and the caller adds those to the global set."""
         node_set = set(nodes)
         required: Set[Node] = set()
-        for i, node in enumerate(nodes):
+        for node in nodes:
             for arg in node.args:
                 if isinstance(arg, Node) and arg not in node_set:
-                    required.add(arg)    # external input
-            is_ext_out = node in self.graph_outputs or any(u not in node_set for u in node.users)
-            later_uses = [u for u in node.users if u in nodes[i + 1:]]
-            if is_ext_out or len(later_uses) > 1:
+                    required.add(arg)
+            if node in self.graph_outputs or any(u not in node_set for u in node.users):
                 required.add(node)
         return required
 
-    def _stack_fits(self, nodes: List[Node]) -> bool:
-        """Simulate a conservative stack depth to check the subgraph fits.
+    def _required_globals(self, nodes: List[Node]) -> Set[Node]:
+        """Globals needed for a subgraph: external IO plus the spill-planner
+        overflow (multi-user intermediates that didn't fit in any register)."""
+        ext_io = self._ext_io(nodes)
+        _, overflow, _ = _plan_spills(nodes, ext_io)
+        return ext_io | overflow
 
-        We track the virtual depth (items logically on the stack) and also
-        account for the peak internal depth that custom multi-instruction ops
-        need during their emission (peak_stack_extra).
-        """
+    def _stack_fits(self, nodes: List[Node]) -> bool:
+        """Check that the schedule fits within the l12 hardware budget
+        (stack ≤ 8, stack + active_regs ≤ 11) once register spilling is
+        applied. The spill planner is strictly more permissive than the
+        old depth-only check, so feasible=True iff a legal placement
+        exists."""
+        ext_io = self._ext_io(nodes)
+        _, _, feasible = _plan_spills(nodes, ext_io)
+        return feasible
+
+    def _stack_fits_legacy(self, nodes: List[Node]) -> bool:
+        """Original depth-only feasibility (kept for reference / debugging).
+        Counts every live value as a stack slot — multi-user values are
+        treated as living on the stack via the dup+store-to-global pattern."""
         node_set = set(nodes)
         depth = 0
         uses_left: Dict[Node, int] = {}
@@ -1040,7 +1214,12 @@ class GintCompiler:
     def _compile_subgraph(
         self, nodes: List[Node], partitioner: GraphPartitioner
     ) -> GintCompiledSubgraph:
-        global_nodes = self._sorted_globals(partitioner._required_globals(nodes))
+        # Compute the spill plan first: multi-user intermediates go to
+        # virtual registers when possible, with the remaining "overflow"
+        # falling back to a global tensor slot exactly like before.
+        ext_io = partitioner._ext_io(nodes)
+        node_to_reg, overflow, _ = _plan_spills(nodes, ext_io)
+        global_nodes = self._sorted_globals(ext_io | overflow)
         tensor_map = {n: i for i, n in enumerate(global_nodes)}
 
         # Compute broadcast plan FIRST so the tile decision can drive the
@@ -1086,7 +1265,8 @@ class GintCompiler:
         token = _frontend_state.set(fe_state)
         try:
             codegen = StackCodegen(max_stack=8, tensor_map=tensor_map,
-                                   load_fn=load_fn, store_fn=store_fn)
+                                   load_fn=load_fn, store_fn=store_fn,
+                                   node_to_reg=node_to_reg)
             codegen.set_subgraph_nodes(nodes, partitioner.graph_outputs)
 
             for node in nodes:

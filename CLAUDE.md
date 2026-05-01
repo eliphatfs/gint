@@ -153,6 +153,15 @@ Supported GPU backends:
 - Outer batch dims (when len(batch_dims) > 1) stay in `batch_shape`; the innermost is pulled into block_grid. The current implementation only enables the new tile when `len(batch_dims) >= 1` (i.e. the merge couldn't fully collapse to a flat block); otherwise stays on 1d
 - Geometry-smith case: subgraph mixing `(M, 1)` and `(M, 3)` had `block_size=3, batch_dims=[M]` → 2dw with `grid=ceil(M/32)`. Wall time dropped 0.70 ms → 0.16 ms at M=1M (matches eager within 1.5×)
 
+#### Register-Spill Codegen (`_plan_spills`)
+- The l12 kernel variant has `POOL_SIZE=12` slots shared between stack (grows up from `pool[0]`) and 8 virtual registers (`reg N = pool[POOL_SIZE-1-N]`). The conductor uses up to 11 of those (`stack + active_regs ≤ 11`) to leave one slot of headroom for transient `dup`/`swap` shuffling.
+- `_plan_spills(nodes, ext_io)` walks the schedule once and assigns a virtual register to every multi-user intermediate (`>1 distinct downstream user inside the subgraph`) that isn't already an external-IO node. Register indices are reused across non-overlapping live ranges via simple liveness (free regs at last-use, allocate at result production). Returns `(node_to_reg, overflow, feasible)` — overflow is the set of multi-user nodes that didn't fit in any of the 8 registers and falls back to a global-tensor slot.
+- `GraphPartitioner._stack_fits` is a thin wrapper over `_plan_spills(...).feasible`. It is strictly more permissive than the old depth-only check because spilling a long-lived multi-user value to a register removes it from the abstract stack.
+- `GraphPartitioner._required_globals = ext_io ∪ overflow` — multi-user intermediates that fit in registers don't get a tensor slot, freeing both `max_tensors` budget and global memory traffic.
+- `StackCodegen` accepts the spill plan via `node_to_reg`. `emit_op` emits `FStoreReg<N>` after computing a spilled node (and pops the value from the virtual stack); `handle_operand` emits `FLoadReg<N>` whenever an arg is needed and isn't on the virtual stack at depth 0/1. The generic-arg, depth-1, and depth-≥2 branches all prefer a register reload over a global reload.
+- The host's `select_variant` automatically picks `l12` when the bytecode references registers (`max_reg_idx ≥ 4`); subgraphs with no spills stay on `s7`.
+- Geometry_smith post-reduction tail: 14-node pointwise chain (two `schlick_ggx` calls + final multiply) used to split into a 10-node + 4-node pair (stack overflow at op 11). With register spills, all 14 ops fuse into a single 21-instruction kernel using regs 0 and 1 for `relu_1` and `k₁`. Wall time at M=1M: 115 µs → 77 µs (eager 102 µs).
+
 #### Metadata Ops Support
 - The conductor supports shape/stride-only ops (`view`, `unsqueeze`, `squeeze`, `expand`, `permute`, `transpose`, `t`, `slice`) as **identity on the stack** — no bytecode emitted, value passes through unchanged
 - Registered as `OpKind.METADATA` in `op_registry.py` with `arity=1`, `arg_order=[0]` (only the tensor arg is pushed; shape/dim args are read from the FX node, not the stack)
