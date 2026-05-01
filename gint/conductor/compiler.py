@@ -1377,21 +1377,25 @@ class GintCompiler:
         *,
         pre_prefix: Optional[List[Node]],
         scalar_prefix: List[Node],
+        broadcast_suffix: List[Node],
         tile: dict,
     ) -> GintCompiledSubgraph:
-        """Tile-aware fused reduction with no broadcast suffix.
+        """Tile-aware fused reduction (modes '2dt' and '2dw').
 
-        Mirrors `_compile_reduction_subgraph` for small N (`tile['mode']`
-        is '2dt' or '2dw') and additionally supports:
-          - pre_prefix: pointwise ops absorbed into Phase 1 — each chunk's
-            load applies these ops before accumulating
+        Handles all three phase combinations:
+          - pre_prefix: pointwise ops absorbed into Phase 1's accumulation
           - scalar_prefix: per-thread pointwise ops on the reduced scalar
+          - broadcast_suffix: per-chunk pointwise ops mixing the scalar with
+            external (..., N)-shaped globals; each chunk emits load + ops +
+            store using the tile's block-shaped layout
 
-        Broadcast suffix isn't supported here; that path stays on the legacy
-        1d codegen below (RMSNorm-style).
+        Mode '1d' (large N) stays on the legacy `_compile_fused_reduction_subgraph`
+        codegen below — that path is structurally different (batches in
+        `batch_shape` rather than `block_grid`) and well-tested by RMSNorm.
         """
         pre_prefix = list(pre_prefix or [])
         scalar_prefix = list(scalar_prefix)
+        broadcast_suffix = list(broadcast_suffix)
 
         reduction_input = reduction_node.args[0]
         input_shape = list(partitioner._get_shape(reduction_input))
@@ -1399,41 +1403,146 @@ class GintCompiler:
         keepdim = (reduction_node.args[2] if len(reduction_node.args) > 2
                    else reduction_node.kwargs.get('keepdim', False))
 
-        output_node = scalar_prefix[-1] if scalar_prefix else reduction_node
+        if broadcast_suffix:
+            output_node = broadcast_suffix[-1]
+        elif scalar_prefix:
+            output_node = scalar_prefix[-1]
+        else:
+            output_node = reduction_node
         output_shape = list(partitioner._get_shape(output_node))
 
-        all_nodes = pre_prefix + [reduction_node] + scalar_prefix
+        all_nodes = pre_prefix + [reduction_node] + scalar_prefix + broadcast_suffix
+        node_set = set(all_nodes)
         global_nodes = self._sorted_globals(partitioner._required_globals(all_nodes))
         tensor_map = {n: i for i, n in enumerate(global_nodes)}
-        output_globals: Set[Node] = (
-            {output_node} if output_node in tensor_map else set())
 
-        in_strides = list(partitioner._get_strides(reduction_input) or
-                          _c_contiguous_strides(input_shape))
-        out_strides_full = list(partitioner._get_strides(output_node) or
-                                _c_contiguous_strides(output_shape))
+        # Phase 2 stores: broadcast_suffix nodes that have external users.
+        suffix_output_nodes: Set[Node] = {
+            n for n in broadcast_suffix
+            if n in tensor_map and (
+                n in partitioner.graph_outputs
+                or any(u not in node_set for u in n.users))
+        }
 
-        red_stride = in_strides[-1] if in_strides else 1
+        # Globals split into "scalar" (single-element-per-batch — only the
+        # reduction-only output when broadcast_suffix is empty) and "block"
+        # (full reduction-dim block per warp tile — everything else).
+        scalar_globals: Set[Node] = set()
+        if not broadcast_suffix and output_node in tensor_map:
+            scalar_globals.add(output_node)
 
-        in_batch_strides = list(in_strides[:-1]) if in_strides else []
-        if keepdim:
-            out_batch_strides = (list(out_strides_full[:-1])
-                                 if out_strides_full else [])
-        else:
-            out_batch_strides = list(out_strides_full)
-
+        # Per-tensor batch strides for the subgraph's batch axis
+        # (input_shape[:-1]). Pads with 0-strides on the left for tensors
+        # with fewer batch dims (broadcast over outer batches), and uses
+        # 0 within-shape for size-1 batch dims (broadcast within the same
+        # ndim).
         batch_shape_raw = list(input_shape[:-1])
-        merged_shape, merged_strides = _merge_dims(
-            batch_shape_raw, [in_batch_strides, out_batch_strides])
-        merged_in_bs, merged_out_bs = merged_strides
+
+        def _is_block_global(gn: Node) -> bool:
+            return gn not in scalar_globals
+
+        def _batch_strides_for(gn: Node) -> List[int]:
+            gn_shape = partitioner._get_shape(gn)
+            gn_strides = partitioner._get_strides(gn)
+            if gn_shape is None:
+                gn_shape = ()
+            gn_shape = list(gn_shape)
+            if _is_block_global(gn):
+                # Block-shaped: tensor's shape ends in the reduction dim
+                # (size N or 1 for inner-broadcast). Batch portion is the
+                # leading dims.
+                actual_shape = gn_shape[:-1] if gn_shape else []
+                if gn_strides is None:
+                    actual_strides = _c_contiguous_strides(gn_shape)[:-1] if gn_shape else []
+                else:
+                    actual_strides = list(gn_strides[:-1]) if gn_strides else []
+            else:
+                # Scalar-output: actual batch portion is full shape (no
+                # reduction dim) for keepdim=False, or shape[:-1] for
+                # keepdim=True.
+                if keepdim and gn_shape:
+                    actual_shape = gn_shape[:-1]
+                    if gn_strides is None:
+                        actual_strides = _c_contiguous_strides(gn_shape)[:-1]
+                    else:
+                        actual_strides = list(gn_strides[:-1])
+                else:
+                    actual_shape = list(gn_shape)
+                    if gn_strides is None:
+                        actual_strides = _c_contiguous_strides(gn_shape)
+                    else:
+                        actual_strides = list(gn_strides)
+            n_pad = len(batch_shape_raw) - len(actual_shape)
+            padded = [0] * max(0, n_pad)
+            # Within the tensor's existing dims, broadcast (size 1 vs
+            # subgraph dim > 1) → 0 stride.
+            for i, sz in enumerate(actual_shape):
+                out_dim = batch_shape_raw[max(0, n_pad) + i]
+                if sz == 1 and out_dim > 1:
+                    padded.append(0)
+                else:
+                    padded.append(actual_strides[i] if i < len(actual_strides) else 0)
+            return padded
+
+        per_tensor_batch_strides_full: Dict[Node, List[int]] = {
+            gn: _batch_strides_for(gn) for gn in global_nodes
+        }
+
+        def _inner_stride_for(gn: Node) -> int:
+            if gn in scalar_globals:
+                return 0  # unused (bsst has shape=1 for the scalar dim)
+            gn_shape = partitioner._get_shape(gn)
+            if gn_shape is None or len(gn_shape) == 0:
+                return 0
+            if gn_shape[-1] == 1 and N > 1:
+                return 0  # broadcast in inner
+            gn_strides = partitioner._get_strides(gn)
+            if gn_strides is not None and len(gn_strides) > 0:
+                return gn_strides[-1]
+            return 1  # C-contig fallback
+
+        per_tensor_inner_stride: Dict[Node, int] = {
+            gn: _inner_stride_for(gn) for gn in global_nodes
+        }
+
+        # Joint merge: every tensor in the subgraph must agree to merge a
+        # batch-dim pair. Tensors broadcasting outer dims (stride 0) merge
+        # with each other; the merge stops at the first dim where some
+        # tensor doesn't fit `stride[i] == stride[i+1] * shape[i+1]`.
+        all_strides_lists = [per_tensor_batch_strides_full[gn] for gn in global_nodes]
+        merged_batch_shape, merged_strides_per_tensor = _merge_dims(
+            batch_shape_raw, all_strides_lists)
+
+        if not merged_batch_shape:
+            m_inner = 1
+            outer_shape: tuple = ()
+            per_tensor_inner_batch_stride = {gn: 0 for gn in global_nodes}
+            per_tensor_outer_strides = {gn: () for gn in global_nodes}
+        else:
+            m_inner = merged_batch_shape[-1]
+            outer_shape = merged_batch_shape[:-1]
+            per_tensor_inner_batch_stride = {}
+            per_tensor_outer_strides = {}
+            for i, gn in enumerate(global_nodes):
+                ms = merged_strides_per_tensor[i]
+                per_tensor_inner_batch_stride[gn] = ms[-1] if ms else 0
+                per_tensor_outer_strides[gn] = tuple(ms[:-1]) if ms else ()
 
         B, R, mode = tile['B'], tile['R'], tile['mode']
         n_chunks = math.ceil(N / R)
 
         if mode == '2dt':
-            load_fn, store_fn = fe.fldg_2dt, fe.fstg_2dt
+            block_load_fn = fe.fldg_2dt
+            block_store_fn = fe.fstg_2dt
         else:  # '2dw'
-            load_fn, store_fn = fe.fldg_2dw, fe.fstg_2dt
+            block_load_fn = fe.fldg_2dw
+            block_store_fn = fe.fstg_2dw
+        # Scalar-output store always uses 2DT addressing — for both modes,
+        # `(t * stride_1) + (w * stride_2)` with shape_2 = 1 / stride_2 = 0
+        # masks down to a single (thread, lane) write per batch lane and
+        # the addressing is identical between fstg_2dt and fstg_2dw at
+        # operand 0. Picking 2dt for both keeps it simple.
+        scalar_store_fn = fe.fstg_2dt
 
         op_desc_red = get_op_descriptor(reduction_node)
         combine_fn = op_desc_red.combine_fn
@@ -1441,7 +1550,7 @@ class GintCompiler:
         fe_state = FrontendState([])
         token = _frontend_state.set(fe_state)
         try:
-            # Phase 1: load pre_prefix tensors, apply ops, accumulate chunks.
+            # Phase 1: load + accumulate (with optional pre_prefix ops).
             if pre_prefix:
                 for k in range(n_chunks):
                     for nd in pre_prefix:
@@ -1452,21 +1561,19 @@ class GintCompiler:
                             if isinstance(arg, (int, float)):
                                 fe.fpush(float(arg))
                             elif isinstance(arg, Node) and arg in tensor_map:
-                                load_fn(k * R, tensor_map[arg])
-                            # else: intermediate Node already on stack from
-                            # previous pre_prefix iteration's emit
+                                block_load_fn(k * R, tensor_map[arg])
+                            # else: intermediate Node already on top of stack
                         desc.emit_fn(nd)
                     if k > 0:
                         combine_fn()
             else:
                 input_slot = tensor_map[reduction_input]
-                load_fn(0, input_slot)
+                block_load_fn(0, input_slot)
                 for k in range(1, n_chunks):
-                    load_fn(k * R, input_slot)
+                    block_load_fn(k * R, input_slot)
                     combine_fn()
 
-            # Phase 2: per-tile final reduce (warp_allreduce / width-combine
-            # subset; same dispatch as standalone reduction).
+            # Phase 1 final: warp_allreduce / width-combine subset per tile.
             if tile['do_warp_reduce'] and op_desc_red.warp_reduce_fn is not None:
                 op_desc_red.warp_reduce_fn()
             if tile['do_width_combine']:
@@ -1474,7 +1581,9 @@ class GintCompiler:
             if op_desc_red.post_reduce_fn is not None:
                 op_desc_red.post_reduce_fn(reduction_node)
 
-            # Phase 1b: scalar prefix ops on the per-thread scalar.
+            # Phase 1b: scalar prefix ops on the per-thread (or per-width-lane)
+            # scalar. Pointwise ops act per-(thread, width-lane) so the
+            # scalar's distribution across the warp doesn't matter.
             for nd in scalar_prefix:
                 desc = get_op_descriptor(nd)
                 arg_order = resolve_arg_order(desc, nd)
@@ -1493,63 +1602,105 @@ class GintCompiler:
                             arg_counts[arg] -= 1
                 desc.emit_fn(nd)
 
-            if output_node in tensor_map:
-                store_fn(0, tensor_map[output_node])
+            if broadcast_suffix:
+                # Phase 2: per-chunk broadcast suffix.
+                scalar_node = scalar_prefix[-1] if scalar_prefix else reduction_node
+                for k in range(n_chunks):
+                    fe.dup()  # preserve scalar across iterations
+                    chunk_vstack: List[Optional[Node]] = [scalar_node]
+                    for nd in broadcast_suffix:
+                        desc = get_op_descriptor(nd)
+                        arg_order = resolve_arg_order(desc, nd)
+                        pushed = 0
+                        for idx in arg_order:
+                            arg = nd.args[idx]
+                            if isinstance(arg, (int, float)):
+                                fe.fpush(float(arg))
+                                chunk_vstack.append(None)
+                                pushed += 1
+                            elif isinstance(arg, Node):
+                                if arg in tensor_map:
+                                    block_load_fn(k * R, tensor_map[arg])
+                                    chunk_vstack.append(arg)
+                                    pushed += 1
+                                else:
+                                    depth = GintCompiler._vstack_depth(
+                                        chunk_vstack, arg)
+                                    if depth == -1:
+                                        raise RuntimeError(
+                                            f"Arg {arg.name} not on chunk "
+                                            f"stack for {nd.name}")
+                                    if depth == 0:
+                                        pass
+                                    elif depth == 1:
+                                        fe.swap()
+                                        top = chunk_vstack.pop()
+                                        sec = chunk_vstack.pop()
+                                        chunk_vstack.append(top)
+                                        chunk_vstack.append(sec)
+                                    else:
+                                        raise RuntimeError(
+                                            f"Arg {arg.name} buried at "
+                                            f"depth {depth} for {nd.name}")
+                                    pushed += 1
+                        desc.emit_fn(nd)
+                        for _ in range(pushed):
+                            chunk_vstack.pop()
+                        chunk_vstack.append(nd)
+
+                        if nd in suffix_output_nodes:
+                            block_store_fn(k * R, tensor_map[nd])
+                            chunk_vstack.pop()
+
+                    while chunk_vstack:
+                        fe.pop()
+                        chunk_vstack.pop()
+
+                fe.pop()  # pop the original scalar that survived all chunks
             else:
-                fe.pop()
+                if output_node in tensor_map:
+                    scalar_store_fn(0, tensor_map[output_node])
+                else:
+                    fe.pop()
             fe.halt()
             bytecode = fe_state.bc
         finally:
             _frontend_state.reset(token)
 
-        # ---- TensorInfo: same shape pattern as standalone reduction ----
-        if not merged_shape:
-            m_inner = 1
-            in_inner_stride = 1
-            out_inner_stride = 1
-            outer_shape: tuple = ()
-            outer_in_bs: tuple = ()
-            outer_out_bs: tuple = ()
-        else:
-            m_inner = merged_shape[-1]
-            in_inner_stride = merged_in_bs[-1] if merged_in_bs else 1
-            out_inner_stride = merged_out_bs[-1] if merged_out_bs else 1
-            outer_shape = merged_shape[:-1]
-            outer_in_bs = merged_in_bs[:-1] if merged_in_bs else ()
-            outer_out_bs = merged_out_bs[:-1] if merged_out_bs else ()
-
+        # ---- Build TensorInfos ----
         tensor_infos = []
         for gn in global_nodes:
-            is_output = gn in output_globals
-            bs_inner = out_inner_stride if is_output else in_inner_stride
-            bs_outer = list(outer_out_bs) if is_output else list(outer_in_bs)
+            is_scalar = gn in scalar_globals
+            bs_inner_batch = per_tensor_inner_batch_stride[gn]
+            bs_outer = list(per_tensor_outer_strides[gn])
+            red_stride_gn = per_tensor_inner_stride[gn]
 
             if mode == '2dt':
-                if not is_output:
-                    bsst1 = [N, red_stride]
-                    bsst2 = [m_inner, bs_inner]
+                if not is_scalar:
+                    bsst1 = [N, red_stride_gn]
+                    bsst2 = [m_inner, bs_inner_batch]
                 else:
                     bsst1 = [1, 0]
-                    bsst2 = [m_inner, bs_inner]
+                    bsst2 = [m_inner, bs_inner_batch]
                 grid_dim_1 = 1
                 grid_dim_2 = (m_inner + B - 1) // B
-                grid_step_1 = 32 if not is_output else 1
+                grid_step_1 = 32 if not is_scalar else 1
                 grid_step_2 = B
             else:  # '2dw'
-                if not is_output:
-                    bsst1 = [m_inner, bs_inner]
-                    bsst2 = [N, red_stride]
+                if not is_scalar:
+                    bsst1 = [m_inner, bs_inner_batch]
+                    bsst2 = [N, red_stride_gn]
                 else:
-                    bsst1 = [m_inner, bs_inner]
+                    bsst1 = [m_inner, bs_inner_batch]
                     bsst2 = [1, 0]
                 grid_dim_1 = (m_inner + B - 1) // B
                 grid_dim_2 = 1
                 grid_step_1 = B
-                grid_step_2 = 4 if not is_output else 1
+                grid_step_2 = 4 if not is_scalar else 1
 
             tensor_infos.append(ProgramTensorInfo(
                 elm_size=4,
-                batch_strides=list(bs_outer),
+                batch_strides=bs_outer,
                 batch_shape=list(outer_shape),
                 block_shape_stride_1=bsst1,
                 block_shape_stride_2=bsst2,
@@ -1594,11 +1745,12 @@ class GintCompiler:
         reduction_size = input_shape[-1]
 
         tile = _select_reduction_tiling(reduction_size)
-        if tile['mode'] != '1d' and not broadcast_suffix:
+        if tile['mode'] != '1d':
             return self._compile_fused_reduction_new_tile(
                 reduction_node, pw_schedule, partitioner,
                 pre_prefix=pre_prefix,
                 scalar_prefix=scalar_prefix,
+                broadcast_suffix=broadcast_suffix,
                 tile=tile,
             )
 
