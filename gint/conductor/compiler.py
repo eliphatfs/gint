@@ -140,6 +140,38 @@ def _select_reduction_tiling(N: int) -> dict:
                 warp_axis='width', batch_axis='thread')
 
 
+def _select_pointwise_tiling(block_size: int) -> dict:
+    """Select pointwise tile parameters based on the merged inner-block size.
+
+    Mirrors `_select_reduction_tiling` but adapted for pointwise — no warp
+    reduction, just per-tile lane packing. Same B*R=128 budget, same three
+    modes. Choice trades off two things:
+
+      - lane utilization (high = useful work per warp)
+      - memory coalescing for C-contiguous (M, K) inputs (consecutive
+        threads reading consecutive addresses)
+
+    Tier choice:
+      block_size >= 128 → (1, 128, '1d')   1 batch/warp scanning K per warp;
+                                           threads stride 1 → coalesced
+      16-127            → (4, 32,  '2dt')  4 batches × ≤32 inner per warp;
+                                           threads stride 1 in inner → coalesced
+      < 16              → (32, 4,  '2dw')  32 batches × ≤4 inner per warp;
+                                           threads stride K (small) → ~K cache
+                                           lines per width-lane, amortized over
+                                           32× fewer warps
+
+    For block_size < 128 with the existing flat 1d path, lane utilization
+    is `block_size/128`; this dispatch lifts it toward 100% (modulo non-
+    multiple-of-R remainders) at the cost of strided thread access.
+    """
+    if block_size >= 128:
+        return dict(B=1, R=128, mode='1d')
+    if block_size >= 16:
+        return dict(B=4, R=32, mode='2dt')
+    return dict(B=32, R=4, mode='2dw')
+
+
 def _compute_broadcast_plan(output_shape, tensor_shapes, tensor_strides=None):
     """Compute a broadcast plan mapping output_shape to gint block+batch decomposition.
 
@@ -318,9 +350,17 @@ class StackCodegen:
     sugar programs.
     """
 
-    def __init__(self, max_stack: int, tensor_map: Dict[Node, int]):
+    def __init__(self, max_stack: int, tensor_map: Dict[Node, int],
+                 load_fn: Optional[Callable] = None,
+                 store_fn: Optional[Callable] = None):
         self.max_stack = max_stack
         self.tensor_map = tensor_map
+        # Tile-aware load/store entry points. Default to fldg_1d/fstg_1d
+        # (the existing flat-1d path). Pointwise tile dispatch (2dt/2dw)
+        # passes the matching frontend functions; the rest of the codegen
+        # is mode-agnostic since pointwise ops act per-lane.
+        self.load_fn = load_fn or fe.fldg_1d
+        self.store_fn = store_fn or fe.fstg_1d
         # Virtual stack: list of FX nodes (or None for constants), bottom first.
         self.vstack: List[Optional[Node]] = []
         # Remaining internal uses for each node (decremented as args are consumed).
@@ -388,7 +428,7 @@ class StackCodegen:
             # Not on virtual stack: load from global memory.
             if arg not in self.tensor_map:
                 raise RuntimeError(f"Node {arg.name} not on stack and has no global tensor entry")
-            fe.fldg_1d(0, self.tensor_map[arg])
+            self.load_fn(0, self.tensor_map[arg])
             self.vstack.append(arg)
 
         elif depth == 0:
@@ -405,7 +445,7 @@ class StackCodegen:
             if arg in self.tensor_map:
                 # Cheaper to reload from global than shuffle the stack (avoids a
                 # Swap that would displace the current top for later ops).
-                fe.fldg_1d(0, self.tensor_map[arg])
+                self.load_fn(0, self.tensor_map[arg])
                 self.vstack.append(arg)
             else:
                 # Bring to top via Swap.
@@ -430,7 +470,7 @@ class StackCodegen:
         else:
             # Depth >= 2: reload from global if possible, otherwise error.
             if arg in self.tensor_map:
-                fe.fldg_1d(0, self.tensor_map[arg])
+                self.load_fn(0, self.tensor_map[arg])
                 self.vstack.append(arg)
             else:
                 raise RuntimeError(
@@ -479,11 +519,11 @@ class StackCodegen:
                 # Dup first so the store doesn't consume our only copy.
                 fe.dup()
                 self.vstack.append(node)     # virtual: result×2
-                fe.fstg_1d(0, self.tensor_map[node])
+                self.store_fn(0, self.tensor_map[node])
                 self.vstack.pop()            # store pops one → result×1 remains
             else:
                 # Last internal use (or no internal use): just store and remove.
-                fe.fstg_1d(0, self.tensor_map[node])
+                self.store_fn(0, self.tensor_map[node])
                 self.vstack.pop()
         elif internal_uses == 0:
             # Result is not needed by anyone: discard.
@@ -1003,11 +1043,50 @@ class GintCompiler:
         global_nodes = self._sorted_globals(partitioner._required_globals(nodes))
         tensor_map = {n: i for i, n in enumerate(global_nodes)}
 
+        # Compute broadcast plan FIRST so the tile decision can drive the
+        # codegen's load/store frontend choice.
+        # Use effective shapes: for slice inputs, the effective shape is the
+        # slice OUTPUT shape (the subgraph only accesses the sliced window).
+        all_shapes = [partitioner._get_shape(n) for n in global_nodes]
+        all_shapes = list(GraphPartitioner._effective_global_shapes(
+            nodes, global_nodes, all_shapes))
+        all_strides = [partitioner._get_strides(n) for n in global_nodes]
+
+        output_shape = all_shapes[0]
+        for s in all_shapes[1:]:
+            if s is not None:
+                output_shape = _broadcast_shapes(output_shape, s)
+
+        valid_shapes = [s for s in all_shapes if s is not None]
+        valid_strides = [all_strides[i] for i, s in enumerate(all_shapes) if s is not None]
+        plan = _compute_broadcast_plan(output_shape, valid_shapes, valid_strides)
+
+        # Tile dispatch: when the merge couldn't fully collapse to a flat
+        # 1D block (block_size < 128 with at least one batch dim left),
+        # switch to a multi-batch-per-warp tile so the warp's 128 lanes
+        # are used for parallel batches instead of mostly idle. Mirrors
+        # the reduction tile selector exactly.
+        block_size = plan['block_size']
+        batch_dims = list(plan['batch_dims'])
+        if block_size < 128 and len(batch_dims) >= 1:
+            tile = _select_pointwise_tiling(block_size)
+        else:
+            tile = dict(B=1, R=128, mode='1d')
+        mode = tile['mode']
+
+        if mode == '1d':
+            load_fn, store_fn = fe.fldg_1d, fe.fstg_1d
+        elif mode == '2dt':
+            load_fn, store_fn = fe.fldg_2dt, fe.fstg_2dt
+        else:  # '2dw'
+            load_fn, store_fn = fe.fldg_2dw, fe.fstg_2dw
+
         # Open a FrontendState context so all fe.* calls accumulate into fe_state.bc.
         fe_state = FrontendState([])
         token = _frontend_state.set(fe_state)
         try:
-            codegen = StackCodegen(max_stack=8, tensor_map=tensor_map)
+            codegen = StackCodegen(max_stack=8, tensor_map=tensor_map,
+                                   load_fn=load_fn, store_fn=store_fn)
             codegen.set_subgraph_nodes(nodes, partitioner.graph_outputs)
 
             for node in nodes:
@@ -1032,36 +1111,62 @@ class GintCompiler:
         finally:
             _frontend_state.reset(token)
 
-        # Compute broadcast plan for per-tensor info.
-        # Use effective shapes: for slice inputs, the effective shape is the
-        # slice OUTPUT shape (the subgraph only accesses the sliced window).
-        all_shapes = [partitioner._get_shape(n) for n in global_nodes]
-        all_shapes = list(GraphPartitioner._effective_global_shapes(
-            nodes, global_nodes, all_shapes))
-        all_strides = [partitioner._get_strides(n) for n in global_nodes]
-
-        output_shape = all_shapes[0]
-        for s in all_shapes[1:]:
-            if s is not None:
-                output_shape = _broadcast_shapes(output_shape, s)
-
-        valid_shapes = [s for s in all_shapes if s is not None]
-        valid_strides = [all_strides[i] for i, s in enumerate(all_shapes) if s is not None]
-        plan = _compute_broadcast_plan(output_shape, valid_shapes, valid_strides)
-        num_inner_blocks = plan['num_inner_blocks']
-
+        # Build per-tensor TensorInfos. Layout differs by tile mode:
+        #   1d:  block in shape_1 (thread+width flatten), batches in batch_shape
+        #   2dt: inner in shape_1 (thread), innermost batch in shape_2 (width)
+        #   2dw: innermost batch in shape_1 (thread), inner in shape_2 (width)
+        # For 2dt/2dw the innermost merged batch dim is pulled into block_grid
+        # so the kernel's `b_shape -= b_idx*step` clamp masks partial last
+        # tiles when the batch count isn't a multiple of B.
         tensor_infos = []
-        for i, node in enumerate(global_nodes):
-            entry = plan['per_tensor'][i]
-            tensor_infos.append(ProgramTensorInfo(
-                elm_size=4,
-                batch_strides=entry['batch_strides'],
-                batch_shape=list(plan['batch_dims']),
-                block_shape_stride_1=[plan['block_size'], entry['block_stride']],
-                block_shape_stride_2=[1, 0],
-                block_grid_dims=[num_inner_blocks, 1],
-                block_grid_steps=[128, 1],
-            ))
+        if mode == '1d':
+            num_inner_blocks = plan['num_inner_blocks']
+            for i, node in enumerate(global_nodes):
+                entry = plan['per_tensor'][i]
+                tensor_infos.append(ProgramTensorInfo(
+                    elm_size=4,
+                    batch_strides=entry['batch_strides'],
+                    batch_shape=batch_dims,
+                    block_shape_stride_1=[block_size, entry['block_stride']],
+                    block_shape_stride_2=[1, 0],
+                    block_grid_dims=[num_inner_blocks, 1],
+                    block_grid_steps=[128, 1],
+                ))
+            grid_dim = plan['grid_dim']
+        else:
+            B, R = tile['B'], tile['R']
+            innermost_batch = batch_dims[-1]
+            outer_batch_dims = batch_dims[:-1]
+            inner_chunks = (block_size + R - 1) // R
+            batch_tiles = (innermost_batch + B - 1) // B
+            for i, node in enumerate(global_nodes):
+                entry = plan['per_tensor'][i]
+                inner_stride = entry['block_stride']
+                bsts = list(entry['batch_strides'])
+                inner_batch_stride = bsts[-1]
+                outer_batch_strides = bsts[:-1]
+                if mode == '2dt':
+                    bsst1 = [block_size, inner_stride]
+                    bsst2 = [innermost_batch, inner_batch_stride]
+                    grid_dims = [inner_chunks, batch_tiles]
+                    grid_steps = [R, B]
+                else:  # '2dw'
+                    bsst1 = [innermost_batch, inner_batch_stride]
+                    bsst2 = [block_size, inner_stride]
+                    grid_dims = [batch_tiles, inner_chunks]
+                    grid_steps = [B, R]
+                tensor_infos.append(ProgramTensorInfo(
+                    elm_size=4,
+                    batch_strides=outer_batch_strides,
+                    batch_shape=outer_batch_dims,
+                    block_shape_stride_1=bsst1,
+                    block_shape_stride_2=bsst2,
+                    block_grid_dims=grid_dims,
+                    block_grid_steps=grid_steps,
+                ))
+            grid_dim = inner_chunks * batch_tiles
+            for d in outer_batch_dims:
+                grid_dim *= d
 
         # Compute input adjustments for slice ops: non-zero start offsets
         # require adjusting the input tensor's base pointer at runtime.
@@ -1085,7 +1190,7 @@ class GintCompiler:
 
         return GintCompiledSubgraph(bytecode, tensor_infos,
                                      output_shape=output_shape,
-                                     grid_dim=plan['grid_dim'],
+                                     grid_dim=grid_dim,
                                      input_adjustments=input_adjustments)
 
     # --- Reduction detection and compilation ---
@@ -1266,6 +1371,203 @@ class GintCompiler:
             grid_dim=grid_dim,
         )
 
+    def _compile_fused_reduction_new_tile(
+        self, reduction_node: Node, pw_schedule: List[Node],
+        partitioner: GraphPartitioner,
+        *,
+        pre_prefix: Optional[List[Node]],
+        scalar_prefix: List[Node],
+        tile: dict,
+    ) -> GintCompiledSubgraph:
+        """Tile-aware fused reduction with no broadcast suffix.
+
+        Mirrors `_compile_reduction_subgraph` for small N (`tile['mode']`
+        is '2dt' or '2dw') and additionally supports:
+          - pre_prefix: pointwise ops absorbed into Phase 1 — each chunk's
+            load applies these ops before accumulating
+          - scalar_prefix: per-thread pointwise ops on the reduced scalar
+
+        Broadcast suffix isn't supported here; that path stays on the legacy
+        1d codegen below (RMSNorm-style).
+        """
+        pre_prefix = list(pre_prefix or [])
+        scalar_prefix = list(scalar_prefix)
+
+        reduction_input = reduction_node.args[0]
+        input_shape = list(partitioner._get_shape(reduction_input))
+        N = input_shape[-1]
+        keepdim = (reduction_node.args[2] if len(reduction_node.args) > 2
+                   else reduction_node.kwargs.get('keepdim', False))
+
+        output_node = scalar_prefix[-1] if scalar_prefix else reduction_node
+        output_shape = list(partitioner._get_shape(output_node))
+
+        all_nodes = pre_prefix + [reduction_node] + scalar_prefix
+        global_nodes = self._sorted_globals(partitioner._required_globals(all_nodes))
+        tensor_map = {n: i for i, n in enumerate(global_nodes)}
+        output_globals: Set[Node] = (
+            {output_node} if output_node in tensor_map else set())
+
+        in_strides = list(partitioner._get_strides(reduction_input) or
+                          _c_contiguous_strides(input_shape))
+        out_strides_full = list(partitioner._get_strides(output_node) or
+                                _c_contiguous_strides(output_shape))
+
+        red_stride = in_strides[-1] if in_strides else 1
+
+        in_batch_strides = list(in_strides[:-1]) if in_strides else []
+        if keepdim:
+            out_batch_strides = (list(out_strides_full[:-1])
+                                 if out_strides_full else [])
+        else:
+            out_batch_strides = list(out_strides_full)
+
+        batch_shape_raw = list(input_shape[:-1])
+        merged_shape, merged_strides = _merge_dims(
+            batch_shape_raw, [in_batch_strides, out_batch_strides])
+        merged_in_bs, merged_out_bs = merged_strides
+
+        B, R, mode = tile['B'], tile['R'], tile['mode']
+        n_chunks = math.ceil(N / R)
+
+        if mode == '2dt':
+            load_fn, store_fn = fe.fldg_2dt, fe.fstg_2dt
+        else:  # '2dw'
+            load_fn, store_fn = fe.fldg_2dw, fe.fstg_2dt
+
+        op_desc_red = get_op_descriptor(reduction_node)
+        combine_fn = op_desc_red.combine_fn
+
+        fe_state = FrontendState([])
+        token = _frontend_state.set(fe_state)
+        try:
+            # Phase 1: load pre_prefix tensors, apply ops, accumulate chunks.
+            if pre_prefix:
+                for k in range(n_chunks):
+                    for nd in pre_prefix:
+                        desc = get_op_descriptor(nd)
+                        arg_order = resolve_arg_order(desc, nd)
+                        for idx in arg_order:
+                            arg = nd.args[idx]
+                            if isinstance(arg, (int, float)):
+                                fe.fpush(float(arg))
+                            elif isinstance(arg, Node) and arg in tensor_map:
+                                load_fn(k * R, tensor_map[arg])
+                            # else: intermediate Node already on stack from
+                            # previous pre_prefix iteration's emit
+                        desc.emit_fn(nd)
+                    if k > 0:
+                        combine_fn()
+            else:
+                input_slot = tensor_map[reduction_input]
+                load_fn(0, input_slot)
+                for k in range(1, n_chunks):
+                    load_fn(k * R, input_slot)
+                    combine_fn()
+
+            # Phase 2: per-tile final reduce (warp_allreduce / width-combine
+            # subset; same dispatch as standalone reduction).
+            if tile['do_warp_reduce'] and op_desc_red.warp_reduce_fn is not None:
+                op_desc_red.warp_reduce_fn()
+            if tile['do_width_combine']:
+                _emit_width_combine(combine_fn)
+            if op_desc_red.post_reduce_fn is not None:
+                op_desc_red.post_reduce_fn(reduction_node)
+
+            # Phase 1b: scalar prefix ops on the per-thread scalar.
+            for nd in scalar_prefix:
+                desc = get_op_descriptor(nd)
+                arg_order = resolve_arg_order(desc, nd)
+                arg_counts: Dict[Node, int] = {}
+                for idx in arg_order:
+                    arg = nd.args[idx]
+                    if isinstance(arg, Node):
+                        arg_counts[arg] = arg_counts.get(arg, 0) + 1
+                for idx in arg_order:
+                    arg = nd.args[idx]
+                    if isinstance(arg, (int, float)):
+                        fe.fpush(float(arg))
+                    elif isinstance(arg, Node):
+                        if arg_counts.get(arg, 0) > 1:
+                            fe.dup()
+                            arg_counts[arg] -= 1
+                desc.emit_fn(nd)
+
+            if output_node in tensor_map:
+                store_fn(0, tensor_map[output_node])
+            else:
+                fe.pop()
+            fe.halt()
+            bytecode = fe_state.bc
+        finally:
+            _frontend_state.reset(token)
+
+        # ---- TensorInfo: same shape pattern as standalone reduction ----
+        if not merged_shape:
+            m_inner = 1
+            in_inner_stride = 1
+            out_inner_stride = 1
+            outer_shape: tuple = ()
+            outer_in_bs: tuple = ()
+            outer_out_bs: tuple = ()
+        else:
+            m_inner = merged_shape[-1]
+            in_inner_stride = merged_in_bs[-1] if merged_in_bs else 1
+            out_inner_stride = merged_out_bs[-1] if merged_out_bs else 1
+            outer_shape = merged_shape[:-1]
+            outer_in_bs = merged_in_bs[:-1] if merged_in_bs else ()
+            outer_out_bs = merged_out_bs[:-1] if merged_out_bs else ()
+
+        tensor_infos = []
+        for gn in global_nodes:
+            is_output = gn in output_globals
+            bs_inner = out_inner_stride if is_output else in_inner_stride
+            bs_outer = list(outer_out_bs) if is_output else list(outer_in_bs)
+
+            if mode == '2dt':
+                if not is_output:
+                    bsst1 = [N, red_stride]
+                    bsst2 = [m_inner, bs_inner]
+                else:
+                    bsst1 = [1, 0]
+                    bsst2 = [m_inner, bs_inner]
+                grid_dim_1 = 1
+                grid_dim_2 = (m_inner + B - 1) // B
+                grid_step_1 = 32 if not is_output else 1
+                grid_step_2 = B
+            else:  # '2dw'
+                if not is_output:
+                    bsst1 = [m_inner, bs_inner]
+                    bsst2 = [N, red_stride]
+                else:
+                    bsst1 = [m_inner, bs_inner]
+                    bsst2 = [1, 0]
+                grid_dim_1 = (m_inner + B - 1) // B
+                grid_dim_2 = 1
+                grid_step_1 = B
+                grid_step_2 = 4 if not is_output else 1
+
+            tensor_infos.append(ProgramTensorInfo(
+                elm_size=4,
+                batch_strides=list(bs_outer),
+                batch_shape=list(outer_shape),
+                block_shape_stride_1=bsst1,
+                block_shape_stride_2=bsst2,
+                block_grid_dims=[grid_dim_1, grid_dim_2],
+                block_grid_steps=[grid_step_1, grid_step_2],
+            ))
+
+        grid_dim = grid_dim_1 * grid_dim_2
+        for d in outer_shape:
+            grid_dim *= d
+        grid_dim = max(1, grid_dim)
+
+        return GintCompiledSubgraph(
+            bytecode, tensor_infos,
+            output_shape=tuple(output_shape) if output_shape else (),
+            grid_dim=grid_dim,
+        )
+
     def _compile_fused_reduction_subgraph(
         self, reduction_node: Node, pw_schedule: List[Node],
         partitioner: GraphPartitioner,
@@ -1277,6 +1579,12 @@ class GintCompiler:
         Phase 1:  Load (apply pre-prefix) chunks, accumulate, warp-reduce.
         Phase 1b: Emit scalar prefix ops (consume only the scalar + constants).
         Phase 2:  For each chunk, dup scalar, emit broadcast suffix ops, store.
+
+        When the chosen reduction tile isn't '1d' and there is no broadcast
+        suffix (Phase 2 empty), we take a separate small-N path that mirrors
+        `_compile_reduction_subgraph`'s tile-aware emission with pre/scalar
+        prefix support. The legacy 1d path below handles everything else,
+        including the RMSNorm-style broadcast-suffix case.
         """
         scalar_prefix, broadcast_suffix = GintCompiler._split_pointwise_chain(
             reduction_node, pw_schedule)
@@ -1284,6 +1592,16 @@ class GintCompiler:
         reduction_input = reduction_node.args[0]
         input_shape = list(partitioner._get_shape(reduction_input))
         reduction_size = input_shape[-1]
+
+        tile = _select_reduction_tiling(reduction_size)
+        if tile['mode'] != '1d' and not broadcast_suffix:
+            return self._compile_fused_reduction_new_tile(
+                reduction_node, pw_schedule, partitioner,
+                pre_prefix=pre_prefix,
+                scalar_prefix=scalar_prefix,
+                tile=tile,
+            )
+
         n_chunks = math.ceil(reduction_size / 128)
 
         # Determine the output node: broadcast suffix if present, otherwise

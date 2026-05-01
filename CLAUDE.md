@@ -143,6 +143,16 @@ Supported GPU backends:
 - **Partitioner integration**: Shape equality check replaced with `_broadcast_shapes()` compatibility; broadcast plan feasibility is verified before accepting a node into a subgraph
 - Example: `a(32, 128) + b(128,)` → block=128, batch=[32], grid=32 warps. `b` gets `batch_strides=[0]` so each row reuses the same 128 elements
 
+#### Pointwise Tile Dispatch (small inner block)
+- When `_compute_broadcast_plan` leaves `block_size < 128` (because the partitioner joined mismatched-shape ops, e.g. `relu(M, 1) + n*L(M, 3)` where the inner-dim merge stops at the 1≠3 mismatch), the existing 1d codegen would use only `block_size/128` of each warp's lanes. `_select_pointwise_tiling(block_size)` lifts the same B*R=128 dispatch as reductions onto the pointwise path:
+  - `block_size >= 128` → 1d (existing flat path; coalesced thread-stride 1)
+  - `16 <= block_size < 128` → 2dt (B=4 batches × ≤32 inner per warp; thread-stride 1 stays coalesced)
+  - `block_size < 16` → 2dw (B=32 batches × ≤4 inner per warp; thread-stride is the small inner dim K, ~K cache lines per width-lane amortized over 32× fewer warps)
+- `StackCodegen` is parameterized with `load_fn` / `store_fn` so the same code emits `fldg_1d`/`2dt`/`2dw` and `fstg_*` per the chosen tile. Pointwise ops are width-lane independent so the codegen logic itself is mode-agnostic — only the load/store frontend differs
+- Per-tensor TensorInfo per mode: 2dt places the inner block in shape_1 (thread axis) and the innermost merged batch dim in shape_2 (width axis); 2dw swaps them. Inner chunks (`ceil(block_size / R)`) and batch tiles (`ceil(M / B)`) live in `block_grid_dims`, so partial last tiles get clamped automatically by the kernel's `b_shape - b_idx*step` masking
+- Outer batch dims (when len(batch_dims) > 1) stay in `batch_shape`; the innermost is pulled into block_grid. The current implementation only enables the new tile when `len(batch_dims) >= 1` (i.e. the merge couldn't fully collapse to a flat block); otherwise stays on 1d
+- Geometry-smith case: subgraph mixing `(M, 1)` and `(M, 3)` had `block_size=3, batch_dims=[M]` → 2dw with `grid=ceil(M/32)`. Wall time dropped 0.70 ms → 0.16 ms at M=1M (matches eager within 1.5×)
+
 #### Metadata Ops Support
 - The conductor supports shape/stride-only ops (`view`, `unsqueeze`, `squeeze`, `expand`, `permute`, `transpose`, `t`, `slice`) as **identity on the stack** — no bytecode emitted, value passes through unchanged
 - Registered as `OpKind.METADATA` in `op_registry.py` with `arity=1`, `arg_order=[0]` (only the tensor arg is pushed; shape/dim args are read from the FX node, not the stack)
@@ -160,7 +170,7 @@ Supported GPU backends:
   - `N >= 128` → (B=1, R=128, mode `1d`); threads+width flatten over reduction; final = warp_allreduce + width-combine.
   - `16 <= N < 128` → (B=4, R=32, mode `2dt`); threads scan reduction, width-lanes carry 4 batches; final = warp_allreduce only.
   - `N < 16` → (B=32, R=4, mode `2dw`); threads carry 32 batches, width-lanes scan reduction; final = width-combine only.
-  - Standalone `_compile_reduction_subgraph` uses this dispatch; the fused-reduction path still emits the (B=1, R=128) layout — see Future Work
+  - Both `_compile_reduction_subgraph` and `_compile_fused_reduction_subgraph` use this dispatch. For fused, the small-N path (mode != '1d') is gated to **no broadcast suffix**; broadcast-suffix cases (RMSNorm-style) stay on the legacy 1d codegen — see Future Work
 - **`combine_fn` / `warp_reduce_fn` / `post_reduce_fn`**: descriptor splits the reduction's emit into pieces so the compiler can call only the relevant ones per tile. `combine_fn` is the pairwise multi-chunk accumulator (fadd for sum/mean, fmul for prod, `dup2; fgt/flt; fselect` pair for amax/amin). `warp_reduce_fn` is the 1-instr `warp_allreduce_*`. `post_reduce_fn(node)` is the optional final fix-up (mean's `* 1/N`)
 - **OOB padding caveat**: kernel pads OOB lanes with `0.0`. Sum/mean tolerate this; prod (× 0), amax (max-with-0 clamps negatives), amin (min-with-0 clamps positives) do NOT. Those three are gated by `_check_reduction_feasible_clean_chunks`, which now requires `N % R == 0` for the chosen tile (was `N % 128 == 0`). E.g. N=64 with tile R=32 is now accepted; previously rejected
 - **No kernel changes required** — width-lane combining is composed from existing instructions:
@@ -183,14 +193,16 @@ Supported GPU backends:
   - Phase 1: For each chunk, load (apply pre-prefix ops), accumulate, warp_allreduce + width-lane combine → scalar on stack
   - Phase 1b: Emit scalar prefix ops on the scalar
   - Phase 2: For each chunk, `dup` scalar, load chunked globals, emit broadcast suffix ops, store output
+- **Two codegen paths**:
+  - `_compile_fused_reduction_new_tile` for small N when the broadcast suffix is empty: tile-aware Phase 1 (chunked `fldg_2dt/2dw` + pre_prefix ops + accumulate) and Phase 1b (scalar prefix on per-thread scalar) using the same B*R=128 dispatch as the standalone reduction. Geometry_smith's `(n*v).sum(-1)` (N=3, pre_prefix=[mul]) hits this path: `grid=1M → 32K`, wall time 0.70 ms → 0.16 ms at M=1M
+  - `_compile_fused_reduction_subgraph` (legacy 1d) for everything else: any `broadcast_suffix` is non-empty (RMSNorm-style), or `_select_reduction_tiling` picked mode '1d' (N≥128). Phase 2's per-chunk broadcast-suffix loads still need the matching tile-aware addressing for small-N + suffix combinations, which is the next future-work item
 - **Fusion detection**: `_can_fuse_with_reduction` (post-reduction) and `_can_fuse_pre_reduction` (pre-reduction) validate that all involved ops are ELEMENTWISE, that the reduction result has no external users, and that all external globals share the reduction dimension
 - **Deferred compilation**: Pointwise subgraphs preceding reductions are buffered rather than compiled immediately, avoiding wasted work when they are absorbed by pre-reduction fusion
 - **Stack depth**: Phase 1 peaks at ~2 extra slots (width-lane combine). Phase 2 needs scalar + 1 for input + op overhead. Total ~4-5, well within MAX_STACK=8
 - Examples: `x - mean(x)` (single binary op, existing pattern). `x * rsqrt(mean(x*x) + eps) * w` (full RMSNorm, 6 nodes fused into 1 kernel)
 
 #### Reduction Future Work
-- **Tile dispatch for fused reduction** — `_compile_fused_reduction_subgraph` still uses the legacy (B=1, R=128) layout regardless of N. Lifting `_select_reduction_tiling` into Phase 1 (and Phase 2's broadcast suffix) would help small-N cases (e.g. geometry_smith with N=3)
-- **Pointwise tile dispatch** — when the partitioner joins mismatched-shape ops (e.g. `(M, 1) + (M, K)`), `_compute_broadcast_plan`'s merge stops at the inner-dim mismatch and `block_size` collapses to K. Applying the same B*R=128 tile dispatch on the pointwise path (2dt for K in [16, 127], 2dw for K < 16) would recover lane utilization
+- **Broadcast-suffix support in tile dispatch** — `_compile_fused_reduction_new_tile` is gated to *no broadcast suffix*. Small-N + broadcast-suffix cases (hypothetical layer_norm with N<128) still fall back to legacy 1d. Phase 2's per-chunk loads of external globals would need tile-aware addressing matching the multi-batch-per-warp layout
 - **Dedicated `WarpFullReduceSum` instruction** — single opcode replacing the 7-instruction width-lane combine sequence
 - **Kernel loop instruction** — for reduction dims > ~16K without bytecode bloat
 - **Non-innermost reductions** — would require transposing the tensor or a different grid decomposition
