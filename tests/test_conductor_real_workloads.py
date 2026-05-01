@@ -171,6 +171,43 @@ class TestRealWorkloads(unittest.TestCase):
         got = compiled(x)
         torch.testing.assert_close(got, ref, atol=1e-4, rtol=1e-4)
 
+    def test_per_batch_pre_reduction_fusion(self):
+        """A per-batch op (relu of a [M,1] tensor) running alongside a
+        per-chunk reduction (`(n*L).sum(-1)`) should fuse into a SINGLE
+        kernel. The pre_prefix splits into:
+          - per_batch = [relu]  → Phase 0, runs once before chunk loop
+                                  with stride-0 inner loads / size-1 store
+          - per_chunk = [mul_1] → Phase 1, runs inside the chunk loop
+        Mirrors the geometry_smith middle subgraph that previously needed
+        two kernels (pointwise + standalone reduction)."""
+        def fn(scalar_in, n, L):
+            relu_out = torch.relu(scalar_in)
+            sum_out  = (n * L).sum(-1, keepdim=True)
+            return relu_out, sum_out
+
+        torch.manual_seed(0)
+        scalar_in = torch.randn(4096, 1, device='cuda')
+        n = torch.randn(4096, 3, device='cuda')
+        L = torch.randn(4096, 3, device='cuda')
+
+        with torch.no_grad():
+            relu_ref, sum_ref = fn(scalar_in, n, L)
+            compiled = torch.compile(fn, backend="gint",
+                                     options={"cuda_graphs": False})
+            relu_got, sum_got = compiled(scalar_in, n, L)
+        torch.testing.assert_close(relu_got, relu_ref, atol=1e-5, rtol=1e-4)
+        torch.testing.assert_close(sum_got, sum_ref, atol=1e-4, rtol=1e-4)
+
+        torch._dynamo.reset()
+        sgs = inspect_subgraphs(fn, scalar_in, n, L)
+        # Single fused-reduction subgraph covering relu + n*L + sum.
+        self.assertEqual(len(sgs), 1)
+        self.assertEqual(sgs[0].kind, 'fused-reduction')
+        node_names = [nd.name for nd in sgs[0].nodes]
+        self.assertIn('relu', node_names)
+        self.assertIn('mul', node_names)
+        self.assertIn('sum_1', node_names)
+
     def test_cse_dedups_duplicate_subexpressions(self):
         """torch.fx's CSE pass should run before partitioning, so two
         independent calls to a helper that internally computes the same

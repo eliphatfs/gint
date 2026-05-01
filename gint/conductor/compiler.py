@@ -1143,13 +1143,56 @@ class GintCompiler:
         return True
 
     @staticmethod
+    def _split_pre_prefix(pre_schedule: List[Node], reduction_input: Node) -> tuple:
+        """Split pre_schedule into (per_batch, per_chunk).
+
+        per_chunk = ancestors of reduction_input (transitive args, including
+                    reduction_input itself) inside pre_schedule. These ops
+                    are emitted inside Phase 1's chunk loop.
+        per_batch = pre_schedule \\ per_chunk. These ops are emitted ONCE
+                    before the chunk loop; they consume per-batch external
+                    globals (shape ``[..., 1]``) and produce per-batch
+                    outputs that the kernel stores via ``fstg_2dt`` writing
+                    only the size-1 axis.
+        """
+        pre_set = set(pre_schedule)
+        per_chunk: Set[Node] = {reduction_input}
+        # Iterate over reverse-topo: include any node whose result feeds a
+        # node already in per_chunk. Repeat until fixpoint.
+        changed = True
+        while changed:
+            changed = False
+            for node in pre_schedule:
+                if node in per_chunk:
+                    continue
+                for downstream in pre_schedule:
+                    if downstream not in per_chunk:
+                        continue
+                    if any(arg is node for arg in downstream.args):
+                        per_chunk.add(node)
+                        changed = True
+                        break
+        per_chunk_list = [n for n in pre_schedule if n in per_chunk]
+        per_batch_list = [n for n in pre_schedule if n not in per_chunk]
+        return per_batch_list, per_chunk_list
+
+    @staticmethod
     def _can_fuse_pre_reduction(pre_schedule: List[Node], reduction_node: Node,
                                  partitioner: GraphPartitioner) -> bool:
         """Check if a pointwise subgraph can fuse BEFORE a reduction.
 
-        The pre-prefix ops are emitted inside the Phase 1 accumulation loop:
-        each chunk is loaded, the prefix ops are applied, and the result is
-        accumulated.  This avoids storing the prefix result to global memory.
+        Pre-prefix ops split into two categories:
+          - per_chunk: ancestors of reduction_input. Emitted inside Phase 1's
+            chunk loop (each chunk → ops → accumulate). External inputs must
+            be reduction-dim-shaped.
+          - per_batch: independent of reduction (e.g. ``relu(sum_1)`` running
+            alongside a separate ``n*L → sum_2`` reduction). Emitted ONCE
+            before the chunk loop. External inputs must be per-batch-shaped
+            (size 1 in the reduction dim, broadcast across chunk lanes).
+
+        This generalizes the original "single per-chunk pre-prefix" support
+        and is what lets geometry_smith fuse `[relu, mul_1] + sum_2` into
+        one kernel.
         """
         pre_set = set(pre_schedule)
 
@@ -1168,17 +1211,21 @@ class GintCompiler:
             if user is not reduction_node:
                 return False
 
-        # 3. All external inputs to the pre-prefix must share the reduction dim.
+        per_batch, per_chunk = GintCompiler._split_pre_prefix(
+            pre_schedule, reduction_input)
+
         input_shape = partitioner._get_shape(reduction_input)
         if input_shape is None:
             return False
         reduction_size = input_shape[-1]
 
-        for node in pre_schedule:
+        # 3a. per_chunk external inputs must share the reduction dim.
+        per_chunk_set = set(per_chunk)
+        for node in per_chunk:
             for arg in node.args:
                 if not isinstance(arg, Node):
                     continue
-                if arg in pre_set:
+                if arg in per_chunk_set:
                     continue
                 shape = partitioner._get_shape(arg)
                 if shape is None:
@@ -1186,6 +1233,33 @@ class GintCompiler:
                 if len(shape) == 0:
                     continue
                 if shape[-1] != reduction_size:
+                    return False
+
+        # 3b. per_batch external inputs must have size-1 in the reduction
+        # dim (per-batch values, broadcast across chunk lanes).
+        per_batch_set = set(per_batch)
+        for node in per_batch:
+            for arg in node.args:
+                if not isinstance(arg, Node):
+                    continue
+                if arg in per_batch_set:
+                    continue
+                shape = partitioner._get_shape(arg)
+                if shape is None:
+                    return False
+                if len(shape) == 0:
+                    continue
+                if shape[-1] != 1:
+                    return False
+
+        # 3c. per_batch nodes must NOT feed per_chunk or anything downstream
+        # of the reduction (their outputs are external-only). The current
+        # split places ancestors of reduction_input into per_chunk, so this
+        # is automatically true for direct consumers; double-check that
+        # transitive feeds are also caught.
+        for node in per_batch:
+            for user in node.users:
+                if user in per_chunk_set or user is reduction_node:
                     return False
 
         return True
@@ -1595,6 +1669,13 @@ class GintCompiler:
         keepdim = (reduction_node.args[2] if len(reduction_node.args) > 2
                    else reduction_node.kwargs.get('keepdim', False))
 
+        # Split pre_prefix into per-batch (runs once before the chunk loop)
+        # and per-chunk (runs inside the chunk loop). The split is feasible
+        # whenever ``_can_fuse_pre_reduction`` accepted the schedule; here
+        # we just compute it.
+        per_batch_pre, per_chunk_pre = GintCompiler._split_pre_prefix(
+            pre_prefix, reduction_input)
+
         if broadcast_suffix:
             output_node = broadcast_suffix[-1]
         elif scalar_prefix:
@@ -1616,12 +1697,26 @@ class GintCompiler:
                 or any(u not in node_set for u in n.users))
         }
 
-        # Globals split into "scalar" (single-element-per-batch — only the
-        # reduction-only output when broadcast_suffix is empty) and "block"
+        # Globals split into "scalar" (single-element-per-batch — written
+        # only along the size-1 axis of the tile via fstg_2dt) and "block"
         # (full reduction-dim block per warp tile — everything else).
+        # Members of the "scalar" set:
+        #   - reduction-only output (when broadcast_suffix is empty)
+        #   - per_batch_pre external inputs (shape [..., 1] — broadcast
+        #     across chunk lanes; loaded once via block_load_fn(0, slot))
+        #   - per_batch_pre external outputs (shape [..., 1] — written
+        #     once via fstg_2dt with a size-1 inner axis)
         scalar_globals: Set[Node] = set()
         if not broadcast_suffix and output_node in tensor_map:
             scalar_globals.add(output_node)
+        per_batch_pre_set = set(per_batch_pre)
+        for nd in per_batch_pre:
+            for arg in nd.args:
+                if isinstance(arg, Node) and arg in tensor_map and arg not in per_batch_pre_set:
+                    scalar_globals.add(arg)
+            if nd in tensor_map:
+                # External output of a per_batch_pre op.
+                scalar_globals.add(nd)
 
         # Per-tensor batch strides for the subgraph's batch axis
         # (input_shape[:-1]). Pads with 0-strides on the left for tensors
@@ -1742,10 +1837,44 @@ class GintCompiler:
         fe_state = FrontendState([])
         token = _frontend_state.set(fe_state)
         try:
-            # Phase 1: load + accumulate (with optional pre_prefix ops).
-            if pre_prefix:
+            # Phase 0: per_batch_pre (runs once before the chunk loop).
+            # Loads per-batch globals via block_load_fn(0, slot) — for
+            # [..., 1]-shaped inputs the inner stride is 0 so all chunk
+            # lanes get the same value. Each op runs on every (thread,
+            # width-lane) of the warp; results are redundant but the
+            # final fstg_2dt only writes the size-1 axis (one slot per
+            # batch), so memory writes are correct without a mask.
+            for nd in per_batch_pre:
+                desc = get_op_descriptor(nd)
+                arg_order = resolve_arg_order(desc, nd)
+                arg_counts: Dict[Node, int] = {}
+                for idx in arg_order:
+                    arg = nd.args[idx]
+                    if isinstance(arg, Node):
+                        arg_counts[arg] = arg_counts.get(arg, 0) + 1
+                for idx in arg_order:
+                    arg = nd.args[idx]
+                    if isinstance(arg, (int, float)):
+                        fe.fpush(float(arg))
+                    elif isinstance(arg, Node):
+                        if arg in tensor_map and arg in scalar_globals:
+                            block_load_fn(0, tensor_map[arg])
+                        else:
+                            # Intermediate within per_batch_pre — already
+                            # on top of stack. Dup if more uses follow.
+                            if arg_counts.get(arg, 0) > 1:
+                                fe.dup()
+                                arg_counts[arg] -= 1
+                desc.emit_fn(nd)
+                if nd in tensor_map:
+                    # External output — stored once per batch via the
+                    # size-1-axis fstg_2dt path used by scalar globals.
+                    scalar_store_fn(0, tensor_map[nd])
+
+            # Phase 1: load + accumulate (with optional per-chunk pre ops).
+            if per_chunk_pre:
                 for k in range(n_chunks):
-                    for nd in pre_prefix:
+                    for nd in per_chunk_pre:
                         desc = get_op_descriptor(nd)
                         arg_order = resolve_arg_order(desc, nd)
                         for idx in arg_order:
