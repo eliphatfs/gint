@@ -624,6 +624,47 @@ class StackCodegen:
 
     # --- Operation emission ---
 
+    def try_skip_commutative_args(self, node: Node, op_desc: OpDescriptor) -> bool:
+        """Fast path for arity-2 commutative ops (e.g. ``a*b``).
+
+        When both args are already on the virtual stack at depths 0 and 1
+        (in either order, both at last-use, neither in tensor_map / regs),
+        the op's result doesn't depend on which is on top. Skipping the
+        Swap that ``handle_operand`` would emit avoids the Swap-pair waste
+        seen e.g. in geometry_smith's ``mul_6 = div_3 * div_1`` (declared
+        arg order ``[div_1, div_3]``, stack happens to have div_3 on top
+        from the just-completed FRDiv).
+
+        Returns True if the args were "consumed in place" (caller should
+        skip ``handle_operand`` and call ``emit_op`` with num_pushed=2).
+        """
+        if not op_desc.commutative or op_desc.arity != 2:
+            return False
+        arg_indices = resolve_arg_order(op_desc, node)
+        if len(arg_indices) != 2:
+            return False
+        a = node.args[arg_indices[0]]
+        b = node.args[arg_indices[1]]
+        if not isinstance(a, Node) or not isinstance(b, Node):
+            return False
+        # Different nodes — needs distinct stack slots. (mul(x, x) handled
+        # by the normal dup-at-depth-0 path.)
+        if a is b:
+            return False
+        da = self._depth(a)
+        db = self._depth(b)
+        if {da, db} != {0, 1}:
+            return False
+        # Both args must be at last use (the dup-for-future-use path is
+        # the same whether or not we swap, but the "no action" branch in
+        # handle_operand only fires at last-use, and we want to mirror it).
+        if self.uses_left.get(a, 0) != 1 or self.uses_left.get(b, 0) != 1:
+            return False
+        # Mark both as consumed; the op will pop them via emit_op.
+        self.uses_left[a] = 0
+        self.uses_left[b] = 0
+        return True
+
     def emit_op(self, node: Node, op_desc: OpDescriptor, num_pushed: Optional[int] = None):
         """
         Emit the operation, update the virtual stack (pop inputs, push result),
@@ -1359,6 +1400,13 @@ class GintCompiler:
                 op_desc = get_op_descriptor(node)
                 if op_desc is None:
                     raise RuntimeError(f"Unsupported op reached compiler: {node.target}")
+
+                # Commutative fast path: if both args are already on the
+                # virtual stack at depths 0/1 in either order, skip the
+                # Swap that the normal arg-loading path would emit.
+                if codegen.try_skip_commutative_args(node, op_desc):
+                    codegen.emit_op(node, op_desc, num_pushed=2)
+                    continue
 
                 # Handle operands in the prescribed arg order.
                 arg_indices = resolve_arg_order(op_desc, node)

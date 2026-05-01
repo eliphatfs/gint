@@ -171,6 +171,46 @@ class TestRealWorkloads(unittest.TestCase):
         got = compiled(x)
         torch.testing.assert_close(got, ref, atol=1e-4, rtol=1e-4)
 
+    def test_commutative_swap_elision(self):
+        """When a commutative arity-2 op (e.g. ``mul``) is consumed at the
+        end of a chain whose stack already has the args in reverse of the
+        FX-declared order, the codegen should NOT emit a Swap pair just to
+        match the declared order. Mirrors geometry_smith's ``mul_6 = div_1
+        * div_3`` where ``div_3`` ends up on top of stack from the just-
+        completed FRDiv: with the commutative flag, no Swap is needed."""
+        def fn(a, b, c, d):
+            # FX schedules the chain so a/b lands on top before the final
+            # mul whose declared order is (a/b, c+d) — without the
+            # commutative flag the codegen would emit Swap;Swap to bring
+            # (a/b) below (c+d).
+            x = a / b
+            y = c + d
+            return y * x   # decompose in this order so y appears second
+
+        torch.manual_seed(0)
+        a = torch.randn(1024, device='cuda') + 1.0
+        b = torch.randn(1024, device='cuda') + 1.0
+        c = torch.randn(1024, device='cuda')
+        d = torch.randn(1024, device='cuda')
+
+        ref = fn(a, b, c, d)
+        compiled = torch.compile(fn, backend="gint", options={"cuda_graphs": False})
+        got = compiled(a, b, c, d)
+        torch.testing.assert_close(got, ref, atol=1e-5, rtol=1e-5)
+
+        torch._dynamo.reset()
+        sgs = inspect_subgraphs(fn, a, b, c, d)
+        # Bytecode should NOT contain two consecutive Swap instructions.
+        from gint.kernel.interpreter.main import INSNS
+        SWAP_OPCODE = next(opc for cls, opc in INSNS.items()
+                           if cls.__name__ == 'Swap')
+        for sg in sgs:
+            ops = [pair[0] for pair in sg.bytecode]
+            for i in range(len(ops) - 1):
+                self.assertFalse(
+                    ops[i] == SWAP_OPCODE and ops[i+1] == SWAP_OPCODE,
+                    f"Found Swap;Swap pair at insn {i} in subgraph {sg.kind}")
+
     def test_per_batch_pre_reduction_fusion(self):
         """A per-batch op (relu of a [M,1] tensor) running alongside a
         per-chunk reduction (`(n*L).sum(-1)`) should fuse into a SINGLE

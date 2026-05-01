@@ -53,6 +53,12 @@ class OpDescriptor:
     # warp/width reduction (e.g. mean's `* 1/N`). Takes the FX node so it
     # can read shape-dependent constants. None = no post step.
     post_reduce_fn:   Optional[Callable]  = None
+    # When True, the op's result is invariant under arg permutation
+    # (e.g. ``a*b == b*a``).  Lets ``StackCodegen`` skip Swap-pair work
+    # when the FX-declared arg order would force a stack reshuffle that
+    # the op doesn't actually need.  Only meaningful for arity==2 ops
+    # whose emit_fn is symmetric in its stack inputs.
+    commutative:      bool                = False
 
 
 # ---------------------------------------------------------------------------
@@ -747,10 +753,10 @@ OP_REGISTRY: dict = {
     # would-be fpush so codegen stays consistent.
     torch.ops.aten.add.Tensor:
         OpDescriptor(2, OpKind.ELEMENTWISE, _emit_add_tensor,
-                     arg_order=_arg_order_scalar_fold),
+                     arg_order=_arg_order_scalar_fold, commutative=True),
     torch.ops.aten.mul.Tensor:
         OpDescriptor(2, OpKind.ELEMENTWISE, _emit_mul_binary,
-                     arg_order=_arg_order_scalar_fold),
+                     arg_order=_arg_order_scalar_fold, commutative=True),
     torch.ops.aten.sub.Tensor:
         OpDescriptor(2, OpKind.ELEMENTWISE, _emit_sub_tensor,
                      arg_order=_arg_order_scalar_fold),
@@ -787,8 +793,10 @@ OP_REGISTRY: dict = {
     torch.ops.aten.lt.Tensor:  _ew2(fe.flt, arg_order=[1, 0]),
     torch.ops.aten.ge.Tensor:  _ew2(fe.fge, arg_order=[1, 0]),
     torch.ops.aten.le.Tensor:  _ew2(fe.fle, arg_order=[1, 0]),
-    torch.ops.aten.eq.Tensor:  _ew2(fe.feq),   # symmetric
-    torch.ops.aten.ne.Tensor:  _ew2(fe.fne),   # symmetric
+    torch.ops.aten.eq.Tensor:  OpDescriptor(2, OpKind.ELEMENTWISE,
+                                            lambda _n: fe.feq(), commutative=True),
+    torch.ops.aten.ne.Tensor:  OpDescriptor(2, OpKind.ELEMENTWISE,
+                                            lambda _n: fe.fne(), commutative=True),
 
     # Scalar variants: aten.gt.Scalar(self, scalar) = self > scalar.
     # Natural push [self, scalar]: self at second, scalar at top.
@@ -892,9 +900,11 @@ OP_REGISTRY: dict = {
     # --- Pairwise min/max + clamping ---
     # max(a,b)/min(a,b) via dup2; fgt/flt; fselect (3 insns each).
     torch.ops.aten.maximum.default:
-        OpDescriptor(2, OpKind.ELEMENTWISE, _emit_maximum, peak_stack_extra=2),
+        OpDescriptor(2, OpKind.ELEMENTWISE, _emit_maximum,
+                     peak_stack_extra=2, commutative=True),
     torch.ops.aten.minimum.default:
-        OpDescriptor(2, OpKind.ELEMENTWISE, _emit_minimum, peak_stack_extra=2),
+        OpDescriptor(2, OpKind.ELEMENTWISE, _emit_minimum,
+                     peak_stack_extra=2, commutative=True),
     # Tensor-tensor clamp_min/max share the maximum/minimum sequence.
     torch.ops.aten.clamp_min.Tensor:
         OpDescriptor(2, OpKind.ELEMENTWISE, _emit_clamp_min_scalar, peak_stack_extra=2),

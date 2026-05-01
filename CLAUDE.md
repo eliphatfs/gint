@@ -153,6 +153,12 @@ Supported GPU backends:
 - Outer batch dims (when len(batch_dims) > 1) stay in `batch_shape`; the innermost is pulled into block_grid. The current implementation only enables the new tile when `len(batch_dims) >= 1` (i.e. the merge couldn't fully collapse to a flat block); otherwise stays on 1d
 - Geometry-smith case: subgraph mixing `(M, 1)` and `(M, 3)` had `block_size=3, batch_dims=[M]` → 2dw with `grid=ceil(M/32)`. Wall time dropped 0.70 ms → 0.16 ms at M=1M (matches eager within 1.5×)
 
+#### Commutative-Op Swap Elision
+- `OpDescriptor.commutative` flags arity-2 ops whose result is invariant under arg order (`a*b == b*a`): `add.Tensor`, `mul.Tensor`, `eq.Tensor`, `ne.Tensor`, `maximum.default`, `minimum.default`.
+- `StackCodegen.try_skip_commutative_args(node, op_desc)` runs before normal arg processing in `_compile_subgraph`. When both args are already on the virtual stack at depths 0 and 1 (in either order, last-use, neither in tensor_map / regs), it consumes them in place and skips the Swap that the depth-1 path would emit. The op then runs on whichever order the stack has — same result.
+- Why it matters: e.g. geometry_smith's final `mul_6 = mul.Tensor(div_1, div_3)`. After computing `div_3` from FRDiv, the stack has `[..., div_1, div_3]`. The declared arg order `[0, 1]` would force pushing `div_1` first (Swap), then `div_3` (Swap again — the second Swap was just to undo the first). With the flag, both Swaps disappear. K#2 dropped from 36 → 34 instructions.
+- Steady-state wall time barely moves (kernels are bandwidth-bound, not insn-bound), but the bytecode is tighter and the analyzer's `max_stack` may now allow `s7` for borderline subgraphs.
+
 #### CSE Pre-Pass
 - `GintCompiler.compile` runs `torch.fx.passes.dialect.common.cse_pass.CSEPass` on the AOT graph before partitioning. The pass is hash-based local value numbering on `(target, hash(args, kwargs))` with a banlist (random / in-place ops) supplied via `get_CSE_banned_ops()`. It returns a fresh `GraphModule` with node metadata preserved.
 - Why: AOT decomposition often emits duplicates that FX's own tracing didn't catch. Geometry_smith's two `schlick_ggx(_, roughness)` calls each materialize their own `r*r`, `/2`, `1-k` — CSE collapses the duplicates so the partitioner / register planner sees a single canonical copy. Cuts the post-reduction tail from 14 nodes (21 insns) to 11 nodes (18 insns).
