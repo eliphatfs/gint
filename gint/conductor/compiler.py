@@ -1145,8 +1145,28 @@ class GintCompiler:
             pending_pws.clear()
             return last
 
+        def _is_metadata_only(schedule: List[Node]) -> bool:
+            """A subgraph that consists entirely of metadata ops (view,
+            unsqueeze, permute, ...) does no real work — its kernel
+            would be a pure load+store. Eager handles metadata for free
+            (zero kernels), so we skip the partition entirely and let
+            ``_run_eager`` produce the same view tensors. Heavy callers
+            like ``_sample2d_internal`` and ``_interpolate_impl`` each
+            had one such isolated 1-node subgraph after the partition's
+            shape-aware split."""
+            for node in schedule:
+                desc = get_op_descriptor(node)
+                if desc is None or desc.kind != OpKind.METADATA:
+                    return False
+            return True
+
         while i < len(raw_schedules):
             schedule = raw_schedules[i]
+            if _is_metadata_only(schedule):
+                # Drop the schedule entirely; nodes route through
+                # _run_eager when execute() walks the graph.
+                i += 1
+                continue
             if self._is_reduction_subgraph(schedule):
                 reduction_node = schedule[0]
                 keepdim = (reduction_node.args[2]
