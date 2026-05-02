@@ -13,6 +13,16 @@ from ..host.executor import TensorInterface, get_executor
 from .compiler import GintCompiler
 
 
+def _has_symint_shape(t) -> bool:
+    """True if *t* is a tensor with at least one SymInt-typed dim."""
+    if not isinstance(t, torch.Tensor):
+        return False
+    for d in t.shape:
+        if isinstance(d, torch.SymInt):
+            return True
+    return False
+
+
 def _resolve_options(kwargs, defaults):
     """Merge torch.compile ``mode`` and ``options`` into *defaults*.
 
@@ -49,6 +59,24 @@ def _make_gint_backend(cuda_graphs: bool, num_warmup_iters: int) -> Callable:
             kwargs, (cuda_graphs, num_warmup_iters))
 
         def compiler_fn(gm: GraphModule, example_inputs: List[torch.Tensor]):
+            # Fail fast on SymInt-shaped inputs. Dynamo's automatic
+            # dynamic-shape promotion is disabled at registration time
+            # (see ``register_backend``), so this only fires when the
+            # user explicitly opts in via ``dynamic=True`` or exceeds
+            # ``cache_size_limit``. SymInts here would propagate into
+            # ``ProgramTensorInfo`` / ``grid_dim`` / output allocation
+            # which all need concrete ints.
+            if any(_has_symint_shape(t) for t in example_inputs):
+                raise RuntimeError(
+                    "gint backend received SymInt-shaped inputs (dynamic "
+                    "shapes), which it does not support. Use "
+                    "``gint.conductor.compile(fn)`` (drop-in for "
+                    "``torch.compile``; scopes dynamo's "
+                    "automatic_dynamic_shapes=False patch to the wrapped "
+                    "call only), or pass ``dynamic=False`` to "
+                    "``torch.compile``, or call "
+                    "``torch._dynamo.mark_static(t, dim)`` on the dynamic dim."
+                )
             compiler = GintCompiler(gm, example_inputs)
             return compiler.compile()
 
@@ -80,6 +108,52 @@ def _make_gint_backend(cuda_graphs: bool, num_warmup_iters: int) -> Callable:
             return compiled
 
     return gint_backend_fn
+
+
+def compile(fn=None, *, backend: str = "gint", **kwargs) -> Callable:
+    """``torch.compile`` drop-in that scopes dynamo to gint's static-shape model.
+
+    gint bakes shapes/strides/grid_dim into per-shape bytecode, so it can't
+    compile FX graphs with SymInt-shaped FakeTensors. Dynamo's
+    ``automatic_dynamic_shapes`` would normally promote a dim to dynamic on
+    the second recompile, breaking us. This wrapper applies
+    ``torch._dynamo.config.patch(automatic_dynamic_shapes=False,
+    assume_static_by_default=True)`` only while the wrapped callable is
+    executing — so dynamo's tracing (which happens inside the call) sees
+    the patched config, but other backends in the same process keep their
+    original config.
+
+    Use this instead of ``torch.compile(backend="gint")`` when you want
+    per-shape recompilation without flipping global dynamo config::
+
+        from gint.conductor import compile as gint_compile
+
+        @gint_compile
+        def fn(a, b):
+            return a + b
+
+    Pass ``backend=gint_backend(...)`` (or any other gint backend name) to
+    customise CUDA-graph behavior::
+
+        @gint_compile(backend=gint_backend(cuda_graphs=False))
+        def fn(a, b): ...
+    """
+    import functools
+
+    if fn is None:
+        return functools.partial(compile, backend=backend, **kwargs)
+
+    base = torch.compile(fn, backend=backend, **kwargs)
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kw):
+        with torch._dynamo.config.patch(
+            automatic_dynamic_shapes=False,
+            assume_static_by_default=True,
+        ):
+            return base(*args, **kw)
+
+    return wrapper
 
 
 def gint_backend(*, cuda_graphs: bool = True, num_warmup_iters: int = 1) -> Callable:

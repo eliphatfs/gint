@@ -21,6 +21,26 @@ Supported op surface (full list in `op_registry.py`; unsupported ops fall back t
 
 Partitioner constraints per subgraph: max 8 global tensor slots, max stack depth 8, broadcast-compatible shapes.
 
+## Static-Shape Constraint
+
+- gint generates per-shape bytecode: the broadcast plan, tile mode, batch strides, and `grid_dim` are all baked at compile time. SymInt-shaped FakeTensors can't be packed into `ProgramTensorInfo` (the executor's `HTensorInfo` struct needs concrete ints) and would crash at runtime when allocating output tensors.
+- **Recommended entry point: `gint.conductor.compile`** — drop-in for `torch.compile` that wraps the call site with `torch._dynamo.config.patch(automatic_dynamic_shapes=False, assume_static_by_default=True)`. The patch is active only while the wrapped callable is executing, so dynamo's tracing (which fires inside that call) sees the patched config — no global side effect on other backends in the same process. Backend-internal patching doesn't work because dynamo's trace decision happens *before* it dispatches to our backend; the patch must live around the user-call site.
+- After `cache_size_limit` (default 8) per-shape compiles, dynamo logs a warning and falls back to eager. Users with many shape variants can bump `torch._dynamo.config.cache_size_limit` before the first compile.
+- Defensive guard inside `compiler_fn`: if SymInt-shaped tensors still slip through (e.g. user passed `dynamic=True` to `torch.compile`, or used `torch.compile(backend="gint")` directly without the wrapper), raise a `RuntimeError` pointing at the remediation (use `gint.conductor.compile`, pass `dynamic=False`, or `mark_static`). Better to fail loudly than silently emit a kernel for the wrong shape.
+
+```python
+from gint.conductor import compile as gint_compile
+
+@gint_compile
+def fn(a, b):
+    return a + b
+
+# or with options
+@gint_compile(options={"cuda_graphs": False})
+def fn2(a, b):
+    return torch.bmm(a, b) + 1.0
+```
+
 ## Backend Registration
 
 - `import gint.conductor` auto-registers two backends (only runs when torch is importable, since `gint.conductor` itself depends on torch):
@@ -145,6 +165,20 @@ Geometry-smith case: `(M, 1)` and `(M, 3)` had `block_size=3, batch_dims=[M]` �
 - **Deferred compilation**: pointwise subgraphs preceding reductions are buffered rather than compiled immediately, avoiding wasted work when they are absorbed by pre-reduction fusion.
 - **Stack depth**: Phase 1 peaks at ~2 extra slots (width-lane combine). Phase 2 needs scalar + 1 for input + op overhead. Total ~4-5, well within MAX_STACK=8.
 - Examples: `x - mean(x)` (single binary op, existing pattern). `x * rsqrt(mean(x*x) + eps) * w` (full RMSNorm, 6 nodes fused into 1 kernel).
+
+## Small-Matrix BMM / Inverse Rewrite
+
+- `gint/conductor/special_ops.py` runs a pre-partition FX rewrite that targets two patterns from `torch.compile`'s AOT graph:
+  - `aten.bmm.default(a, b)` where both args have trailing dims `(N, N)` with N ≤ 4 (and N matches across a / b).
+  - `operator.getitem(aten.linalg_inv_ex.default(a), 0)` (the `linalg.inv` decomposition) where `a` has trailing dims `(N, N)` with N ≤ 4. The dead `linalg_inv_ex` node is erased after the rewrite.
+- Both patterns are replaced with calls to Python wrappers in `gint/host/matrix.py` (`gint_bmm`, `gint_inv`). The wrappers' targets aren't in `OP_REGISTRY`, so the partitioner skips them — they run via `_run_eager`, which calls our wrapper, which dispatches to a `SugarProgram`. This avoids touching the partitioner / pointwise codegen logic.
+- Kernel sharing: only the 4×4 BMM and INV kernels exist (mirrors of `tests/test_bmm4x4.py` / `tests/test_inv4x4.py`). Smaller N is handled by padding before launch:
+  - BMM: pad A and B with zeros into the bottom rows/columns of a 4×4 buffer. Zero rows/columns contribute nothing to A·B, so the top-left N×N of the 4×4 product is `a @ b`. Sliced back at the end.
+  - INV: pad with the identity block — `diag(A, I_{4-N})`. The padded matrix is block-diagonal, so its inverse is `diag(inv(A), I_{4-N})`; the top-left N×N is `inv(A)`. Sliced back at the end.
+  - N == 1: skipped — `gint_bmm` returns `a * b`, `gint_inv` returns `a.reciprocal()`. No kernel launch.
+- Surrounding pointwise ops still fuse through gint codegen normally — only the bmm/inv node itself is on the eager-fallback path. Verified by `tests/test_conductor_bmm_inv.py::test_subgraphs_post_rewrite`: the trailing `+ 1.0` after a bmm becomes a separate single-node pointwise gint subgraph.
+- Padding allocates fresh tensors on each call (PyTorch's caching allocator handles this under cuda-graph capture). For N=2 this is 4× compute waste; acceptable given the launch-overhead amortization (small bmm/inv are launch-bound).
+- N > 4 is not rewritten and falls through to torch.bmm / torch.linalg.inv eager. Non-square matrices and non-matching `(N, M, K)` BMM also skip the rewrite.
 
 ## Reduction Future Work
 

@@ -35,6 +35,7 @@ from .op_registry import (
     OpDescriptor, OpKind, get_op_descriptor, resolve_arg_order,
     _emit_width_combine,
 )
+from .special_ops import apply_special_op_rewrites
 
 
 # ---------------------------------------------------------------------------
@@ -989,6 +990,12 @@ class GintCompiler:
         self.example_inputs = example_inputs
 
     def compile(self) -> Callable:
+        # Replace small bmm / linalg_inv patterns with calls to gint's
+        # specialized matrix kernels. These rewritten nodes live on the
+        # eager fallback path (their target is a Python wrapper that
+        # invokes a SugarProgram), so the partitioner ignores them.
+        self.gm = apply_special_op_rewrites(self.gm)
+
         # Run torch.fx's CSE pass first. AOT autograd hands us decomposed
         # graphs in which two ``schlick_ggx(_, roughness)`` calls each emit
         # their own ``roughness * roughness`` / ``mul / 2`` / ``1 - k`` —

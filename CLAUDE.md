@@ -55,10 +55,11 @@ The fatbin/HSACO ships **two kernel variants** under symbols `geval_s7` and `gev
 - `gint/host/analyzer.py`: static analyzer over recorded bytecode — `analyze_bytecode(bc)` returns `BytecodeStats` (peak stack depth, registers used, min pool size). Torch-free; useful for variant selection. Re-exported as `gint.analyze_bytecode`.
 
 ### Torch.Compile Integration (Conductor)
-- `gint/conductor/backend.py`: backend registration (`"gint"` default with CUDA graphs, `"gint-no-cuda-graph"` legacy alias).
+- `gint/conductor/backend.py`: backend registration (`"gint"` default with CUDA graphs, `"gint-no-cuda-graph"` legacy alias). Also exposes `gint.conductor.compile` — a `torch.compile` drop-in that scopes `automatic_dynamic_shapes=False` to the wrapped call (no global config flip; required because gint compiles per-shape and can't accept SymInt FakeTensors).
 - `gint/conductor/compiler.py`: FX graph → bytecode conversion, graph partitioning, broadcasting.
 - `gint/conductor/debug.py`: `inspect_subgraphs(fn, *args)` + `print_subgraphs` for inspecting compiled subgraphs.
 - Op surface (full list in `op_registry.py`): arithmetic, comparisons, transcendentals, activations, clamp, composite, metadata (view/unsqueeze/squeeze/expand/permute/transpose/t/slice), innermost-dim reductions (sum/mean/prod/amax/amin). Unsupported ops fall back to eager.
+- Special-op rewrite (`gint/conductor/special_ops.py`): pre-partition pass replaces `aten.bmm.default` and `getitem(linalg_inv_ex(a), 0)` with calls to `gint.host.matrix.gint_bmm` / `gint_inv` for square matrices with N ≤ 4. The rewritten nodes run via the eager-fallback path (which dispatches to a `SugarProgram`); surrounding pointwise ops still go through gint codegen.
 - Partitioner constraints per subgraph: max 8 global tensor slots, max stack depth 8, broadcast-compatible shapes.
 - See `docs/conductor.md` for codegen details (broadcasting, tile dispatch, register spills, CSE, fused reductions, etc.).
 
@@ -97,6 +98,7 @@ gint/
     executor.py      # Base executor interface + backend auto-detection
     utils.py         # Shared utilities (fill_tensor_info, cdiv)
     sugar.py         # Convenience APIs
+    matrix.py        # Small batched (N<=4) bmm / inverse SugarPrograms + Python wrappers
     analyzer.py      # Static stack/reg usage analyzer for recorded bytecode
   kernel/            # Device-side LLVM IR code
     interpreter/     # Stack-based VM implementation

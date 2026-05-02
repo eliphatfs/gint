@@ -31,9 +31,9 @@ Or via ``gint_backend()`` for baked-in defaults::
         return x * y
 """
 
-from .backend import gint_backend, register_backend
+from .backend import gint_backend, register_backend, compile
 
 register_backend("gint", cuda_graphs=True)
 register_backend("gint-no-cuda-graph", cuda_graphs=False)
 
-__all__ = ['gint_backend', 'register_backend']
+__all__ = ['gint_backend', 'register_backend', 'compile']
