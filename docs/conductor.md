@@ -19,7 +19,24 @@ Supported op surface (full list in `op_registry.py`; unsupported ops fall back t
 - Metadata: view, unsqueeze, squeeze, expand, permute, transpose, t, slice
 - Reductions (innermost dim only): sum, mean, prod, amax, amin
 
-Partitioner constraints per subgraph: max 8 global tensor slots, max stack depth 8, broadcast-compatible shapes.
+Partitioner constraints per subgraph: max 8 global tensor slots, max stack depth 8, broadcast-compatible shapes, all output globals must share the same iteration shape.
+
+## Gint-Eligible Node Set (dtype fixed point)
+
+- gint kernels read and write 4-byte float words. A node is gint-compileable only when **every** input boundary and the output boundary are floats — otherwise gint either picks up garbage from eager (e.g. an int64 index tensor reinterpreted as float) or hands garbage back.
+- Two ops have legitimate non-float endpoints: `gt/lt/ge/le/eq/ne` produce bool, and `where.self` consumes a bool predicate. Internally, comparisons emit 0.0/1.0 and `where.self` reads via fselect — so the bool channel is fine **as long as both endpoints stay inside the same gint subgraph**. Crossing the eager boundary with a bool tensor would round-trip through bitwise reinterpretation.
+- `op_registry.compute_gint_node_set(graph)` resolves this with a fixed-point pass:
+  1. Seed with every registered, `check_fn`-passing call_function node.
+  2. Drop any node whose dtype contract fails *given the current candidate set* (`_node_dtypes_compatible`). The bool channel is allowed only when every comparison user is a candidate `where.self` and every `where.self` cond comes from a candidate comparison.
+  3. Iterate. A dropped `where` poisons its comparison feeders, which may in turn poison other shared-where consumers, until the set is stable.
+- The result is cached on `graph._gint_node_set`. `get_op_descriptor(node)` consults the set when a partition is in flight, falling back to a single-node check (with an empty allow-set) when called outside the partitioner — so direct codegen / unit-test paths still get conservative answers.
+
+## Output-Driven Iteration Shape
+
+- The kernel iterates over the *output* shape, not over a global broadcast of every tensor. Letting an input drive the iteration would cause a kernel that reads `view(small) → big` to iterate `big`'s cells while writing to a buffer sized for `small`, smashing the same address with different values.
+- During growth, `GraphPartitioner.partition` rejects a candidate node whose addition would give the subgraph two outputs with different shapes (`out_shapes` collected from `global_nodes ∩ scheduled`). The check fires before `_compute_broadcast_plan` so we never propagate an inflated iteration shape into stride computation.
+- `_compile_subgraph` then derives `output_shape` from the broadcast of *output* globals only. Inputs are validated against that shape via `_compute_broadcast_plan` — small inputs broadcast UP into the iteration via stride-0 padding, but no input is allowed to grow the iteration beyond what every output buffer can hold.
+- The "outputs must agree" rule splits patterns like `relu(scalar_in) + (n*L).sum(-1)` into separate pointwise + reduction subgraphs at the partition layer; the merger phase (see *Fused Reduction+Broadcast+Pointwise*) restores the per-batch + per-chunk fusion when a reduction follows.
 
 ## Static-Shape Constraint
 
@@ -104,7 +121,10 @@ Geometry-smith case: `(M, 1)` and `(M, 3)` had `block_size=3, batch_dims=[M]` �
 ## Register-Spill Codegen (`_plan_spills`)
 
 - The l12 kernel variant has `POOL_SIZE=12` slots shared between stack (grows up from `pool[0]`) and 8 virtual registers (`reg N = pool[POOL_SIZE-1-N]`). The conductor uses up to 11 of those (`stack + active_regs ≤ 11`) to leave one slot of headroom for transient `dup`/`swap` shuffling.
-- `_plan_spills(nodes, ext_io)` walks the schedule once and assigns a virtual register to every multi-user intermediate (`>1 distinct downstream user inside the subgraph`) that isn't already an external-IO node. Register indices are reused across non-overlapping live ranges via simple liveness (free regs at last-use, allocate at result production). Returns `(node_to_reg, overflow, feasible)` — overflow is the set of multi-user nodes that didn't fit in any of the 8 registers and falls back to a global-tensor slot.
+- `_plan_spills(nodes, ext_io)` walks the schedule and assigns a virtual register to two classes of node:
+  1. **Multi-use intermediates** (`>1 distinct downstream user inside the subgraph`, not in `ext_io`).
+  2. **Buried single-use nodes** discovered by simulating the abstract stack in the codegen's actual `arg_order` and watching for any internal arg that lands at depth ≥ 2 by the time its `handle_operand` fires. Codegen has no rotN — only `swap` rescues depth 1 — so a buried single-use value would otherwise raise the "buried at depth ≥ 2" runtime error in `StackCodegen.handle_operand`. Burial detection iterates: each round adds the newly-buried args to the spill set and re-simulates, converging in O(nodes) rounds since each round adds ≥ 1 node or terminates.
+- Register indices are reused across non-overlapping live ranges via simple liveness (free regs at last-use, allocate at result production). Returns `(node_to_reg, overflow, feasible)` — overflow is the set of nodes that couldn't fit in any of the 8 registers and falls back to a global-tensor slot.
 - `GraphPartitioner._stack_fits` is a thin wrapper over `_plan_spills(...).feasible`. Strictly more permissive than the old depth-only check because spilling a long-lived multi-user value to a register removes it from the abstract stack.
 - `GraphPartitioner._required_globals = ext_io ∪ overflow` — multi-user intermediates that fit in registers don't get a tensor slot, freeing both `max_tensors` budget and global memory traffic.
 - `StackCodegen` accepts the spill plan via `node_to_reg`. `emit_op` emits `FStoreReg<N>` after computing a spilled node (and pops the value from the virtual stack); `handle_operand` emits `FLoadReg<N>` whenever an arg is needed and isn't on the virtual stack at depth 0/1. The generic-arg, depth-1, and depth-≥2 branches all prefer a register reload over a global reload.
@@ -162,7 +182,7 @@ Geometry-smith case: `(M, 1)` and `(M, 3)` had `block_size=3, batch_dims=[M]` �
   - `_compile_fused_reduction_subgraph` (legacy 1d) for mode '1d' only (N ≥ 128). Structurally distinct (batches in `batch_shape` vs `block_grid_dim_2`) and production-tested by RMSNorm.
 - **Geometry_smith fused-reduction** at N=3 (mode 2dw, pre_prefix split into per_batch=[relu]+per_chunk=[mul_1], no suffix): collapses the `relu(sum_1) + (n*L).sum(-1)` middle pair into one kernel, dropping the outer per-iter from 4 kernels (75 µs) to 3 kernels (63 µs) at M=1M. **Small-N RMSNorm-shape** at N=8 or N=64 (mode 2dw / 2dt, pre_prefix=[mul] + scalar_prefix=[+eps, rsqrt] + broadcast_suffix=[*x, *w]): single fused kernel covered by `tests/test_conductor_real_workloads.py::test_rms_norm_small_N_2dw / _2dt`.
 - **Fusion detection**: `_can_fuse_with_reduction` (post-reduction) and `_can_fuse_pre_reduction` (pre-reduction) validate that all involved ops are ELEMENTWISE, that the reduction result has no external users, and that all external globals share the reduction dimension.
-- **Deferred compilation**: pointwise subgraphs preceding reductions are buffered rather than compiled immediately, avoiding wasted work when they are absorbed by pre-reduction fusion.
+- **Deferred compilation**: pointwise subgraphs preceding reductions are buffered rather than compiled immediately, avoiding wasted work when they are absorbed by pre-reduction fusion. The buffer is a *list* of pending pointwise schedules: when the partitioner splits a per-batch op (e.g. `relu(scalar_in)`) and a per-chunk op (e.g. `n*L`) into separate subgraphs (their outputs disagree in shape — see *Output-Driven Iteration Shape*), the merger first tries `_can_fuse_pre_reduction` on the **concatenation** of every pending schedule. If that succeeds, all per-batch + per-chunk ops absorb into one fused-reduction kernel. If it fails, the merger falls back to fusing only the most recent schedule (compiling earlier ones as standalone kernels), then to compiling all pending separately.
 - **Stack depth**: Phase 1 peaks at ~2 extra slots (width-lane combine). Phase 2 needs scalar + 1 for input + op overhead. Total ~4-5, well within MAX_STACK=8.
 - Examples: `x - mean(x)` (single binary op, existing pattern). `x * rsqrt(mean(x*x) + eps) * w` (full RMSNorm, 6 nodes fused into 1 kernel).
 

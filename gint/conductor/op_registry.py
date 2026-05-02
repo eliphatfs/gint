@@ -13,6 +13,7 @@ from enum import Enum, auto
 from typing import Callable, List, Optional
 
 import torch
+from torch.fx import Node
 from ..host import frontend as fe
 
 
@@ -552,6 +553,21 @@ def _check_clamp(node) -> bool:
     return (min_val is not None) or (max_val is not None)
 
 
+# Set of comparison ops whose FX-declared output is bool but gint encodes
+# as 0.0/1.0 float for downstream ``where.self`` (which reads via
+# fselect). Used by the gint-compilable analysis to allow the
+# bool-encoded-as-float channel only when both endpoints are inside the
+# gint subgraph.
+_COMPARISON_OPS = frozenset({
+    torch.ops.aten.gt.Tensor, torch.ops.aten.lt.Tensor,
+    torch.ops.aten.ge.Tensor, torch.ops.aten.le.Tensor,
+    torch.ops.aten.eq.Tensor, torch.ops.aten.ne.Tensor,
+    torch.ops.aten.gt.Scalar, torch.ops.aten.lt.Scalar,
+    torch.ops.aten.ge.Scalar, torch.ops.aten.le.Scalar,
+    torch.ops.aten.eq.Scalar, torch.ops.aten.ne.Scalar,
+})
+
+
 def _emit_hardtanh(node):
     """hardtanh(x, min_val=-1, max_val=1) = clamp(x, min_val, max_val)."""
     min_val = float(node.args[1]) if len(node.args) > 1 else -1.0
@@ -1003,13 +1019,131 @@ OP_REGISTRY: dict = {
 
 
 def get_op_descriptor(node) -> Optional[OpDescriptor]:
-    """Return the OpDescriptor for *node*, or None if not supported."""
+    """Return the OpDescriptor for *node*, or None if not supported.
+
+    A node is gint-compilable iff:
+      * Its target is registered.
+      * Its op-specific ``check_fn`` (if any) accepts it.
+      * Its FX-declared input and output dtypes match the gint kernel
+        contract: kernels read and write 4-byte float words, so any
+        non-float boundary with eager would either feed garbage in or
+        leave garbage out.
+
+    There is one explicit exception to "all-float": comparison ops have
+    bool FX output but encode it as 0.0/1.0 float; ``where.self``
+    consumes that float encoding via fselect. We allow the bool channel
+    only when both endpoints are in the *same* gint subgraph — i.e.
+    every user of the comparison is a gint-compilable ``where.self``,
+    and every bool input to the ``where.self`` comes from a
+    gint-compilable comparison.
+    """
     desc = OP_REGISTRY.get(node.target)
     if desc is None:
         return None
     if desc.check_fn is not None and not desc.check_fn(node):
         return None
+
+    # Walk into the cached gint set if the host has computed one for the
+    # current FX graph. This holds during partition; lookups outside that
+    # context fall back to a single-node check (used by tests / direct
+    # codegen calls that don't go through the partitioner).
+    gm_set = getattr(node.graph, '_gint_node_set', None)
+    if gm_set is not None:
+        return desc if node in gm_set else None
+    if not _node_dtypes_compatible(node, frozenset()):
+        return None
     return desc
+
+
+def _node_dtypes_compatible(node, gint_set) -> bool:
+    """Single-node dtype check used by ``compute_gint_node_set`` and as
+    a conservative fallback when no cached set is available.
+
+    ``gint_set`` is the running set of "definitely gint-compileable"
+    nodes — used only to validate the bool-encoded channel between a
+    comparison op and a ``where.self`` consumer.
+    """
+    val = node.meta.get('val')
+    out_dtype = getattr(val, 'dtype', None)
+
+    is_cmp = node.target in _COMPARISON_OPS
+    is_where = node.target is torch.ops.aten.where.self
+
+    # Output dtype.
+    if out_dtype is not None and not out_dtype.is_floating_point:
+        if not is_cmp:
+            return False
+        # Comparison: bool output is OK only if every user is a
+        # gint-compileable where.self that's already in gint_set.
+        for user in node.users:
+            if user.op != 'call_function':
+                return False
+            if user.target is not torch.ops.aten.where.self:
+                return False
+            if user not in gint_set:
+                return False
+
+    # Input dtypes.
+    def check_arg(arg):
+        if not isinstance(arg, Node):
+            return True
+        arg_val = arg.meta.get('val')
+        arg_dtype = getattr(arg_val, 'dtype', None)
+        if arg_dtype is None or arg_dtype.is_floating_point:
+            return True
+        # Bool input is allowed only as the cond arg of where.self when
+        # produced by a gint-compileable comparison.
+        if (is_where and arg_dtype == torch.bool
+                and arg.target in _COMPARISON_OPS
+                and arg in gint_set):
+            return True
+        return False
+
+    for arg in node.args:
+        if isinstance(arg, (list, tuple)):
+            if not all(check_arg(a) for a in arg):
+                return False
+        elif not check_arg(arg):
+            return False
+    for v in node.kwargs.values():
+        if isinstance(v, (list, tuple)):
+            if not all(check_arg(a) for a in v):
+                return False
+        elif not check_arg(v):
+            return False
+    return True
+
+
+def compute_gint_node_set(graph) -> set:
+    """Fixed-point determination of the set of gint-compileable nodes
+    in ``graph``. Run once per partition.
+
+    Starts with every registered, check_fn-passing node and removes
+    those whose dtype contract fails *given the current candidate set*.
+    Iterates until stable: a comparison op that gets dropped (because
+    its where consumer was dropped) may in turn cause that consumer's
+    other comparison feeders to drop, etc.
+
+    Cached on the graph as ``graph._gint_node_set`` so subsequent
+    ``get_op_descriptor(node)`` calls just consult the set.
+    """
+    candidates: set = set()
+    for node in graph.nodes:
+        if node.op != 'call_function':
+            continue
+        desc = OP_REGISTRY.get(node.target)
+        if desc is None:
+            continue
+        if desc.check_fn is not None and not desc.check_fn(node):
+            continue
+        candidates.add(node)
+
+    while True:
+        next_set = {n for n in candidates if _node_dtypes_compatible(n, candidates)}
+        if next_set == candidates:
+            break
+        candidates = next_set
+    return candidates
 
 
 def resolve_arg_order(desc: OpDescriptor, node) -> List[int]:

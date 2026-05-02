@@ -33,6 +33,7 @@ from ..host import frontend as fe
 from ..host.frontend import FrontendState, _frontend_state
 from .op_registry import (
     OpDescriptor, OpKind, get_op_descriptor, resolve_arg_order,
+    compute_gint_node_set,
     _emit_width_combine,
 )
 from .special_ops import apply_special_op_rewrites
@@ -358,23 +359,32 @@ def _plan_spills(
     num_regs: int = _SPILL_NUM_REGS,
     pool_limit: int = _SPILL_POOL_LIMIT,
 ):
-    """Decide which multi-user intermediates should live in virtual registers.
+    """Decide which intermediates should live in virtual registers.
 
-    Walks the schedule and assigns a virtual register to every node with
-    >1 distinct downstream user inside the subgraph (i.e. values that
-    would otherwise need a global-memory round-trip to handle the
-    "buried at depth ≥ 2" reload case in ``StackCodegen.handle_operand``).
+    Walks the schedule and assigns a virtual register to:
+      1. every node with >1 distinct downstream user inside the subgraph;
+      2. any single-user node whose simulated stack position would put it
+         at depth ≥ 2 by the time its consumer fires — codegen has no
+         reach-deep-into-stack op besides ``swap`` (depth 1), so such a
+         value would otherwise trip the "buried at depth ≥ 2" runtime
+         error in ``StackCodegen.handle_operand``.
+
+    Burial detection iterates: each round simulates the schedule's stack
+    state, finds args that arrive buried, marks them for spill, and
+    re-runs. Converges in O(nodes) rounds since each round adds ≥1 node
+    to the spill set or terminates.
 
     Registers are reused across non-overlapping live ranges via a simple
     Belady-style allocator: free registers whose owner just died, then
     allocate the smallest free index for the new result. If the live
-    multi-user set ever exceeds ``num_regs``, the overflow nodes go back
-    to a global-tensor slot (returned in ``overflow``).
+    spill set ever exceeds ``num_regs``, the overflow nodes go back to
+    a global-tensor slot (returned in ``overflow``).
 
-    Concurrently simulates the abstract stack to verify pool feasibility:
+    Concurrently simulates the abstract stack as an ordered list to
+    verify pool feasibility AND detect burial:
       - stack_peak (during op emission) ≤ max_stack
-      - on_stack_live + active_regs ≤ pool_limit (slot conflicts in the
-        pool happen otherwise — stack and registers share pool[0..11]).
+      - on_stack + active_regs ≤ pool_limit (slot conflicts in the pool
+        happen otherwise — stack and registers share pool[0..11]).
 
     Returns ``(node_to_reg, overflow, feasible)``."""
     node_set = set(nodes)
@@ -390,69 +400,118 @@ def _plan_spills(
         if users_after:
             last_use[n] = max(node_idx[u] for u in users_after)
 
-    # External-IO nodes with at least one in-subgraph consumer also occupy
-    # a stack slot until that last consumer (codegen does ``dup; store``
-    # so a copy stays on stack). Track them like any other live value.
-    candidate_set: Set[Node] = {
+    # Multi-use intermediates always need a register; augmented across
+    # rounds by single-use nodes that the simulation finds buried.
+    multi_use: Set[Node] = {
         n for n in nodes
         if later_user_count.get(n, 0) > 1 and n not in ext_io
     }
+    extra_buried: Set[Node] = set()
 
-    free_regs = list(range(num_regs))
-    in_reg: Dict[Node, int] = {}
+    feasible = True
     node_to_reg: Dict[Node, int] = {}
     overflow: Set[Node] = set()
-    on_stack_live: Set[Node] = set()
-    feasible = True
 
-    for i, node in enumerate(nodes):
-        op_desc = get_op_descriptor(node)
-        arity = op_desc.arity if op_desc else 0
-        peak_extra = op_desc.peak_stack_extra if op_desc else 0
+    for _round in range(len(nodes) + 1):
+        candidate_set = multi_use | extra_buried
 
-        # Peak during emission: pre-existing on-stack live + freshly pushed
-        # args + op's internal peak. Conservative — every arg push counts
-        # as +1 even when the codegen could skip the dup at depth 0.
-        peak = len(on_stack_live) + arity + peak_extra
-        if peak > max_stack:
-            feasible = False
-        if peak + len(in_reg) > pool_limit:
-            feasible = False
+        free_regs = list(range(num_regs))
+        in_reg: Dict[Node, int] = {}
+        node_to_reg = {}
+        overflow = set()
+        # Ordered stack: bottom first; on_stack[-1] is top of stack.
+        on_stack: List[Node] = []
+        feasible = True
+        new_buried: Set[Node] = set()
 
-        # Free dying args (last use at this step). Args may be in regs,
-        # on the stack-live set, or both for the rare ext-IO case.
-        for arg in node.args:
-            if not isinstance(arg, Node):
-                continue
-            if last_use.get(arg, -1) != i:
-                continue
-            if arg in in_reg:
-                free_regs.append(in_reg.pop(arg))
-                free_regs.sort()
-            if arg in on_stack_live:
-                on_stack_live.discard(arg)
+        for i, node in enumerate(nodes):
+            op_desc = get_op_descriptor(node)
+            arity = op_desc.arity if op_desc else 0
+            peak_extra = op_desc.peak_stack_extra if op_desc else 0
 
-        # Result placement.
-        has_internal_use = later_user_count.get(node, 0) > 0
-        if not has_internal_use:
-            # Stored to global (ext_io) or popped immediately. No slot.
-            pass
-        elif node in candidate_set:
-            if free_regs:
-                reg = free_regs.pop(0)
-                in_reg[node] = reg
-                node_to_reg[node] = reg
+            # Burial detection: walk args in the codegen's actual
+            # ``arg_order``, tracking how each handle_operand affects the
+            # local stack. Each fresh push (load_reg / load_global /
+            # constant) bumps every still-on-stack value down by one;
+            # an internal arg that was at depth 0 before this op can end
+            # up at depth ≥ 2 by the time its own handle_operand fires,
+            # which the codegen has no way to recover (only swap can
+            # rescue depth 1, and there's no rotN). Mark such args for
+            # spilling on the next round.
+            arg_order = (resolve_arg_order(op_desc, node)
+                         if op_desc is not None
+                         else list(range(len(node.args))))
+            sim = list(on_stack)
+            for idx in arg_order:
+                if idx >= len(node.args):
+                    continue
+                arg = node.args[idx]
+                if not isinstance(arg, Node):
+                    if isinstance(arg, (int, float)):
+                        sim.append(None)
+                    continue
+                if arg in in_reg or arg in ext_io or arg in overflow \
+                        or arg not in node_set:
+                    sim.append(arg)  # fresh load
+                    continue
+                # Stack-only candidate.
+                rev_pos = next((j for j, n in enumerate(reversed(sim)) if n is arg), -1)
+                if rev_pos == -1:
+                    sim.append(arg)
+                    continue
+                if rev_pos == 0:
+                    pass  # already on top
+                elif rev_pos == 1:
+                    top = sim.pop(); sec = sim.pop()
+                    sim.append(top); sim.append(sec)
+                else:
+                    new_buried.add(arg)
+                    sim.append(arg)  # pretend we loaded it
+
+            peak = len(sim) + peak_extra
+            if peak > max_stack:
+                feasible = False
+            if peak + len(in_reg) > pool_limit:
+                feasible = False
+
+            # Free dying args (last use at this step). Args may be in
+            # regs, on the stack, or both for the rare ext-IO case.
+            for arg in node.args:
+                if not isinstance(arg, Node):
+                    continue
+                if last_use.get(arg, -1) != i:
+                    continue
+                if arg in in_reg:
+                    free_regs.append(in_reg.pop(arg))
+                    free_regs.sort()
+                while arg in on_stack:
+                    on_stack.remove(arg)
+
+            # Result placement.
+            has_internal_use = later_user_count.get(node, 0) > 0
+            if not has_internal_use:
+                # Stored to global (ext_io) or popped immediately.
+                pass
+            elif node in candidate_set:
+                if free_regs:
+                    reg = free_regs.pop(0)
+                    in_reg[node] = reg
+                    node_to_reg[node] = reg
+                else:
+                    overflow.add(node)
+                    on_stack.append(node)
             else:
-                overflow.add(node)
-                on_stack_live.add(node)
-        else:
-            # Single-user internal, OR ext_io with internal uses.
-            on_stack_live.add(node)
+                # Single-user internal, OR ext_io with internal uses.
+                on_stack.append(node)
 
-        if len(on_stack_live) > max_stack:
-            feasible = False
-        if len(on_stack_live) + len(in_reg) > pool_limit:
-            feasible = False
+            if len(on_stack) > max_stack:
+                feasible = False
+            if len(on_stack) + len(in_reg) > pool_limit:
+                feasible = False
+
+        if not new_buried:
+            return node_to_reg, overflow, feasible
+        extra_buried |= new_buried
 
     return node_to_reg, overflow, feasible
 
@@ -817,6 +876,13 @@ class GraphPartitioner:
         return result
 
     def partition(self) -> List[List[Node]]:
+        # Pre-compute the set of gint-compileable nodes for this graph.
+        # ``get_op_descriptor`` consults the cached set so each node's
+        # gint-eligibility honours the cross-node dtype constraints
+        # (e.g. comparison-to-where bool channels) rather than judging
+        # in isolation.
+        self.gm.graph._gint_node_set = compute_gint_node_set(self.gm.graph)
+
         subgraphs: List[List[Node]] = []
         current: List[Node] = []
         current_shape = None
@@ -866,22 +932,54 @@ class GraphPartitioner:
             if can_add:
                 candidate = current + [node]
                 scheduled = ForestTraverser(candidate).get_schedule()
+                scheduled_set = set(scheduled)
                 if len(self._required_globals(scheduled)) > self.max_tensors:
                     can_add = False
                 elif not self._stack_fits(scheduled):
                     can_add = False
                 else:
-                    merged_shape = _broadcast_shapes(current_shape, shape) if current_shape else shape
                     global_nodes_list = list(self._required_globals(scheduled))
                     global_shapes_raw = [self._get_shape(n) for n in global_nodes_list]
                     global_shapes_raw = self._effective_global_shapes(
                         scheduled, global_nodes_list, global_shapes_raw)
-                    global_shapes = [s for s in global_shapes_raw if s is not None]
-                    if global_shapes and any(s != merged_shape for s in global_shapes):
-                        global_strides = [self._get_strides(n) for n in global_nodes_list]
-                        global_strides = [global_strides[i] for i, s in enumerate(global_shapes_raw) if s is not None]
-                        if _compute_broadcast_plan(merged_shape, global_shapes, global_strides) is None:
-                            can_add = False
+                    # Iteration shape is driven by OUTPUTS (globals the
+                    # kernel writes). Broadcasting that shape to inputs
+                    # via ``_compute_broadcast_plan`` lets us reject
+                    # any input whose shape can't broadcast (e.g., a
+                    # view of a scalar fed into a larger pointwise op),
+                    # so the partitioner splits instead of producing a
+                    # subgraph that overruns the output buffer.
+                    out_shapes = [
+                        tuple(global_shapes_raw[i]) for i, n in enumerate(global_nodes_list)
+                        if n in scheduled_set and global_shapes_raw[i] is not None
+                    ]
+                    # All outputs of a single subgraph must agree on
+                    # iteration shape: the kernel writes one
+                    # (in1, in2, ...) tile per step, and those writes
+                    # land in fixed-stride buffers. If two outputs
+                    # disagreed, broadcasting between them would inflate
+                    # the iteration count past either buffer's size and
+                    # corrupt the smaller one. Inputs can still broadcast
+                    # UP via ``_compute_broadcast_plan`` further down.
+                    if out_shapes and len(set(out_shapes)) > 1:
+                        can_add = False
+                        merged_shape = None
+                    elif out_shapes:
+                        merged_shape = out_shapes[0]
+                    else:
+                        merged_shape = (_broadcast_shapes(current_shape, shape)
+                                        if current_shape else shape)
+                    if not can_add:
+                        pass
+                    elif merged_shape is None:
+                        can_add = False
+                    else:
+                        global_shapes = [s for s in global_shapes_raw if s is not None]
+                        if global_shapes and any(s != merged_shape for s in global_shapes):
+                            global_strides = [self._get_strides(n) for n in global_nodes_list]
+                            global_strides = [global_strides[i] for i, s in enumerate(global_shapes_raw) if s is not None]
+                            if _compute_broadcast_plan(merged_shape, global_shapes, global_strides) is None:
+                                can_add = False
 
             if can_add:
                 current_shape = _broadcast_shapes(current_shape, shape) if current_shape else shape
@@ -1016,16 +1114,36 @@ class GintCompiler:
         compiled: Dict[int, GintCompiledSubgraph] = {}
         i = 0
         sg_index = 0
-        pending_pw: Optional[List[Node]] = None  # deferred pointwise schedule
+        # Accumulate consecutive pointwise schedules so a per-batch + per-chunk
+        # split (forced by the partitioner's "all outputs share an iteration
+        # shape" rule) can still fuse into a single fused-reduction kernel
+        # when a reduction follows. Each entry is one partitioned pointwise
+        # subgraph in topological order.
+        pending_pws: List[List[Node]] = []
 
         def _emit_pending():
-            """Compile and record the deferred pointwise subgraph (if any)."""
+            """Compile and record any deferred pointwise subgraphs (each as
+            its own kernel)."""
             nonlocal sg_index
-            if pending_pw is not None:
-                compiled[sg_index] = self._compile_subgraph(
-                    pending_pw, partitioner)
-                merged_schedules.append(pending_pw)
+            for pw in pending_pws:
+                compiled[sg_index] = self._compile_subgraph(pw, partitioner)
+                merged_schedules.append(pw)
                 sg_index += 1
+            pending_pws.clear()
+
+        def _emit_pending_except_last():
+            """Emit all but the last pending pointwise subgraph; return the
+            last one (or None)."""
+            nonlocal sg_index
+            if not pending_pws:
+                return None
+            last = pending_pws[-1]
+            for pw in pending_pws[:-1]:
+                compiled[sg_index] = self._compile_subgraph(pw, partitioner)
+                merged_schedules.append(pw)
+                sg_index += 1
+            pending_pws.clear()
+            return last
 
         while i < len(raw_schedules):
             schedule = raw_schedules[i]
@@ -1036,12 +1154,20 @@ class GintCompiler:
                            else reduction_node.kwargs.get('keepdim', False))
 
                 # Check for pre-reduction fusion (deferred pointwise before reduction).
+                # Try the largest combined prefix first (per-batch + per-chunk split
+                # by the partitioner); fall back to just the most recent schedule.
                 pre_prefix = None
-                if pending_pw is not None:
+                if pending_pws:
+                    combined: List[Node] = []
+                    for pw in pending_pws:
+                        combined.extend(pw)
                     if self._can_fuse_pre_reduction(
-                            pending_pw, reduction_node, partitioner):
-                        pre_prefix = pending_pw
-                        pending_pw = None  # consumed, don't compile
+                            combined, reduction_node, partitioner):
+                        pre_prefix = combined
+                        pending_pws.clear()
+                    elif self._can_fuse_pre_reduction(
+                            pending_pws[-1], reduction_node, partitioner):
+                        pre_prefix = _emit_pending_except_last()
                     else:
                         _emit_pending()
 
@@ -1065,8 +1191,7 @@ class GintCompiler:
                 compiled[sg_index] = self._compile_reduction_subgraph(
                     reduction_node, partitioner)
             else:
-                _emit_pending()
-                pending_pw = schedule  # defer compilation
+                pending_pws.append(schedule)
                 i += 1
                 continue
             merged_schedules.append(schedule)
@@ -1104,6 +1229,8 @@ class GintCompiler:
                             compiled[sg_id], results, partitioner,
                         )
                         executed_sgs.add(sg_id)
+                elif node.op == 'get_attr':
+                    results[node] = getattr(self.gm, node.target)
                 else:
                     results[node] = self._run_eager(node, results)
 
@@ -1365,10 +1492,31 @@ class GintCompiler:
             nodes, global_nodes, all_shapes))
         all_strides = [partitioner._get_strides(n) for n in global_nodes]
 
-        output_shape = all_shapes[0]
-        for s in all_shapes[1:]:
-            if s is not None:
+        # Iteration shape is the broadcast of the OUTPUTS only — i.e. the
+        # globals the kernel writes — not a broadcast across every global.
+        # If we let an input drive the iteration shape (typical for, say,
+        # ``view(small) → big``), we'd iterate more cells than the output
+        # buffer holds and stomp on the same address repeatedly. Inputs
+        # whose shape doesn't fit the output via standard broadcasting
+        # are caught downstream by ``_compute_broadcast_plan`` returning
+        # None — the partitioner then refuses to merge such a node into
+        # the subgraph and splits instead.
+        node_set_local = set(nodes)
+        output_globals = [n for n in global_nodes if n in node_set_local]
+        output_shapes = [partitioner._get_shape(n) for n in output_globals
+                         if partitioner._get_shape(n) is not None]
+        output_shape: tuple = ()
+        if output_shapes:
+            output_shape = output_shapes[0]
+            for s in output_shapes[1:]:
                 output_shape = _broadcast_shapes(output_shape, s)
+        else:
+            # No output globals (rare; only happens if every output is
+            # discarded). Fall back to the broadcast of all shapes.
+            output_shape = all_shapes[0]
+            for s in all_shapes[1:]:
+                if s is not None:
+                    output_shape = _broadcast_shapes(output_shape, s)
 
         valid_shapes = [s for s in all_shapes if s is not None]
         valid_strides = [all_strides[i] for i, s in enumerate(all_shapes) if s is not None]
@@ -2388,8 +2536,21 @@ class GintCompiler:
                  cuda_stream=torch.cuda.current_stream().cuda_stream)
 
     def _run_eager(self, node: Node, results: Dict[Node, torch.Tensor]):
-        args   = tuple(results[a] if isinstance(a, Node) else a for a in node.args)
-        kwargs = {k: results[v] if isinstance(v, Node) else v for k, v in node.kwargs.items()}
+        def resolve(v):
+            if isinstance(v, Node):
+                return results[v]
+            # FX gives us immutable_list / immutable_dict; aten op overload
+            # resolution rejects those for List/Dict-typed args. Convert to
+            # plain list/tuple/dict and recurse to unwrap any inner Nodes.
+            if isinstance(v, list):
+                return [resolve(x) for x in v]
+            if isinstance(v, tuple):
+                return tuple(resolve(x) for x in v)
+            if isinstance(v, dict):
+                return {k: resolve(x) for k, x in v.items()}
+            return v
+        args   = tuple(resolve(a) for a in node.args)
+        kwargs = {k: resolve(v) for k, v in node.kwargs.items()}
         return node.target(*args, **kwargs)
 
     # --- Utilities ---
