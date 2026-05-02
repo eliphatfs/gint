@@ -1,6 +1,8 @@
 """
-Compile-and-runtime benchmark for three kernels — add3 (a+b+c), rmsnorm,
-and geometry_smith (BRDF Smith geometry term from diffrp) — across:
+Compile-and-runtime benchmark for four kernels — add3 (a+b+c), rmsnorm,
+geometry_smith (BRDF Smith geometry term from diffrp), and
+ggx_importance (GGX-D importance-sampled half-vector head from diffrp) —
+across:
   - eager torch
   - torch.jit.script
   - triton (inline kernel for add3, generalized_rms_norm from tests for rmsnorm)
@@ -25,10 +27,12 @@ Usage:
     python benchmark/bench_compile.py --kernel add3
     python benchmark/bench_compile.py --kernel rmsnorm
     python benchmark/bench_compile.py --kernel geometry_smith
+    python benchmark/bench_compile.py --kernel ggx_importance
     python benchmark/bench_compile.py --kernel add3 --clear-triton-cache
 """
 
 import argparse
+import math
 import os
 import pathlib
 import shutil
@@ -450,10 +454,119 @@ def build_geometry_smith(M=1 << 20):
     return impls, ref, f"shape=(M={M}, 3)", 1e-4
 
 
+# ---------------------------------------------------------------------------
+# Kernel: ggx_importance (GGX-D importance-sampled half-vector, from diffrp)
+# ---------------------------------------------------------------------------
+# https://github.com/eliphatfs/diffrp/blob/main/diffrp/utils/light_transport.py#L87
+#
+# Float-roughness branch of GGX importance sampling: per-sample (x, y) →
+# half-vector (hx, hy, hz) before the tangent-space rotation. 4
+# transcendentals (sqrt × 2, cos, sin) plus a scalar-folded rational —
+# every elementwise op uses the Tensor-Scalar variant since `roughness`
+# is a Python float. Three independent outputs in one fused subgraph
+# (no reduction, no broadcast suffix). Pure pointwise / 1D bandwidth
+# bound at large N — what differentiates backends here is per-output
+# launch dispatch and how trig-heavy chains schedule.
+
+def ggx_importance_eager(x, y, roughness):
+    a = roughness * roughness
+    phi = math.tau * x
+    cos_theta = torch.sqrt((1.0 - y) / (1.0 + (a * a - 1.0) * y))
+    sin_theta = torch.sqrt(1.0 - cos_theta * cos_theta)
+    hx = torch.cos(phi) * sin_theta
+    hz = torch.sin(phi) * sin_theta
+    hy = cos_theta
+    return hx, hy, hz
+
+
+@triton.jit
+def _ggx_importance_triton_kernel(x_ptr, y_ptr, hx_ptr, hy_ptr, hz_ptr,
+                                  n, ROUGHNESS: tl.constexpr,
+                                  BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    x = tl.load(x_ptr + offs, mask=mask)
+    y = tl.load(y_ptr + offs, mask=mask)
+    a = ROUGHNESS * ROUGHNESS
+    phi = (2.0 * math.pi) * x
+    cos_theta = tl.sqrt((1.0 - y) / (1.0 + (a * a - 1.0) * y))
+    sin_theta = tl.sqrt(1.0 - cos_theta * cos_theta)
+    tl.store(hx_ptr + offs, tl.cos(phi) * sin_theta, mask=mask)
+    tl.store(hz_ptr + offs, tl.sin(phi) * sin_theta, mask=mask)
+    tl.store(hy_ptr + offs, cos_theta, mask=mask)
+
+
+def ggx_importance_triton_call(x, y, roughness):
+    n = x.numel()
+    hx = torch.empty_like(x)
+    hy = torch.empty_like(x)
+    hz = torch.empty_like(x)
+    BLOCK = 1024
+    _ggx_importance_triton_kernel[(triton.cdiv(n, BLOCK),)](
+        x, y, hx, hy, hz, n, ROUGHNESS=roughness, BLOCK=BLOCK,
+    )
+    return hx, hy, hz
+
+
+def build_ggx_importance(N=1 << 22):
+    """N=2^22 samples ≈ 16 MB per tensor (5 tensors total in/out → 80 MB),
+    bandwidth-bound regime. Roughness is a fixed Python float so it folds
+    into Tensor-Scalar ops on the gint side and a constexpr on triton."""
+    torch.manual_seed(11)
+    x = torch.rand(N, device='cuda', dtype=torch.float32)
+    y = torch.rand(N, device='cuda', dtype=torch.float32)
+    roughness = 0.4
+
+    hx_ref, hy_ref, hz_ref = ggx_importance_eager(x, y, roughness)
+    # Stack outputs so verify() can do a single allclose.
+    ref = torch.stack([hx_ref, hy_ref, hz_ref])
+
+    def stack_call(fn):
+        def go():
+            hx, hy, hz = fn()
+            return torch.stack([hx, hy, hz])
+        return go
+
+    impls = {}
+    impls['eager'] = stack_call(lambda: ggx_importance_eager(x, y, roughness))
+
+    @torch.jit.script
+    def jit_fn(xx, yy, rr: float):
+        a = rr * rr
+        phi = (2.0 * math.pi) * xx
+        cos_theta = torch.sqrt((1.0 - yy) / (1.0 + (a * a - 1.0) * yy))
+        sin_theta = torch.sqrt(1.0 - cos_theta * cos_theta)
+        hx = torch.cos(phi) * sin_theta
+        hz = torch.sin(phi) * sin_theta
+        hy = cos_theta
+        return hx, hy, hz
+    impls['torch.jit'] = stack_call(lambda: jit_fn(x, y, roughness))
+
+    impls['triton'] = stack_call(lambda: ggx_importance_triton_call(x, y, roughness))
+
+    impls['inductor'] = stack_call(
+        lambda f=torch.compile(ggx_importance_eager, backend='inductor'):
+        f(x, y, roughness))
+    impls['inductor-rg'] = stack_call(
+        lambda f=torch.compile(ggx_importance_eager, backend='inductor',
+                               mode='reduce-overhead'):
+        f(x, y, roughness))
+    impls['gint'] = stack_call(
+        lambda f=torch.compile(ggx_importance_eager, backend='gint'):
+        f(x, y, roughness))
+    impls['gint-nocg'] = stack_call(
+        lambda f=torch.compile(ggx_importance_eager,
+                               backend='gint', options={"cuda_graphs": False}):
+        f(x, y, roughness))
+    return impls, ref, f"shape=(N={N},)", 1e-4
+
+
 KERNELS = {
     'add3': build_add3,
     'rmsnorm': build_rmsnorm,
     'geometry_smith': build_geometry_smith,
+    'ggx_importance': build_ggx_importance,
 }
 
 
@@ -481,10 +594,8 @@ def main():
 
     if args.kernel == 'add3':
         impls, ref, shape_str, atol = build_add3(args.n)
-    elif args.kernel == 'rmsnorm':
-        impls, ref, shape_str, atol = build_rmsnorm()
     else:
-        impls, ref, shape_str, atol = build_geometry_smith()
+        impls, ref, shape_str, atol = KERNELS[args.kernel]()
 
     print(f"\n{args.kernel} benchmark  ({shape_str}, dtype=fp32, "
           f"device={torch.cuda.get_device_name()})")

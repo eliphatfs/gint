@@ -4,6 +4,7 @@ fusion, and broadcast in combinations that the unit-style cases in
 ``test_conductor_backend.py`` don't cover.  Add new functions here rather
 than inflating the unit-test module."""
 
+import math
 import torch
 import unittest
 from tests import requires_gpu
@@ -52,6 +53,39 @@ class TestRealWorkloads(unittest.TestCase):
             geometry_smith, backend="gint", options={"cuda_graphs": False})
         got = compiled(n, v, L, r)
         torch.testing.assert_close(got, ref, atol=1e-4, rtol=1e-3)
+
+    def test_ggx_importance_sample_head(self):
+        """diffrp/utils/light_transport.py:_importance_sample_ggx_impl_singler
+        — GGX-D importance-sampled half-vector head (pre-tangent-rotation):
+        4 transcendentals (sqrt × 2, cos, sin) + a scalar-folded rational
+        in y, returning three vectors (hx, hy, hz). Exercises ``Tensor op
+        Scalar`` on every elementwise op — ``roughness`` is a Python float
+        so ``a*a-1``, ``mul tau``, ``1-y``, ``1+...`` all fold into single
+        Tensor-Scalar instructions. Multi-output return forces three
+        separate stores in the same fused subgraph."""
+        def fn(x, y, roughness: float):
+            a = roughness * roughness
+            phi = math.tau * x
+            cos_theta = torch.sqrt((1.0 - y) / (1.0 + (a * a - 1.0) * y))
+            sin_theta = torch.sqrt(1.0 - cos_theta * cos_theta)
+            hx = torch.cos(phi) * sin_theta
+            hz = torch.sin(phi) * sin_theta
+            hy = cos_theta
+            return hx, hy, hz
+
+        torch.manual_seed(0)
+        N = 4096
+        x = torch.rand(N, device='cuda', dtype=torch.float32)
+        y = torch.rand(N, device='cuda', dtype=torch.float32)
+        roughness = 0.4
+
+        hx_ref, hy_ref, hz_ref = fn(x, y, roughness)
+        compiled = torch.compile(fn, backend="gint",
+                                 options={"cuda_graphs": False})
+        hx_got, hy_got, hz_got = compiled(x, y, roughness)
+        torch.testing.assert_close(hx_got, hx_ref, atol=1e-4, rtol=1e-3)
+        torch.testing.assert_close(hy_got, hy_ref, atol=1e-4, rtol=1e-3)
+        torch.testing.assert_close(hz_got, hz_ref, atol=1e-4, rtol=1e-3)
 
     # ------------------------------------------------------------------
     # Small-N fused reduction WITH broadcast suffix
