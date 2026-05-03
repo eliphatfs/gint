@@ -58,6 +58,14 @@ def fn2(a, b):
     return torch.bmm(a, b) + 1.0
 ```
 
+## Calling gint Kernels from Inside Upstream `torch.compile`
+
+- The complement of the gint backend: when a user wraps *their own* function with plain `torch.compile` (or `gint.conductor.compile`) and that function happens to call a gint kernel — `gint_bmm`, `gint_inv`, or any `@bytecode`-decorated user kernel — the call must not blow up dynamo. Without protection, dynamo recurses into `BaseExecutableProgram.__call__` → `executor.execute` → bytecode-recording ContextVars / opaque cuda-bindings, and dies with errors like `'NoneType' object has no attribute 'make_guard'`.
+- Protection lives in two places, both using `torch.compiler.disable`:
+  - `BaseExecutableProgram.__call__` in `gint/host/executor.py` — the universal safety net. Any `SugarProgram` (or future subclass) graph-breaks at the kernel-call boundary, so dynamo compiles up to the call, runs it eagerly, and resumes after. Adds ~1 μs of Python overhead per call (no-op outside an active trace).
+  - The public wrappers `gint_bmm` / `gint_inv` in `gint/host/matrix.py` — decorated directly so that the small amount of Python around the kernel call (`torch.empty`, `.contiguous()`, `.view()`, padding) graph-breaks once, not once per inner op. Reduces 2 graph breaks + 3 compiled subgraphs per `gint_bmm` call down to 1 + 1.
+- Doesn't interfere with the gint backend's own path: `_run_eager` in `compiler.py` calls `node.target(*args, **kwargs)` from outside any dynamo trace, so the `disable` decorator is a transparent passthrough there. Verified by `tests/test_torch_compile_compat.py::test_gint_compile_still_works`.
+
 ## Backend Registration
 
 - `import gint.conductor` auto-registers two backends (only runs when torch is importable, since `gint.conductor` itself depends on torch):

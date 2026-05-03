@@ -1059,19 +1059,26 @@ def _node_dtypes_compatible(node, gint_set) -> bool:
     """Single-node dtype check used by ``compute_gint_node_set`` and as
     a conservative fallback when no cached set is available.
 
+    The gint kernel speaks fp32-on-CUDA only. Any node whose output OR
+    a tensor input is non-fp32 (incl. fp16 / bf16 / fp64) or non-CUDA
+    (e.g. the cpu fp64 tensors AOT autograd lifts from Python list
+    literals into ``aten._to_copy`` placeholders) is excluded from the
+    gint subgraph and falls through to eager execution.
+
     ``gint_set`` is the running set of "definitely gint-compileable"
     nodes — used only to validate the bool-encoded channel between a
     comparison op and a ``where.self`` consumer.
     """
     val = node.meta.get('val')
     out_dtype = getattr(val, 'dtype', None)
+    out_device = getattr(val, 'device', None)
 
     is_cmp = node.target in _COMPARISON_OPS
     is_where = node.target is torch.ops.aten.where.self
 
     # Output dtype.
-    if out_dtype is not None and not out_dtype.is_floating_point:
-        if not is_cmp:
+    if out_dtype is not None and out_dtype != torch.float32:
+        if not is_cmp or out_dtype != torch.bool:
             return False
         # Comparison: bool output is OK only if every user is a
         # gint-compileable where.self that's already in gint_set.
@@ -1083,13 +1090,24 @@ def _node_dtypes_compatible(node, gint_set) -> bool:
             if user not in gint_set:
                 return False
 
-    # Input dtypes.
+    # Output device must be cuda. ``device.type`` covers cuda:0/cuda:1.
+    if out_device is not None and out_device.type != 'cuda':
+        return False
+
+    # Input dtypes / devices.
     def check_arg(arg):
         if not isinstance(arg, Node):
             return True
         arg_val = arg.meta.get('val')
         arg_dtype = getattr(arg_val, 'dtype', None)
-        if arg_dtype is None or arg_dtype.is_floating_point:
+        arg_device = getattr(arg_val, 'device', None)
+        if arg_dtype is None and arg_device is None:
+            # Non-tensor metadata (e.g. SymInt operand). Accept; later
+            # codegen will reject if the op needs a tensor.
+            return True
+        if arg_device is not None and arg_device.type != 'cuda':
+            return False
+        if arg_dtype == torch.float32:
             return True
         # Bool input is allowed only as the cond arg of where.self when
         # produced by a gint-compileable comparison.

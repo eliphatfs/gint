@@ -146,6 +146,22 @@ class BaseExecutableProgram(object):
         get_executor().execute(self, [_convert_arg(x) for x in args], grid_dim, **extra_kwargs)
 
 
+# Make every gint kernel safe to call from inside upstream ``torch.compile``.
+# Without this, dynamo recurses into the bytecode-recording and executor
+# stack — ContextVar set/reset, opaque cuda-bindings — and blows up with
+# internal errors like ``'NoneType' object has no attribute 'make_guard'``.
+# ``torch.compiler.disable`` graph-breaks at the call site: dynamo compiles
+# up to the call, runs it eagerly, then resumes tracing. It is a near no-op
+# (~1us/call) outside an active trace.
+try:
+    import torch as _torch
+    BaseExecutableProgram.__call__ = _torch.compiler.disable(
+        BaseExecutableProgram.__call__
+    )
+except (ImportError, AttributeError):
+    pass
+
+
 class BaseExecutor(object):
 
     def warp_size(self) -> int:

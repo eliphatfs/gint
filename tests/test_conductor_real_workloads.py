@@ -400,6 +400,32 @@ class TestRealWorkloads(unittest.TestCase):
         # Each elementwise op must be covered by some subgraph.
         self.assertGreaterEqual(len(all_nodes), 12)
 
+    def test_dtype_device_filter_excludes_cpu_fp64_constants(self):
+        """When AOT autograd lifts a Python list literal (e.g. ``[0,0,0]``)
+        into the FX graph as ``aten._to_copy.default``, the result is a
+        cpu fp64 tensor. Earlier the partitioner only checked
+        ``dtype.is_floating_point``, so this fp64 cpu tensor was admitted
+        as a subgraph input, then ``cuMemcpyHtoD(args[i].base_ptr, ...)``
+        crashed inside the executor with
+        ``__cuda_array_interface__ not found`` (cpu tensors don't expose
+        cai). The diffrp fish render hit this through
+        ``trimesh.transformations.translation_matrix`` constants.
+        """
+        def fn(x):
+            # Mimic the lift: a 1D tensor whose dtype/device differs
+            # from x. Plus a fp32 cuda op that the conductor would want
+            # to compile.
+            offset = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float64)
+            return x + offset.to(x.device, x.dtype)
+
+        torch.manual_seed(0)
+        x = torch.randn(64, 3, device='cuda')
+        ref = fn(x)
+        compiled = torch.compile(fn, backend='gint',
+                                 options={'cuda_graphs': False})
+        got = compiled(x)
+        torch.testing.assert_close(got, ref, atol=1e-5, rtol=1e-5)
+
 
 if __name__ == '__main__':
     unittest.main()

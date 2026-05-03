@@ -186,7 +186,7 @@ def prime_backends():
 
     _ = torch.compile(_smoke_eager, backend='inductor')(x)
     _ = torch.compile(_smoke_eager, backend='inductor', mode='reduce-overhead')(x)
-    _ = torch.compile(_smoke_eager, backend='gint')(x)
+    _ = torch.compile(_smoke_eager, backend='gint', options={"clone_outputs": False})(x)
     _ = torch.compile(_smoke_eager, backend='gint', options={"cuda_graphs": False})(x)
     torch.cuda.synchronize()
 
@@ -264,7 +264,7 @@ def build_add3(n):
     impls['inductor-rg'] = (lambda f=torch.compile(add3_eager, backend='inductor',
                                                    mode='reduce-overhead'):
                             f(a, b, c))
-    impls['gint'] = (lambda f=torch.compile(add3_eager, backend='gint'):
+    impls['gint'] = (lambda f=torch.compile(add3_eager, backend='gint', options={"clone_outputs": False}):
                      f(a, b, c))
     impls['gint-nocg'] = (lambda f=torch.compile(add3_eager,
                                                  backend='gint', options={"cuda_graphs": False}):
@@ -334,7 +334,7 @@ def build_rmsnorm(M=4096, N=2048):
     # pow(x, 2) + mean + add + rsqrt + mul + mul, and pow is not in
     # OP_REGISTRY, so the eager form falls back entirely. The manual form
     # uses mul(x, x), which gint compiles into a real subgraph chain.
-    impls['gint'] = (lambda f=torch.compile(rms_norm_manual, backend='gint'):
+    impls['gint'] = (lambda f=torch.compile(rms_norm_manual, backend='gint', options={"clone_outputs": False}):
                      f(x, w))
     impls['gint-nocg'] = (lambda f=torch.compile(rms_norm_manual,
                                                  backend='gint', options={"cuda_graphs": False}):
@@ -446,7 +446,7 @@ def build_geometry_smith(M=1 << 20):
     impls['inductor-rg'] = (lambda f=torch.compile(geometry_smith_eager, backend='inductor',
                                                    mode='reduce-overhead'):
                             f(n, v, L, r))
-    impls['gint'] = (lambda f=torch.compile(geometry_smith_eager, backend='gint'):
+    impls['gint'] = (lambda f=torch.compile(geometry_smith_eager, backend='gint', options={"clone_outputs": False}):
                      f(n, v, L, r))
     impls['gint-nocg'] = (lambda f=torch.compile(geometry_smith_eager,
                                                  backend='gint', options={"cuda_graphs": False}):
@@ -553,7 +553,7 @@ def build_ggx_importance(N=1 << 22):
                                mode='reduce-overhead'):
         f(x, y, roughness))
     impls['gint'] = stack_call(
-        lambda f=torch.compile(ggx_importance_eager, backend='gint'):
+        lambda f=torch.compile(ggx_importance_eager, backend='gint', options={"clone_outputs": False}):
         f(x, y, roughness))
     impls['gint-nocg'] = stack_call(
         lambda f=torch.compile(ggx_importance_eager,

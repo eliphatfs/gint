@@ -32,6 +32,22 @@ def _shape_of(node: Node):
     return None
 
 
+def _is_cuda(node: Node) -> bool:
+    """True iff the node's FX meta says it lives on a CUDA device.
+
+    The gint kernels read raw CUDA pointers; rewriting CPU-side
+    bmm/inv to gint would crash at runtime in ``_convert_arg`` with
+    ``__cuda_array_interface__ not found``.
+    """
+    tm = node.meta.get('tensor_meta')
+    if tm is not None and getattr(tm, 'device', None) is not None:
+        return tm.device.type == 'cuda'
+    val = node.meta.get('val')
+    if val is not None and hasattr(val, 'device'):
+        return val.device.type == 'cuda'
+    return False
+
+
 def _is_supported_bmm(node: Node) -> bool:
     if node.op != 'call_function' or node.target is not torch.ops.aten.bmm.default:
         return False
@@ -39,6 +55,8 @@ def _is_supported_bmm(node: Node) -> bool:
         return False
     a, b = node.args[0], node.args[1]
     if not (isinstance(a, Node) and isinstance(b, Node)):
+        return False
+    if not (_is_cuda(a) and _is_cuda(b)):
         return False
     sa = _shape_of(a)
     sb = _shape_of(b)
@@ -61,6 +79,8 @@ def _is_supported_inv_getitem(node: Node) -> bool:
         return False
     inp = src.args[0] if src.args else None
     if not isinstance(inp, Node):
+        return False
+    if not _is_cuda(inp):
         return False
     s = _shape_of(inp)
     if s is None or len(s) < 2 or s[-1] != s[-2]:

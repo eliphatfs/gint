@@ -23,6 +23,7 @@ For deep details, consult:
 - `docs/platforms.md` — host executor, NVIDIA / AMD GPU support tables, cuda-bindings compatibility, cross-platform porting notes
 - `docs/superopt.md` — GPU-accelerated bytecode superoptimizer in `examples/superopt/`
 - `docs/install.md` — install, dependencies, code generation, CI / wheel build
+- `docs/fish_render_investigation.md` — handoff doc for the diffrp fish-render benchmark: CG corruption fix (dtype filter at `backend.py:151`), nvdiffrast graph-break workaround, steady-state perf profile, optimization opportunities
 
 ## Architecture (high level)
 
@@ -55,7 +56,7 @@ The fatbin/HSACO ships **two kernel variants** under symbols `geval_s7` and `gev
 - `gint/host/analyzer.py`: static analyzer over recorded bytecode — `analyze_bytecode(bc)` returns `BytecodeStats` (peak stack depth, registers used, min pool size). Torch-free; useful for variant selection. Re-exported as `gint.analyze_bytecode`.
 
 ### Torch.Compile Integration (Conductor)
-- `gint/conductor/backend.py`: backend registration (`"gint"` default with CUDA graphs, `"gint-no-cuda-graph"` legacy alias). Also exposes `gint.conductor.compile` — a `torch.compile` drop-in that scopes `automatic_dynamic_shapes=False` to the wrapped call (no global config flip; required because gint compiles per-shape and can't accept SymInt FakeTensors).
+- `gint/conductor/backend.py`: backend registration (`"gint"` default with CUDA graphs, `"gint-no-cuda-graph"` legacy alias). Also exposes `gint.conductor.compile` — a `torch.compile` drop-in that scopes `automatic_dynamic_shapes=False` to the wrapped call (no global config flip; required because gint compiles per-shape and can't accept SymInt FakeTensors). The CG path uses an inference-only `_direct_cudagraph_wrap` (not `make_graphed_callables`); options: `cuda_graphs`, `num_warmup_iters`, `clone_outputs` (default True for safe multi-frame held-output use; set False for max single-kernel perf).
 - `gint/conductor/compiler.py`: FX graph → bytecode conversion, graph partitioning, broadcasting.
 - `gint/conductor/debug.py`: `inspect_subgraphs(fn, *args)` + `print_subgraphs` for inspecting compiled subgraphs.
 - Op surface (full list in `op_registry.py`): arithmetic, comparisons, transcendentals, activations, clamp, composite, metadata (view/unsqueeze/squeeze/expand/permute/transpose/t/slice), innermost-dim reductions (sum/mean/prod/amax/amin). Unsupported ops fall back to eager.

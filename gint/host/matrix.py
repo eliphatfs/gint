@@ -206,6 +206,7 @@ def _batch_flatten(t: torch.Tensor):
     return B, batch_shape, int(n1)
 
 
+@torch.compiler.disable
 def gint_bmm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """Batched ``a @ b`` for matrices of size N <= 4 (N square, equal in a/b).
 
@@ -245,6 +246,7 @@ def gint_bmm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return out.view(*batch_shape, N, N)
 
 
+@torch.compiler.disable
 def gint_inv(a: torch.Tensor) -> torch.Tensor:
     """Batched ``inv(a)`` for matrices of size N <= 4 (square).
 

@@ -174,6 +174,14 @@ def _select_pointwise_tiling(block_size: int) -> dict:
     return dict(B=32, R=4, mode='2dw')
 
 
+class _UnplannableSubgraph(Exception):
+    """Raised by ``_compile_subgraph`` when the partitioner produced a
+    subgraph whose ``output_shape``-driven broadcast plan is infeasible
+    (e.g. an input shape doesn't broadcast to the iteration shape, or
+    the output is a 0-dim scalar). The caller should drop the subgraph
+    so its nodes fall through to the per-node eager-fallback path."""
+
+
 def _compute_broadcast_plan(output_shape, tensor_shapes, tensor_strides=None):
     """Compute a broadcast plan mapping output_shape to gint block+batch decomposition.
 
@@ -251,9 +259,13 @@ def _compute_broadcast_plan(output_shape, tensor_shapes, tensor_strides=None):
         )
         if inner_broadcast:
             block_stride = 0
-        elif orig_strides is not None:
+        elif orig_strides:  # non-None and non-empty
             block_stride = orig_strides[-1]
         else:
+            # None (no strides info) or () (0-dim scalar tensor that broadcasts
+            # over the entire iteration shape) — innermost stride is 0/1; 1 is
+            # the safe default since the loader treats 0-dim tensors as
+            # single-element broadcasts via the batch_strides loop below.
             block_stride = 1
 
         # batch_strides: 0 for broadcast dims, actual stride otherwise
@@ -1123,23 +1135,32 @@ class GintCompiler:
 
         def _emit_pending():
             """Compile and record any deferred pointwise subgraphs (each as
-            its own kernel)."""
+            its own kernel). Subgraphs that turn out to be unplannable
+            (e.g. output-shape can't broadcast all inputs) are dropped so
+            their nodes fall through to per-node ``_run_eager``."""
             nonlocal sg_index
             for pw in pending_pws:
-                compiled[sg_index] = self._compile_subgraph(pw, partitioner)
+                try:
+                    compiled[sg_index] = self._compile_subgraph(pw, partitioner)
+                except _UnplannableSubgraph:
+                    continue
                 merged_schedules.append(pw)
                 sg_index += 1
             pending_pws.clear()
 
         def _emit_pending_except_last():
             """Emit all but the last pending pointwise subgraph; return the
-            last one (or None)."""
+            last one (or None). Drops unplannable subgraphs same as
+            ``_emit_pending``."""
             nonlocal sg_index
             if not pending_pws:
                 return None
             last = pending_pws[-1]
             for pw in pending_pws[:-1]:
-                compiled[sg_index] = self._compile_subgraph(pw, partitioner)
+                try:
+                    compiled[sg_index] = self._compile_subgraph(pw, partitioner)
+                except _UnplannableSubgraph:
+                    continue
                 merged_schedules.append(pw)
                 sg_index += 1
             pending_pws.clear()
@@ -1261,6 +1282,7 @@ class GintCompiler:
                         return tuple(results[n] if isinstance(n, Node) else n for n in res)
                     return results[res] if isinstance(res, Node) else res
 
+        execute.num_gint_subgraphs = len(subgraph_schedules)
         return execute
 
     @staticmethod
@@ -1538,9 +1560,47 @@ class GintCompiler:
                 if s is not None:
                     output_shape = _broadcast_shapes(output_shape, s)
 
+        # Outputs allocated by ``_run_subgraph`` use plain ``torch.empty`` →
+        # C-contiguous. If FX declares any output node with non-contig
+        # strides (e.g. an ``aten.expand`` view with strides ``(0, 0, 1)``,
+        # or a stack-of-channels layout ``(262144, 512, 1, 262144)`` for
+        # ``(1, 512, 512, 3)``), the kernel would code-gen against the
+        # FX strides while writing into a C-contig buffer — touching only
+        # a tiny subset of cells and leaving the rest as garbage.
+        # ``torch.empty_strided`` to match FX would fix correctness, but
+        # the resulting non-standard layouts confuse cuda-graph capture
+        # (the caching allocator reuses addresses oddly across replays).
+        # Bail to per-node eager fallback for these — eager handles the
+        # view ops for free.
+        for i, n in enumerate(global_nodes):
+            if n not in node_set_local:  # only outputs
+                continue
+            shape_i = all_shapes[i]
+            strides_i = all_strides[i]
+            if shape_i is None or strides_i is None:
+                continue
+            if tuple(strides_i) != tuple(_c_contiguous_strides(shape_i)):
+                raise _UnplannableSubgraph(
+                    f"output {n.name}: strides={tuple(strides_i)} != "
+                    f"C-contig {tuple(_c_contiguous_strides(shape_i))} of "
+                    f"shape {tuple(shape_i)}"
+                )
+
         valid_shapes = [s for s in all_shapes if s is not None]
         valid_strides = [all_strides[i] for i, s in enumerate(all_shapes) if s is not None]
         plan = _compute_broadcast_plan(output_shape, valid_shapes, valid_strides)
+        if plan is None:
+            # Output-driven iteration shape rejects one of the inputs
+            # (e.g. ``(512,)`` input vs ``(512, 1, 1)`` output) or the
+            # output is 0-dim. The partitioner's merge check uses
+            # ``merged_shape`` (broadcast over all globals) which can
+            # succeed even when ``output_shape`` (outputs only) can't.
+            # Bail so the caller drops this subgraph and lets each node
+            # run via ``_run_eager``.
+            raise _UnplannableSubgraph(
+                f"output_shape={tuple(output_shape)} cannot broadcast all "
+                f"inputs {[tuple(s) for s in valid_shapes]}"
+            )
 
         # Tile dispatch: when the merge couldn't fully collapse to a flat
         # 1D block (block_size < 128 with at least one batch dim left),
@@ -2545,6 +2605,10 @@ class GintCompiler:
             out_shape = partitioner._get_shape(node)
             if out_shape is None:
                 out_shape = compiled.output_shape
+            # Plain ``torch.empty`` → C-contiguous strides. Subgraphs with
+            # non-contig FX-declared output strides are gated out at
+            # ``_compile_subgraph`` time so their nodes fall through here
+            # via the eager-fallback path instead of reaching this allocator.
             t = torch.empty(out_shape, dtype=ref.dtype, device=ref.device)
             output_tensors.append(t)
             results[node] = t
