@@ -3,8 +3,7 @@
 ## Dependencies
 
 Runtime dependencies (declared in `pyproject.toml`):
-- `numpy`, `llvmlite>=0.43`, `cuda-bindings>=12.6`, `rich`
-- Optional: `torch>=2.0` (for conductor / `torch.compile` backend)
+- `numpy`, `llvmlite>=0.43`, `cuda-bindings>=12.6`, `rich`, `torch>=2.0`
 - Optional: `hip-python>=6.0` (for AMD HIP backend)
 
 For cuda-bindings version compatibility details, see `docs/platforms.md`.
@@ -14,8 +13,7 @@ For cuda-bindings version compatibility details, see `docs/platforms.md`.
 Built with `hatchling`. Requires Python >=3.10.
 
 ```bash
-pip install -e .          # core (needs cuda-bindings, numpy, llvmlite, rich)
-pip install -e ".[torch]" # with torch.compile backend
+pip install -e .          # core (needs cuda-bindings, numpy, llvmlite, rich, torch)
 
 # AMD HIP backend (hip-python is only on Test PyPI due to AMD's packaging policy)
 python3 -m pip install -i https://test.pypi.org/simple "hip-python>=6.0.0"

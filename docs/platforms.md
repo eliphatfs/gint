@@ -4,8 +4,8 @@ Reference for backend-specific details.
 
 ## Host-Side Executor
 
-- `gint/host/executor.py`: core program execution interface + `get_executor()` auto-detection.
-- `gint/host/cuda/executor_impl.py`: NVIDIA-specific implementation (CudaExecutor). Loads kernel from `gint/host/cuda/gint.fatbin.xz` (not tracked in git — must be generated via `./generate.sh`).
+- `gint/host/executor.py`: core program execution interface + `get_executor()` auto-detection. `_convert_arg` fast-paths `torch.Tensor` (the dominant input type) by reading `data_ptr/shape/stride` directly instead of going through `__cuda_array_interface__` (~4× faster per arg). Other CUDA-array-interface producers (cupy, numba) still use the generic CAI parser. `BaseExecutableProgram.__call__` is wrapped with a guarded `torch.compiler.disable` that only fires when `torch.compiler.is_compiling()` is true — eliminating the ~2 µs/call dynamo-frame overhead on hot inference paths.
+- `gint/host/cuda/executor_impl.py`: NVIDIA-specific implementation (CudaExecutor). Loads kernel from `gint/host/cuda/gint.fatbin.xz` (not tracked in git — must be generated via `./generate.sh`). `execute()` is split into a hot path and `_build_cacheline()`. The cacheline pre-builds the `(c_void_p * 5)()` `kernel_args` array that `cuLaunchKernel` needs — `dcode`/`dinfo` device pointers and `nargs`/`grid_dim`/`flag` ctypes wrappers are all per-shape constants, so the per-call hot path skips `prepare_arg`+`CTypesWrapper` and goes straight to `cuLaunchKernel`. Cacheline also stores the resolved `cufunc`, computed `(gx, gy, gz, bx, by, bz)` launch dims, and `smem_bytes`. The `_keepalive` tuple holds references to the c_int wrappers so the addresses inside `kernel_args` stay valid.
 - `gint/host/hip/executor_impl.py`: AMD-specific implementation (HipExecutor). Loads kernel from `gint/host/hip/gint.fatbin.xz` (not tracked in git — must be generated via `./generate_amdgcn.sh`).
 - **Backend selection**: `GINT_BACKEND` env var (`"cuda"` or `"hip"`) for explicit override; default tries CUDA first, falls back to HIP.
 - `gint/host/utils.py`: shared utilities (`fill_tensor_info`, `cdiv`) used by both executors.

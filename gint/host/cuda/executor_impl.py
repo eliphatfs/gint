@@ -57,28 +57,11 @@ class CudaExecutor(BaseExecutor):
         cacheline = pcu.get(pcp)
 
         if cacheline is None:
-            pd = program.get_program(*args, **extra_kwargs)
-            if pd.input_indices is None:
-                pd.input_indices = list(range(len(pd.input_infos)))
-            assert len(pd.input_indices) == len(pd.input_infos), "Input indices must match input infos"
-            variant = select_variant(pd)
-            _, dcode = check_cuda_error(cuda.cuMemAlloc(len(pd.program) * 4))
-            check_cuda_error(cuda.cuMemcpyHtoD(dcode, pd.program, len(pd.program) * 4))
-            _, hinfo = check_cuda_error(cuda.cuMemAllocHost(ctypes.sizeof(HTensorInfo)))
-            _, dinfo = check_cuda_error(cuda.cuMemAlloc(ctypes.sizeof(HTensorInfo)))
-            dctx_local = current_context()
-            dctx_local.deferred(lambda: check_cuda_error(cuda.cuMemFree(dcode)))
-            dctx_local.deferred(lambda: check_cuda_error(cuda.cuMemFree(dinfo)))
-            dctx_local.deferred(lambda: check_cuda_error(cuda.cuMemFreeHost(hinfo)))
-            pcu[pcp] = cacheline = dcode, dinfo, HTensorInfo.from_address(int(hinfo)), len(args), pd.input_indices, variant
-            ti = HTensorInfo.from_address(int(hinfo))
-            _fill_tensor_info(ti, pd.input_infos)
+            cacheline = pcu[pcp] = self._build_cacheline(
+                program, args, grid_dim, **extra_kwargs)
 
-        dcode, dinfo, ti, nargs, indices, variant = cacheline
-        if len(args) != nargs:
-            raise ValueError("Number of arguments don't match the program.")
-
-        dctx, cufunc, concurrencies, num_sm = self.geval_func_handle(variant)
+        (dinfo, ti, indices, cufunc, kernel_args,
+         gx, gy, gz, bx, by, bz, smem, _keepalive) = cacheline
 
         for i, tidx in enumerate(indices):
             ti.base_ptr[i] = args[tidx].base_ptr
@@ -87,8 +70,67 @@ class CudaExecutor(BaseExecutor):
             check_cuda_error(cuda.cuMemcpyHtoD(dinfo, ctypes.addressof(ti), ctypes.sizeof(ti)))
         else:
             check_cuda_error(cuda.cuMemcpyHtoDAsync(dinfo, ctypes.addressof(ti), ctypes.sizeof(ti), custream))
+        check_cuda_error(cuda.cuLaunchKernel(
+            cufunc, gx, gy, gz, bx, by, bz, smem, custream, kernel_args, 0))
+
+    def _build_cacheline(self, program, args, grid_dim, **extra_kwargs):
+        """Build a cacheline for one (program, shape) combination. All
+        kernel args (dcode, dinfo, nargs, grid_dim, flag) and launch
+        params (block dim, smem) are constants per cache key, so we
+        pre-build the ``(c_void_p * 5)()`` array cuLaunchKernel needs and
+        the c_int wrappers it points into. The runtime hot path then
+        just rewrites tensor base ptrs and calls cuLaunchKernel directly,
+        skipping the per-call ``prepare_arg`` + ``CTypesWrapper`` chain
+        in ``launch_kernel``.
+
+        Holds references to the c_int wrappers in ``_keepalive`` so the
+        ctypes addresses inside ``kernel_args`` stay valid.
+        """
+        pd = program.get_program(*args, **extra_kwargs)
+        if pd.input_indices is None:
+            pd.input_indices = list(range(len(pd.input_infos)))
+        assert len(pd.input_indices) == len(pd.input_infos), "Input indices must match input infos"
+        if len(args) != len(pd.input_indices):
+            raise ValueError("Number of arguments don't match the program.")
+
+        variant = select_variant(pd)
+
+        _, dcode = check_cuda_error(cuda.cuMemAlloc(len(pd.program) * 4))
+        check_cuda_error(cuda.cuMemcpyHtoD(dcode, pd.program, len(pd.program) * 4))
+        _, hinfo = check_cuda_error(cuda.cuMemAllocHost(ctypes.sizeof(HTensorInfo)))
+        _, dinfo = check_cuda_error(cuda.cuMemAlloc(ctypes.sizeof(HTensorInfo)))
+        dctx_local = current_context()
+        dctx_local.deferred(lambda: check_cuda_error(cuda.cuMemFree(dcode)))
+        dctx_local.deferred(lambda: check_cuda_error(cuda.cuMemFree(dinfo)))
+        dctx_local.deferred(lambda: check_cuda_error(cuda.cuMemFreeHost(hinfo)))
+
+        ti = HTensorInfo.from_address(int(hinfo))
+        _fill_tensor_info(ti, pd.input_infos)
+
+        _, cufunc, concurrencies, num_sm = self.geval_func_handle(variant)
+
+        # Pre-build kernel_args. Layout matches the geval(...) signature:
+        # (i32* code, TensorInfo* tinfo, i32 num_tensors, i32 grid_dim, i32 flag)
+        c_nargs = ctypes.c_int(len(args))
+        c_grid_dim = ctypes.c_int(grid_dim)
+        c_flag = ctypes.c_int(0)
+        kernel_args = (ctypes.c_void_p * 5)()
+        kernel_args[0] = dcode.getPtr()
+        kernel_args[1] = dinfo.getPtr()
+        kernel_args[2] = ctypes.addressof(c_nargs)
+        kernel_args[3] = ctypes.addressof(c_grid_dim)
+        kernel_args[4] = ctypes.addressof(c_flag)
+        # Keep dcode/dinfo + the c_int wrappers alive — kernel_args holds
+        # raw addresses into them; if any go out of scope cuLaunchKernel
+        # will read freed memory.
+        keepalive = (dcode, dinfo, c_nargs, c_grid_dim, c_flag)
+
         best_warps = self.heuristic_best_warps(grid_dim, concurrencies, num_sm)
-        launch_kernel(cufunc, dcode, dinfo, nargs, grid_dim, 0, grid_dim=cdiv(grid_dim, best_warps), block_dim=(32, best_warps, 1), smem_bytes=SMEM_PER_WARP * best_warps, stream=custream)
+        gx = cdiv(grid_dim, best_warps)
+        smem = SMEM_PER_WARP * best_warps
+
+        return (dinfo, ti, pd.input_indices, cufunc, kernel_args,
+                gx, 1, 1, 32, best_warps, 1, smem, keepalive)
 
     def execute_indirect(
         self,
