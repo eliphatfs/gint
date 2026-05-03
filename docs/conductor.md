@@ -77,6 +77,16 @@ def fn2(a, b):
 - `register_backend(name, cuda_graphs, num_warmup_iters=1)` is still public for users who want a custom name; it swallows re-registration errors with a printed warning so re-imports are safe. `num_warmup_iters` is forwarded to `make_graphed_callables` — default 1 is enough to populate gint's per-shape device buffer cache before capture; don't pass 0 (allocations would land inside the captured region).
 - **AOT autograd**: backend uses `aot_module_simplified` (Inductor's lighter wrapper, not `aot_module`) and passes `inference_compiler=compiler_fn` so the no-grad / `inference_mode()` path skips joint-graph tracing entirely. Saves ~1.5–3 ms per cold compile vs the fuller `aot_module` path. Backward is not supported; passing the same compiler for `fw_compiler` and `inference_compiler` is intentional.
 
+## Per-Call Dispatch (`GintCompiler.compile` → `execute`)
+
+- The `execute(*args)` callable returned to AOT autograd is on the steady-state hot path: it runs every time the compiled function is invoked. Anything that depends only on the FX graph (and not on tensor values) is lifted to compile time; the runtime loop then walks a flat list of typed steps with no FX-graph traversal, no `set()` construction, and no per-call `torch.cuda.current_stream()` lookup.
+- Pre-computed once in `compile()`:
+  - `sg_dispatch[i]` per subgraph: `(compiled_sg, input_keys, output_keys, output_specs, adjustments, ref_input_pos, gather_indices)`. `gather_indices` permutes `input_tensors + output_tensors` back into the alphabetical `global_nodes` order the bytecode + `tensor_infos` were built against.
+  - `plan`: a list of `(STEP_PH | STEP_SUBGRAPH | STEP_GET_ATTR | STEP_EAGER | STEP_OUT_ONE | STEP_OUT_SEQ, ...)` tuples in graph order.
+  - For each eager-fallback node, an `arg_resolvers` / `kwarg_resolvers` pair built by `_make_resolver(value)` — closures that walk the immutable FX arg structure once at compile time and emit cheap dict lookups at call time.
+- Why this matters: a single-subgraph rmsnorm (9 FX nodes) measured ~37 µs in the closure on top of a 21 µs gint kernel call before the lift; after, the closure cost drops to ~9 µs. The savings scale with subgraph count and graph size — geometry_smith (3 subgraphs, tiny tensors) went 184 µs → 109 µs (-41%), rmsnorm went 96 µs → 72 µs (-25%). The CUDA-graph path is unaffected (capture happens once during warmup; replay never re-enters this closure).
+- The legacy `_run_subgraph` and `_run_eager` methods remain as references but are no longer on the hot path.
+
 ## CUDA Graphs
 
 - The `"gint"` backend wraps the AOT-compiled callable with `torch.cuda.make_graphed_callables`, so subsequent calls replay a CUDA graph instead of paying per-call launch overhead. Use ``options={"cuda_graphs": False}`` to opt out.

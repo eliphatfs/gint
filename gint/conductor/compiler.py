@@ -1249,40 +1249,184 @@ class GintCompiler:
             for node in schedule:
                 node_to_sg[node] = sg_id
 
+        # ---- Build a flat per-call dispatch plan ----
+        #
+        # The original ``execute`` walked ``self.gm.graph.nodes`` three times
+        # per call (placeholders, body, output) and re-derived static info
+        # for each subgraph (sorted globals, input/output split, output
+        # shapes, input adjustments). For graphs with even a handful of
+        # nodes this Python-level work is the dominant per-launch cost: a
+        # single-subgraph rmsnorm (9 FX nodes) measured ~37 us in this
+        # closure on top of a 21 us kernel call.
+        #
+        # The refactor below lifts everything that depends only on the
+        # FX graph (shape, dtype-source, sorted globals, output specs,
+        # adjustments, eager-arg structure) to compile time, and emits a
+        # flat ``plan`` of small ops the runtime steps through.
+        STEP_PH       = 0  # ('placeholder', ph_idx, node_key)
+        STEP_SUBGRAPH = 1  # ('subgraph',    sg_dispatch_idx)
+        STEP_GET_ATTR = 2  # ('get_attr',    node_key, attr_value)
+        STEP_EAGER    = 3  # ('eager',       node_key, target, arg_resolver, kwarg_resolver)
+        STEP_OUT_ONE  = 4  # ('output_one',  res)              -- res is Node or const
+        STEP_OUT_SEQ  = 5  # ('output_seq',  tuple_of_res)
+
+        # Per-subgraph pre-resolved dispatch info.
+        # Each entry: (compiled_sg, input_keys, output_keys,
+        #              output_specs, adjustments, ref_input_pos,
+        #              gather_indices)
+        #   * input_keys / output_keys: FX nodes used to look up tensors in
+        #     ``results`` (input read, output write).
+        #   * output_specs: list of (shape, ) tuples for each output. dtype
+        #     and device come from input_tensors[ref_input_pos].
+        #   * adjustments: list of (input_position, dim, start, length)
+        #     resolved from the compiled subgraph's input_adjustments.
+        #   * gather_indices: permutation from (input_tensors + output_tensors)
+        #     to ``global_nodes`` (alphabetical) order. The compiled
+        #     subgraph's bytecode and ``tensor_infos`` were built against
+        #     ``global_nodes`` order, so the runtime call must pass
+        #     ``[(input_tensors+output_tensors)[i] for i in gather_indices]``.
+        sg_dispatch: List[tuple] = []
+        sg_id_to_dispatch_idx: Dict[int, int] = {}
+        for sg_id, schedule in enumerate(subgraph_schedules):
+            node_set = set(schedule)
+            global_nodes = self._sorted_globals(
+                partitioner._required_globals(schedule))
+            input_keys  = [n for n in global_nodes if n not in node_set]
+            output_keys = [n for n in global_nodes if n in node_set]
+
+            adjustments: List[tuple] = []
+            comp_sg = compiled[sg_id]
+            for gidx, dim, start in comp_sg.input_adjustments:
+                node = global_nodes[gidx]
+                if node in input_keys:
+                    pos = input_keys.index(node)
+                    inp_shape = partitioner._get_shape(node)
+                    if inp_shape is not None:
+                        length = inp_shape[dim] - start
+                        adjustments.append((pos, dim, start, length))
+
+            output_specs: List[tuple] = []
+            for node in output_keys:
+                out_shape = partitioner._get_shape(node)
+                if out_shape is None:
+                    out_shape = comp_sg.output_shape
+                output_specs.append(tuple(out_shape))
+
+            # ref_input_pos: index into input_tensors used to source
+            # dtype/device for output allocation. ``_run_subgraph`` used
+            # input_tensors[0] when present, else the first value in
+            # ``results``. We keep the same fallback at runtime by
+            # leaving this -1 to signal "use first arg".
+            ref_input_pos = 0 if input_keys else -1
+
+            # Permute (input_tensors + output_tensors) -> global_nodes order.
+            combined = input_keys + output_keys
+            pos_in_combined = {n: i for i, n in enumerate(combined)}
+            gather_indices = tuple(pos_in_combined[n] for n in global_nodes)
+
+            sg_id_to_dispatch_idx[sg_id] = len(sg_dispatch)
+            sg_dispatch.append((comp_sg, input_keys, output_keys,
+                                output_specs, adjustments, ref_input_pos,
+                                gather_indices))
+
+        # Pre-build per-eager-node arg/kwarg resolvers. Each resolver is a
+        # function ``(results) -> resolved_value`` that walks the immutable
+        # FX arg structure once at compile time and emits cheap operations
+        # at call time. For the common case of a flat ``args`` tuple of
+        # Nodes + scalars, this collapses to a single tuple-comprehension
+        # with dict lookups (no recursion, no isinstance checks per leaf).
+        def _make_resolver(value):
+            if isinstance(value, Node):
+                return lambda results, _v=value: results[_v]
+            if isinstance(value, list):
+                child = [_make_resolver(x) for x in value]
+                return lambda results, _c=child: [r(results) for r in _c]
+            if isinstance(value, tuple):
+                child = [_make_resolver(x) for x in value]
+                return lambda results, _c=child: tuple(r(results) for r in _c)
+            if isinstance(value, dict):
+                items = [(k, _make_resolver(v)) for k, v in value.items()]
+                return lambda results, _i=items: {k: r(results) for k, r in _i}
+            return lambda _results, _v=value: _v
+
+        plan: List[tuple] = []
+        ph_count = 0
+        executed_sgs: Set[int] = set()
+        for node in self.gm.graph.nodes:
+            if node.op == 'placeholder':
+                plan.append((STEP_PH, ph_count, node))
+                ph_count += 1
+                continue
+            if node.op == 'output':
+                res = node.args[0]
+                if isinstance(res, (list, tuple)):
+                    plan.append((STEP_OUT_SEQ, tuple(res)))
+                else:
+                    plan.append((STEP_OUT_ONE, res))
+                continue
+            if node in node_to_sg:
+                sg_id = node_to_sg[node]
+                if sg_id in executed_sgs:
+                    continue
+                executed_sgs.add(sg_id)
+                plan.append((STEP_SUBGRAPH, sg_id_to_dispatch_idx[sg_id]))
+                continue
+            if node.op == 'get_attr':
+                plan.append((STEP_GET_ATTR, node, getattr(self.gm, node.target)))
+                continue
+            arg_resolvers   = [_make_resolver(a) for a in node.args]
+            kwarg_resolvers = [(k, _make_resolver(v)) for k, v in node.kwargs.items()]
+            plan.append((STEP_EAGER, node, node.target, arg_resolvers, kwarg_resolvers))
+
+        torch_empty = torch.empty
+        current_stream = torch.cuda.current_stream
+        num_subgraphs = len(subgraph_schedules)
+
         def execute(*args):
             results: Dict[Node, torch.Tensor] = {}
+            stream_handle = current_stream().cuda_stream
 
-            ph_idx = 0
-            for node in self.gm.graph.nodes:
-                if node.op == 'placeholder':
-                    results[node] = args[ph_idx]
-                    ph_idx += 1
-
-            executed_sgs: Set[int] = set()
-            for node in self.gm.graph.nodes:
-                if node.op in ('placeholder', 'output'):
-                    continue
-                if node in node_to_sg:
-                    sg_id = node_to_sg[node]
-                    if sg_id not in executed_sgs:
-                        self._run_subgraph(
-                            sg_id, subgraph_schedules[sg_id],
-                            compiled[sg_id], results, partitioner,
-                        )
-                        executed_sgs.add(sg_id)
-                elif node.op == 'get_attr':
-                    results[node] = getattr(self.gm, node.target)
-                else:
-                    results[node] = self._run_eager(node, results)
-
-            for node in self.gm.graph.nodes:
-                if node.op == 'output':
-                    res = node.args[0]
-                    if isinstance(res, (list, tuple)):
-                        return tuple(results[n] if isinstance(n, Node) else n for n in res)
+            for step in plan:
+                kind = step[0]
+                if kind == STEP_SUBGRAPH:
+                    (comp_sg, input_keys, output_keys, output_specs,
+                     adjustments, ref_pos, gather) = sg_dispatch[step[1]]
+                    input_tensors = [results[n] for n in input_keys]
+                    for pos, dim, start, length in adjustments:
+                        input_tensors[pos] = input_tensors[pos].narrow(
+                            dim, start, length)
+                    if ref_pos >= 0:
+                        ref = input_tensors[ref_pos]
+                    else:
+                        ref = args[0]
+                    output_tensors = [
+                        torch_empty(shape, dtype=ref.dtype, device=ref.device)
+                        for shape in output_specs
+                    ]
+                    for n, t in zip(output_keys, output_tensors):
+                        results[n] = t
+                    combined = input_tensors + output_tensors
+                    ordered = [combined[i] for i in gather]
+                    comp_sg(*ordered, grid_dim=comp_sg.grid_dim,
+                            cuda_stream=stream_handle)
+                elif kind == STEP_PH:
+                    results[step[2]] = args[step[1]]
+                elif kind == STEP_EAGER:
+                    node, target, arg_rs, kw_rs = step[1], step[2], step[3], step[4]
+                    a = tuple(r(results) for r in arg_rs)
+                    kw = {k: r(results) for k, r in kw_rs}
+                    results[node] = target(*a, **kw)
+                elif kind == STEP_GET_ATTR:
+                    results[step[1]] = step[2]
+                elif kind == STEP_OUT_ONE:
+                    res = step[1]
                     return results[res] if isinstance(res, Node) else res
+                else:  # STEP_OUT_SEQ
+                    res = step[1]
+                    return tuple(results[n] if isinstance(n, Node) else n
+                                 for n in res)
 
-        execute.num_gint_subgraphs = len(subgraph_schedules)
+        execute.num_gint_subgraphs = num_subgraphs
         return execute
 
     @staticmethod
