@@ -79,12 +79,19 @@ def fn2(a, b):
 
 ## Per-Call Dispatch (`GintCompiler.compile` → `execute`)
 
-- The `execute(*args)` callable returned to AOT autograd is on the steady-state hot path: it runs every time the compiled function is invoked. Anything that depends only on the FX graph (and not on tensor values) is lifted to compile time; the runtime loop then walks a flat list of typed steps with no FX-graph traversal, no `set()` construction, and no per-call `torch.cuda.current_stream()` lookup.
+- The `execute(*args)` callable returned to AOT autograd is on the steady-state hot path: it runs every time the compiled function is invoked. Anything that depends only on the FX graph (and not on tensor values) is lifted to compile time; the runtime loop then walks a flat list of typed steps with no FX-graph traversal and no per-call set/dict construction.
 - Pre-computed once in `compile()`:
-  - `sg_dispatch[i]` per subgraph: `(compiled_sg, input_keys, output_keys, output_specs, adjustments, ref_input_pos, gather_indices)`. `gather_indices` permutes `input_tensors + output_tensors` back into the alphabetical `global_nodes` order the bytecode + `tensor_infos` were built against.
-  - `plan`: a list of `(STEP_PH | STEP_SUBGRAPH | STEP_GET_ATTR | STEP_EAGER | STEP_OUT_ONE | STEP_OUT_SEQ, ...)` tuples in graph order.
-  - For each eager-fallback node, an `arg_resolvers` / `kwarg_resolvers` pair built by `_make_resolver(value)` — closures that walk the immutable FX arg structure once at compile time and emit cheap dict lookups at call time.
-- Why this matters: a single-subgraph rmsnorm (9 FX nodes) measured ~37 µs in the closure on top of a 21 µs gint kernel call before the lift; after, the closure cost drops to ~9 µs. The savings scale with subgraph count and graph size — geometry_smith (3 subgraphs, tiny tensors) went 184 µs → 109 µs (-41%), rmsnorm went 96 µs → 72 µs (-25%). The CUDA-graph path is unaffected (capture happens once during warmup; replay never re-enters this closure).
+  - `node_to_results_idx`: each value-producing FX node gets a small integer index; the runtime ``results`` is a flat ``list`` indexed by that int (faster than ``Dict[Node, Tensor]``).
+  - `sg_dispatch[i]` per subgraph: `(comp_sg, ti_skeletons, input_writes, output_writes, output_shapes, ref_results_idx)`.
+    - `ti_skeletons`: pre-built `TensorInterface` objects in alphabetical `global_nodes` order. The bytecode/`tensor_infos` were built against this order. The runtime executor reads only `.base_ptr` from these — shape/strides on the TI are ignored at runtime, and `GintCompiledSubgraph.cache_policy` is overridden to a constant so they aren't read there either.
+    - `input_writes`: list of `(results_idx, skel_idx, base_offset_bytes)`. Input slicing (`narrow`) is folded into a compile-time byte offset using FX-stride metadata, so the per-call work is `ti.base_ptr = t.data_ptr() + base_offset` — no `.narrow()` view tensor allocated per call.
+    - `output_writes` + `output_shapes`: parallel lists describing each output's `results` slot, skeleton slot, and concrete shape (for `torch.empty`).
+    - `ref_results_idx`: the `results` index of the first input (used to source `dtype/device` for output allocation; `-1` falls back to `args[0]`).
+  - `plan`: list of `(STEP_PH | STEP_SUBGRAPH | STEP_GET_ATTR | STEP_EAGER | STEP_OUT_NODE | STEP_OUT_CONST | STEP_OUT_SEQ, ...)` tuples in graph order. Output steps split into `_NODE` / `_CONST` / `_SEQ` variants so the runtime branch doesn't have to `isinstance` per call.
+  - For each eager-fallback node, `arg_resolvers` / `kwarg_resolvers` closures built by `_make_resolver(value)` — they walk the immutable FX arg structure once at compile time and emit cheap list-index ops at call time.
+- The closure also captures `executor = get_executor()` and calls `executor.execute(comp_sg, ti_skeletons, ...)` directly, skipping the `BaseExecutableProgram.__call__` indirection (the `torch.compiler.disable` dispatch + `_convert_arg` loop). The conductor closure is never running inside a trace, so the disable wrapper has no work to do here.
+- `GintCompiledSubgraph.cache_policy` overrides the default tuple-of-tuples cache key with a constant `None`. Each subgraph instance only ever sees one (shape, stride, dtype) combination (per-shape compile), so the executor's cacheline dict collapses to a single-entry lookup — saves ~1.5 µs/call.
+- Cumulative impact: a single-subgraph rmsnorm (9 FX nodes) cut from 96 µs → 54 µs total wall (-44%), geometry_smith (3 subgraphs) from 184 µs → 86 µs (-53%). On smith, pure CPU dispatch dropped from 90 µs → 36 µs — well below the 62 µs kernel time, so the GPU work fully hides Python dispatch in real applications. The CUDA-graph path is unaffected (capture happens once during warmup; replay never re-enters this closure).
 - The legacy `_run_subgraph` and `_run_eager` methods remain as references but are no longer on the hot path.
 
 ## CUDA Graphs
