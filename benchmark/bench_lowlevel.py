@@ -211,7 +211,6 @@ def gint_rmsnorm_2d(x, w, y, REGW: int, WARP: int, N: int, M: int):
         fmul()
         fstg_2dt(c, y_blk)
         r += 1
-    pop()
     halt()
 
 
