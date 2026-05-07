@@ -187,30 +187,37 @@ def gint_rmsnorm_2d(x, w, y, REGW: int, WARP: int, N: int, M: int):
     w_blk = make_block_2d(w, [N, M], [1, 0], [1, chunk_t], [0, REGW])
     y_blk = make_block_2d(y, [N, M], [1, N], [1, chunk_t], [0, REGW])
 
-    # Accumulate sum(x^2) over head-dim, caching each chunk in a register
-    fpush(0.0)
-    r = 0
-    for c in range(0, N, WARP):
-        fldg_2dt(c, x_blk)
-        dup()
-        dup()                          # two copies: one to cache, two for fma
-        fstore_reg(r)                  # cache x for normalization pass
-        fma()
-        r += 1
+    # Accumulate sum(x^2) over head-dim.  Unrolled for H=64 (2 × WARP=32):
+    # c=0: fmul (no accumulator needed)   c=32: fma into running sum
+    fldg_2dt(0, x_blk)
+    dup()
+    dup()
+    fstore_reg(0)
+    fmul()                             # acc = x₀²
+
+    fldg_2dt(32, x_blk)
+    dup()
+    dup()
+    fstore_reg(1)
+    fma()                              # acc += x₁²
     warp_allreduce_fsum()
     fmaimm(1.0 / N, 1e-5)
     frsqrt()
 
     # Normalize and apply weight — recover x from registers, no global loads
-    r = 0
-    for c in range(0, N, WARP):
-        dup()
-        fload_reg(r)                   # recover cached x
-        fmul()
-        fldg_2dt(c, w_blk)
-        fmul()
-        fstg_2dt(c, y_blk)
-        r += 1
+    dup()
+    fload_reg(0)
+    fmul()
+    fldg_2dt(0, w_blk)
+    fmul()
+    fstg_2dt(0, y_blk)
+
+    dup()
+    fload_reg(1)
+    fmul()
+    fldg_2dt(32, w_blk)
+    fmul()
+    fstg_2dt(32, y_blk)
     halt()
 
 
