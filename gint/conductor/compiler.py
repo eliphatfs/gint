@@ -1232,9 +1232,20 @@ class GintCompiler:
 
                 if pre_prefix is not None or pw_schedule is not None:
                     fused_nodes = (pre_prefix or []) + [reduction_node] + (pw_schedule or [])
-                    compiled[sg_index] = self._compile_fused_reduction_subgraph(
-                        reduction_node, pw_schedule or [], partitioner,
-                        pre_prefix=pre_prefix)
+                    try:
+                        compiled[sg_index] = self._compile_fused_reduction_subgraph(
+                            reduction_node, pw_schedule or [], partitioner,
+                            pre_prefix=pre_prefix)
+                    except _UnplannableSubgraph:
+                        # Stride or shape mismatch — can't fuse. Fall back
+                        # to standalone reduction; the pointwise nodes that
+                        # would have been fused run via _run_eager instead.
+                        compiled[sg_index] = self._compile_reduction_subgraph(
+                            reduction_node, partitioner)
+                        merged_schedules.append([reduction_node])
+                        sg_index += 1
+                        i += 1
+                        continue
                     merged_schedules.append(fused_nodes)
                     sg_index += 1
                     i += 2 if pw_schedule else 1
@@ -2193,6 +2204,35 @@ class GintCompiler:
                 # External output of a per_batch_pre op.
                 scalar_globals.add(nd)
 
+        # Validate output strides: outputs are freshly allocated as
+        # C-contiguous by execute(), so their FX-metadata strides must
+        # match C-contiguous. Non-contiguous outputs can't be safely
+        # written by a gint kernel.
+        for gn in global_nodes:
+            gn_shape = partitioner._get_shape(gn)
+            gn_strides = partitioner._get_strides(gn)
+            if gn_shape is None or gn_strides is None:
+                continue
+            # A global is an output if it's in suffix_output_nodes,
+            # is the output_node when no broadcast_suffix, or is a
+            # per_batch_pre output (already in scalar_globals).
+            is_output = (
+                gn in suffix_output_nodes
+                or (not broadcast_suffix and gn is output_node)
+                or gn in scalar_globals
+            )
+            # Also check: any global NOT read as an input anywhere is
+            # strictly an output. Inputs would appear as args of nodes
+            # in the fused subgraph.
+            if not is_output:
+                continue
+            if tuple(gn_strides) != tuple(_c_contiguous_strides(gn_shape)):
+                raise _UnplannableSubgraph(
+                    f"fused reduction (new-tile) output {gn.name}: "
+                    f"non-contiguous strides {tuple(gn_strides)} vs "
+                    f"C-contig {tuple(_c_contiguous_strides(gn_shape))} "
+                    f"for shape {tuple(gn_shape)}")
+
         # Per-tensor batch strides for the subgraph's batch axis
         # (input_shape[:-1]). Pads with 0-strides on the left for tensors
         # with fewer batch dims (broadcast over outer batches), and uses
@@ -2716,6 +2756,30 @@ class GintCompiler:
                 input_globals.update(n for n in node.args
                                      if isinstance(n, Node) and n in tensor_map)
 
+        # Validate strides: output globals are freshly allocated as
+        # C-contiguous by execute(), so their FX-metadata strides must
+        # match C-contiguous. Input globals with inner stride != 1 can't
+        # use the 1d path (fldg_1d assumes stride-1 along the reduction dim).
+        for gn in global_nodes:
+            gn_shape = partitioner._get_shape(gn)
+            gn_strides = partitioner._get_strides(gn)
+            if gn_shape is None:
+                continue
+            if gn not in input_globals:
+                # Output global: must be C-contiguous.
+                if gn_strides is not None and tuple(gn_strides) != tuple(_c_contiguous_strides(gn_shape)):
+                    raise _UnplannableSubgraph(
+                        f"fused reduction output {gn.name}: non-contiguous "
+                        f"strides {tuple(gn_strides)} vs C-contig "
+                        f"{tuple(_c_contiguous_strides(gn_shape))} for "
+                        f"shape {tuple(gn_shape)}")
+            else:
+                # Input global: inner stride must be 1 (fldg_1d assumption).
+                if gn_strides is not None and len(gn_strides) > 0 and gn_strides[-1] != 1:
+                    raise _UnplannableSubgraph(
+                        f"fused reduction input {gn.name}: inner stride "
+                        f"{gn_strides[-1]} != 1 for shape {tuple(gn_shape)}")
+
         tensor_infos = []
         for gn in global_nodes:
             gn_shape = partitioner._get_shape(gn)
@@ -2724,7 +2788,11 @@ class GintCompiler:
                 missing = len(batch_dims) - gn_batch_ndim
                 gn_bstrides = [0] * max(0, missing)
                 if gn_batch_ndim > 0:
-                    gn_full_strides = _c_contiguous_strides(gn_shape)
+                    gn_strides = partitioner._get_strides(gn)
+                    if gn_strides is not None:
+                        gn_full_strides = list(gn_strides)
+                    else:
+                        gn_full_strides = _c_contiguous_strides(gn_shape)
                     gn_bstrides = gn_bstrides + list(gn_full_strides[:-1])
                 block_size = gn_shape[-1]
             else:
