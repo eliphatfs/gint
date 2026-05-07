@@ -35,8 +35,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from gint import bytecode, cdiv
 from gint.host.frontend import (
     make_block_1d, fldg_1d, fstg_1d,
-    fpush, fma, fadd, halt,
-    fload_reg, fstore_reg, swap,
+    fpush, fadd, fmul, faddimm, halt,
+    fload_reg, fstore_reg,
 )
 
 # ---------------------------------------------------------------------------
@@ -167,11 +167,10 @@ def _make_gint_poly(degree: int):
     """Return a SugarProgram that evaluates a degree-D geometric-series
     polynomial via Horner's method.
 
-    Stack trace per iteration (acc = x * acc + 1.0):
-        fpush(1.0)     # [acc, 1.0]
-        swap()         # [1.0, acc]
-        fload_reg(0)   # [1.0, acc, x]    sp[0..2] = x, acc, 1
-        fma()          # x * acc + 1.0 → [new_acc]
+    Stack trace per iteration (acc = acc * x + 1.0):
+        fload_reg(0)   # [acc, x]
+        fmul()         # [acc * x]
+        faddimm(1.0)   # [acc * x + 1.0]
     """
 
     @bytecode
@@ -185,10 +184,9 @@ def _make_gint_poly(degree: int):
             fstore_reg(0)                 # ; reg0 = x
             fpush(1.0)                    # acc = 1.0 (= c_D)
             for _ in range(degree):
-                fpush(1.0)                # [acc, 1.0]
-                swap()                    # [1.0, acc]
-                fload_reg(0)              # [1.0, acc, x]
-                fma()                     # [x * acc + 1.0]
+                fload_reg(0)              # [acc, x]
+                fmul()                    # [acc * x]
+                faddimm(1.0)              # [acc * x + 1.0]
             fstg_1d(off, y_ti)            # store result
         halt()
 
