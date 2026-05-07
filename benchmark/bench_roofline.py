@@ -225,11 +225,14 @@ def _make_triton_poly(degree: int):
 # Build function
 # ---------------------------------------------------------------------------
 
-def build_roofline(n=1 << 24, degree=16):
+def build_roofline(n=1 << 24, degree=16, enable_fp_fusion=True):
     """Build roofline benchmark for a given polynomial degree.
 
     Input uniform in [-0.5, 0.5] so the geometric series is bounded:
     p(x) ≤ 1/(1 - 0.5) = 2.0.
+
+    If enable_fp_fusion is False, Triton passes --fmad=false to ptxas,
+    so multiplies and adds stay as separate instructions (matching gint).
     """
     torch.manual_seed(42)
     x = torch.rand(n, device='cuda', dtype=torch.float32) - 0.5  # [-0.5, 0.5]
@@ -250,13 +253,15 @@ def build_roofline(n=1 << 24, degree=16):
         out = torch.empty_like(x)
         BLOCK = 1024
         triton_kernel[(triton.cdiv(n, BLOCK),)](
-            x, out, n, DEGREE=_D, BLOCK=BLOCK)
+            x, out, n, DEGREE=_D, BLOCK=BLOCK, enable_fp_fusion=enable_fp_fusion)
         return out
-    impls['triton'] = triton_call
+    triton_label = "triton" if enable_fp_fusion else "triton-no-fma"
+    impls[triton_label] = triton_call
 
     def gint_call():
         gint_kernel(x, y_gint, N=N, M=M, grid_dim=M)
         return y_gint
+    impls['gint'] = gint_call
     impls['gint'] = gint_call
 
     ai = degree / 4.0  # FLOPs / byte
@@ -280,6 +285,8 @@ def main():
     p.add_argument('--warmup', type=int, default=20)
     p.add_argument('--startup-calls', type=int, default=5)
     p.add_argument('--clear-triton-cache', action='store_true')
+    p.add_argument('--triton-no-fma', action='store_true',
+                   help='Pass --fmad=false to ptxas (disables FMA fusion in Triton)')
     args = p.parse_args()
 
     degrees = [int(d.strip()) for d in args.degree.split(',')]
@@ -292,7 +299,8 @@ def main():
 
     for degree in degrees:
         impls, ref, shape_str, atol, _verify_fn = build_roofline(
-            n=args.n, degree=degree)
+            n=args.n, degree=degree,
+            enable_fp_fusion=not args.triton_no_fma)
 
         print(f"\n{'='*70}")
         print(f"poly (geometric series) roofline benchmark  ({shape_str})")
