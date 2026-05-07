@@ -191,14 +191,10 @@ def gint_rmsnorm_2d(x, w, y, REGW: int, WARP: int, N: int, M: int):
     # c=0: fmul (no accumulator needed)   c=32: fma into running sum
     fldg_2dt(0, x_blk)
     dup()
-    dup()
-    fstore_reg(0)
     fmul()                             # acc = x₀²
 
     fldg_2dt(32, x_blk)
     dup()
-    dup()
-    fstore_reg(1)
     fma()                              # acc += x₁²
     warp_allreduce_fsum()
     fmaimm(1.0 / N, 1e-5)
@@ -206,14 +202,13 @@ def gint_rmsnorm_2d(x, w, y, REGW: int, WARP: int, N: int, M: int):
 
     # Normalize and apply weight — recover x from registers, no global loads
     dup()
-    fload_reg(0)
+    fldg_2dt(0, x_blk)
     fmul()
     fldg_2dt(0, w_blk)
     fmul()
     fstg_2dt(0, y_blk)
 
-    dup()
-    fload_reg(1)
+    fldg_2dt(32, x_blk)
     fmul()
     fldg_2dt(32, w_blk)
     fmul()
