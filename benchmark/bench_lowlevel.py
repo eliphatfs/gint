@@ -30,8 +30,10 @@ import triton.language as tl
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from gint import bytecode, TensorInterface, cdiv
+from gint.kernel.interpreter.main import REG_WIDTH
 from gint.host.frontend import (
-    make_block_1d, fldg_1d, fstg_1d,
+    make_block_1d, make_block_2d,
+    fldg_1d, fstg_1d, fldg_2dt, fstg_2dt,
     fpush, fmaimm, dup, fma, fmul, fadd, fsub, fdiv, frdiv, frsub,
     warp_allreduce_fsum, fperm_w, frsqrt, halt, pop,
     fmulimm, fcos, fsin, fsqrt, swap,
@@ -171,39 +173,39 @@ def gint_add3_kernel(a, b, c, y, REGW: int, WARP: int, N: int, M: int):
 
 
 @bytecode
-def gint_rmsnorm_singlepass(x, w, y, REGW: int, WARP: int, N: int, M: int):
-    """Fused rmsnorm: compute rms-stat and normalize in one pass.
+def gint_rmsnorm_2d(x, w, y, REGW: int, WARP: int, N: int, M: int):
+    """RMSNorm with 2D block layout: WARP-wide reduction over head-dim.
 
-    Caches x in a virtual register so x is loaded from global memory only
-    once.  Requires N <= REGW * WARP (single chunk); the caller must ensure
-    the shape satisfies this constraint.  One program per row (M rows).
+    Mirrors the test_rmsnorm design: 2D block [H=N, T=M], warp lanes handle
+    different H positions, REGW handles different T positions per program.
+    One warp_allreduce suffices — no fperm_w shuffles needed (each lane
+    contributes one H position per T-offset, so cross-lane reduction across
+    all 32 lanes gives the full H-sum for each of the 4 T-positions).
     """
-    x_ti = make_block_1d(x, N, 1, 1, 0, [N], [M])
-    w_ti = make_block_1d(w, N, 1, 1, 0, [0], [M])
-    y_ti = make_block_1d(y, N, 1, 1, 0, [N], [M])
+    chunk_t = cdiv(M, REGW)
 
-    chunk = REGW * WARP  # 128
+    x_blk = make_block_2d(x, [N, M], [1, N], [1, chunk_t], [0, REGW])
+    w_blk = make_block_2d(w, [N, M], [1, 0], [1, chunk_t], [0, REGW])
+    y_blk = make_block_2d(y, [N, M], [1, N], [1, chunk_t], [0, REGW])
 
-    fpush(0.0)                       # running sum = 0
-    for c in range(0, N, chunk):
-        fldg_1d(c, x_ti)             # load x
-        dup()                        # x, x
-        dup()                        # x, x, x
-        fstore_reg(0)                # x, x; reg0 = x (saved for later)
-        fma()                        # x^2 + sum
+    # Accumulate sum(x^2) over head-dim in WARP-wide chunks
+    fpush(0.0)
+    for c in range(0, N, WARP):
+        fldg_2dt(c, x_blk)
+        dup()
+        fma()
     warp_allreduce_fsum()
-    dup(); fperm_w(2, 3, 0, 1); fadd()
-    dup(); fperm_w(1, 0, 3, 2); fadd()
     fmaimm(1.0 / N, 1e-5)
-    frsqrt()                         # rstd
+    frsqrt()
 
-    for c in range(0, N, chunk):
-        dup()                        # rstd, rstd
-        fload_reg(0)                 # rstd, rstd, x
-        fmul()                       # rstd, x * rstd
-        fldg_1d(c, w_ti)             # rstd, x*rstd, w
-        fmul()                       # rstd, x*rstd*w
-        fstg_1d(c, y_ti)             # rstd
+    # Normalize and apply weight
+    for c in range(0, N, WARP):
+        dup()
+        fldg_2dt(c, x_blk)
+        fmul()
+        fldg_2dt(c, w_blk)
+        fmul()
+        fstg_2dt(c, y_blk)
     pop()
     halt()
 
@@ -487,7 +489,7 @@ def build_rmsnorm(B=3000, T=12, H=64):
     impls['triton'] = lambda: triton_rmsnorm(x, x, [1], w, 1e-5).reshape(B, T, H)
 
     def gint_call():
-        gint_rmsnorm_singlepass(x, w, y_gint, N=N, M=M, grid_dim=M)
+        gint_rmsnorm_2d(x, w, y_gint, N=N, M=M, grid_dim=cdiv(M, REG_WIDTH))
         return y_gint.reshape(B, T, H)
     impls['gint'] = gint_call
 
