@@ -17,7 +17,7 @@ class TestInterpretTrivial(unittest.TestCase):
         mod = build_interpreter_main_nvptx()
         ptx = invoke_clang_shim(mod.emit())
         with DriverContext(0) as dctx:
-            func = ptx_link(dctx, ptx, b'geval')
+            func = ptx_link(dctx, ptx, b'geval_s7')
             err, dptr = cuda.cuMemAlloc(64)
             check_cuda_error(err)
             code = numpy.array([0, 0], dtype=numpy.int32)

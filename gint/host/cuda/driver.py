@@ -1,5 +1,6 @@
 import atexit
 import ctypes
+import inspect
 import cuda.bindings.driver as cuda
 from typing import Callable, List, Tuple, Union, Optional
 
@@ -7,6 +8,17 @@ from typing import Callable, List, Tuple, Union, Optional
 class CudaDriverError(RuntimeError):
     """Custom exception for CUDA Driver API errors."""
     pass
+
+
+# cuda-bindings >= 12.8 changed cuCtxCreate from (flags, dev) to
+# (ctxCreateParams, flags, dev).  Detect the signature so we support both.
+_cuctxcreate_params = list(inspect.signature(cuda.cuCtxCreate).parameters.keys())
+if len(_cuctxcreate_params) == 2:
+    def _cuCtxCreate(flags, dev):
+        return cuda.cuCtxCreate(flags, dev)
+else:
+    def _cuCtxCreate(flags, dev):
+        return cuda.cuCtxCreate(None, flags, dev)
 
 
 def check_cuda_error(maybe_err, extra_message: Union[bytes, bytearray, str] = ""):
@@ -35,7 +47,7 @@ class DriverContext(object):
         check_cuda_error(cuda.cuInit(0))
         err, device = cuda.cuDeviceGet(device_ordinal)
         check_cuda_error(err)
-        err, context = cuda.cuCtxCreate(0, device)
+        err, context = _cuCtxCreate(0, device)
         check_cuda_error(err)
         self.context = context
     
