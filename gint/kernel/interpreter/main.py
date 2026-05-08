@@ -1,3 +1,4 @@
+from enum import Enum, auto
 from llvmlite import ir
 from ..platforms.common import *
 from ..platforms.platform import PlatformIRBuilder
@@ -7,6 +8,14 @@ from .instruction import EInsnAttrs, Instruction
 from .instructions.load_tensor_infos import emit_load_tensor_infos
 from .state import StackMachineState, InvalidStateException
 from .structs import TensorInfo
+
+
+class DispatchMode(Enum):
+    SWITCH = auto()           # A: stack-specialized + switch (current)
+    ALLOCA_SWITCH = auto()    # B: alloca state + switch
+    BALANCED_TREE = auto()    # C: stack-specialized + balanced if-else tree
+    OPTIMAL_TREE = auto()     # D: stack-specialized + frequency-optimal if-else tree
+    ALLOCA_BALANCED = auto()  # E: alloca state + balanced if-else tree
 
 from .instructions.arith import *
 from .instructions.arith_int import *
@@ -167,7 +176,83 @@ INSNS: dict[type[Instruction], int] = {
 }
 
 
-def build_main_loop(LL: PlatformIRBuilder, pool_size: int = POOL_SIZE, num_regs: int = NUM_REGS, max_stack: int = MAX_STACK):
+def _emit_insn_case(LL, state, Insn, opid, br_state_fn, suffix):
+    """Emit a single instruction case: create block, clone state, emit IR, branch back.
+
+    Returns (insn_bb, attrs) where attrs is the EInsnAttrs flags for the instruction.
+    """
+    insn_bb = LL.append_basic_block("%s.%s" % (Insn.__name__, suffix))
+    LL.position_at_end(insn_bb)
+    cstate = state.clone()
+    insn = Insn(LL, cstate)
+    attrs = insn.attrs()
+    try:
+        insn.emit_self()
+    except InvalidStateException:
+        LL.unreachable()
+    else:
+        if not (attrs & EInsnAttrs.NoReturn):
+            br_state_fn(cstate)
+    return insn_bb, attrs
+
+
+def _build_if_else_dispatch(LL, state, variant_insns, br_state_fn, undef_bb, suffix, frequencies=None):
+    """Build a binary if-else tree for opcode dispatch.
+
+    If `frequencies` is provided, splits at the weighted median for an
+    optimal (Huffman-like) tree. Otherwise uses a balanced split.
+    """
+    insns_sorted = sorted(variant_insns, key=lambda x: x[1])
+
+    def _emit_leaf(Insn, opid):
+        cstate = state.clone()
+        insn = Insn(LL, cstate)
+        attrs = insn.attrs()
+        try:
+            insn.emit_self()
+        except InvalidStateException:
+            LL.unreachable()
+        else:
+            if not (attrs & EInsnAttrs.NoReturn):
+                br_state_fn(cstate)
+
+    def _build(insns, depth):
+        if len(insns) == 1:
+            Insn, opid = insns[0]
+            _emit_leaf(Insn, opid)
+            return
+
+        if frequencies is not None:
+            total = sum(frequencies.get(opid, 1) for _, opid in insns)
+            cum = 0
+            split_idx = 0
+            for idx, (_, opid) in enumerate(insns):
+                cum += frequencies.get(opid, 1)
+                if cum >= total / 2:
+                    split_idx = idx
+                    break
+            mid = split_idx if split_idx > 0 else 1
+        else:
+            mid = len(insns) // 2
+
+        pivot = insns[mid][1]
+
+        left_bb = LL.append_basic_block("tree.%s.L%d" % (suffix, depth))
+        right_bb = LL.append_basic_block("tree.%s.R%d" % (suffix, depth))
+
+        cond = LL.icmp_unsigned('<', state.opcode, i32(pivot))
+        LL.cbranch(cond, left_bb, right_bb)
+
+        LL.position_at_end(left_bb)
+        _build(insns[:mid], depth + 1)
+
+        LL.position_at_end(right_bb)
+        _build(insns[mid:], depth + 1)
+
+    _build(insns_sorted, 0)
+
+
+def build_main_loop(LL: PlatformIRBuilder, pool_size: int = POOL_SIZE, num_regs: int = NUM_REGS, max_stack: int = MAX_STACK, dispatch_mode: DispatchMode = DispatchMode.SWITCH):
     smem_base = _ensure_smem_global(LL)
 
     # early exit warps beyond user scheduling
@@ -195,59 +280,122 @@ def build_main_loop(LL: PlatformIRBuilder, pool_size: int = POOL_SIZE, num_regs:
     smem_base = LL.gep(smem_base, [i32(0), LL.mul(i32(SMEM_PER_WARP), LL.thread_idx_y())])
 
     entry_bb = LL.block
-    dispatch_bbs: dict[int, ir.Block] = {}
-    dispatch_states: dict[int, StackMachineState] = {}
-    for i in range(max_stack + 1):
-        dispatch_bbs[i] = LL.append_basic_block("dispatch.%d" % i)
-        LL.position_at_end(dispatch_bbs[i])
-        dispatch_states[i] = StackMachineState(LL, smem_base, pool_size, REG_WIDTH, i, num_regs, max_stack)
     undef_bb = LL.append_basic_block("unreachable")
-    
-    def br_state(state: StackMachineState):
-        sp = state.sp
-        for s, t in zip(dispatch_states[sp].flat_regs(), state.flat_regs()):
-            s.add_incoming(t, LL.block)
-        return LL.branch(dispatch_bbs[sp])
-    
-    LL.position_at_end(entry_bb)
-    entry_pc = code_ptr
-    entry_opcode = LL.load(entry_pc)
-    state = dispatch_states[0].clone()
-    state.pc = entry_pc
-    state.opcode = entry_opcode
-    for i in range(pool_size):
-        state.pool[i] = [f32(ir.Undefined)] * REG_WIDTH
-    emit_load_tensor_infos(LL, state, tinfo_ptr)
-    br_state(state)
 
     variant_insns = [(Insn, opid) for Insn, opid in INSNS.items() if not _is_invalid_reg_op(Insn, num_regs)]
 
-    for i in range(max_stack + 1):
-        LL.position_at_end(dispatch_bbs[i])
-        dispatch_switch = LL.switch(dispatch_states[i].opcode, undef_bb)
-        dispatch_weights = [1]
-        for Insn, opid in variant_insns:
-            insn_bb = LL.append_basic_block("%s.%d" % (Insn.__name__, i))
-            LL.position_at_end(insn_bb)
-            cstate = dispatch_states[i].clone()
-            insn = Insn(LL, cstate)
-            attrs = insn.attrs()
-            try:
-                insn.emit_self()
-            except InvalidStateException:
-                LL.unreachable()
+    use_alloca = dispatch_mode in (DispatchMode.ALLOCA_SWITCH, DispatchMode.ALLOCA_BALANCED)
+    use_tree = dispatch_mode in (DispatchMode.BALANCED_TREE, DispatchMode.OPTIMAL_TREE, DispatchMode.ALLOCA_BALANCED)
+
+    if use_alloca:
+        # --- Alloca mode: single dispatch block, runtime sp ---
+        from .state import AllocaStackMachineState
+
+        # Create allocas in the entry block so they dominate all uses
+        LL.position_at_end(entry_bb)
+        sp_alloca = LL.alloca(i32, name="sp")
+        pool_alloca = LL.alloca(f32, size=pool_size * REG_WIDTH, name="pool")
+        LL.store(i32(0), sp_alloca)
+
+        dispatch_bb = LL.append_basic_block("dispatch")
+        LL.position_at_end(dispatch_bb)
+        dispatch_state = AllocaStackMachineState(LL, smem_base, pool_size, REG_WIDTH, 0,
+                                                  num_regs, max_stack,
+                                                  sp_alloca=sp_alloca, pool_alloca=pool_alloca)
+
+        def br_state(state):
+            dispatch_state.pc.add_incoming(state.pc, LL.block)
+            dispatch_state.opcode.add_incoming(state.opcode, LL.block)
+            return LL.branch(dispatch_bb)
+
+        LL.position_at_end(entry_bb)
+        entry_pc = code_ptr
+        entry_opcode = LL.load(entry_pc)
+        state = dispatch_state.clone()
+        state.pc = entry_pc
+        state.opcode = entry_opcode
+        LL.store(i32(0), state.sp)
+        emit_load_tensor_infos(LL, state, tinfo_ptr)
+        br_state(state)
+
+        LL.position_at_end(dispatch_bb)
+        if use_tree:
+            _build_if_else_dispatch(LL, dispatch_state, variant_insns, br_state, undef_bb, "0",
+                                    frequencies=_load_frequencies() if dispatch_mode == DispatchMode.OPTIMAL_TREE else None)
+        else:
+            dispatch_switch = LL.switch(dispatch_state.opcode, undef_bb)
+            dispatch_weights = [1]
+            for Insn, opid in variant_insns:
+                insn_bb, attrs = _emit_insn_case(LL, dispatch_state, Insn, opid, br_state, "0")
+                dispatch_switch.add_case(opid, insn_bb)
+                if attrs & EInsnAttrs.Unlikely:
+                    dispatch_weights.append(1)
+                else:
+                    dispatch_weights.append(10)
+            dispatch_switch.set_weights(dispatch_weights)
+
+    else:
+        # --- PHI mode: stack-depth-specialized dispatch blocks ---
+        dispatch_bbs: dict[int, ir.Block] = {}
+        dispatch_states: dict[int, StackMachineState] = {}
+        for i in range(max_stack + 1):
+            dispatch_bbs[i] = LL.append_basic_block("dispatch.%d" % i)
+            LL.position_at_end(dispatch_bbs[i])
+            dispatch_states[i] = StackMachineState(LL, smem_base, pool_size, REG_WIDTH, i, num_regs, max_stack)
+
+        def br_state(state: StackMachineState):
+            sp = state.sp
+            for s, t in zip(dispatch_states[sp].flat_regs(), state.flat_regs()):
+                s.add_incoming(t, LL.block)
+            return LL.branch(dispatch_bbs[sp])
+
+        LL.position_at_end(entry_bb)
+        entry_pc = code_ptr
+        entry_opcode = LL.load(entry_pc)
+        state = dispatch_states[0].clone()
+        state.pc = entry_pc
+        state.opcode = entry_opcode
+        for i in range(pool_size):
+            state.pool[i] = [f32(ir.Undefined)] * REG_WIDTH
+        emit_load_tensor_infos(LL, state, tinfo_ptr)
+        br_state(state)
+
+        for i in range(max_stack + 1):
+            LL.position_at_end(dispatch_bbs[i])
+            st = dispatch_states[i]
+            if use_tree:
+                frequencies = _load_frequencies() if dispatch_mode == DispatchMode.OPTIMAL_TREE else None
+                _build_if_else_dispatch(LL, st, variant_insns, br_state, undef_bb, str(i),
+                                        frequencies=frequencies)
             else:
-                if not (attrs & EInsnAttrs.NoReturn):
-                    br_state(cstate)
-            dispatch_switch.add_case(opid, insn_bb)
-            if attrs & EInsnAttrs.Unlikely:
-                dispatch_weights.append(1)
-            else:
-                dispatch_weights.append(10)
-        dispatch_switch.set_weights(dispatch_weights)
+                dispatch_switch = LL.switch(st.opcode, undef_bb)
+                dispatch_weights = [1]
+                for Insn, opid in variant_insns:
+                    insn_bb, attrs = _emit_insn_case(LL, st, Insn, opid, br_state, str(i))
+                    dispatch_switch.add_case(opid, insn_bb)
+                    if attrs & EInsnAttrs.Unlikely:
+                        dispatch_weights.append(1)
+                    else:
+                        dispatch_weights.append(10)
+                dispatch_switch.set_weights(dispatch_weights)
 
     LL.position_at_end(undef_bb)
     LL.unreachable()
+
+
+# Lazy-loaded frequency table for optimal tree dispatch (Setup D)
+_FREQUENCIES = None
+
+
+def _load_frequencies():
+    global _FREQUENCIES
+    if _FREQUENCIES is None:
+        try:
+            from .opcode_frequencies import FREQUENCIES
+            _FREQUENCIES = FREQUENCIES
+        except ImportError:
+            _FREQUENCIES = {}
+    return _FREQUENCIES
 
 
 GEvalFType = ir.FunctionType(void, [
@@ -264,7 +412,7 @@ def variant_kernel_name(variant: str) -> str:
     return f"geval_{variant}"
 
 
-def build_interpreter_main_nvptx(variants: list[str] = None) -> PlatformIRBuilder:
+def build_interpreter_main_nvptx(variants: list[str] = None, dispatch_mode: DispatchMode = DispatchMode.SWITCH) -> PlatformIRBuilder:
     """Build an NVPTX module containing one kernel per requested variant.
 
     Returns the IR builder of the LAST variant; the module (`LL.module`)
@@ -276,15 +424,15 @@ def build_interpreter_main_nvptx(variants: list[str] = None) -> PlatformIRBuilde
     first, *rest = variants
     pool, regs, stack = VARIANTS[first]
     LL = NVPTXIRBuilder.create_kernel_module(GEvalFType, variant_kernel_name(first))
-    build_main_loop(LL, pool, regs, stack)
+    build_main_loop(LL, pool, regs, stack, dispatch_mode=dispatch_mode)
     for v in rest:
         pool, regs, stack = VARIANTS[v]
         LL = NVPTXIRBuilder.add_kernel(LL, GEvalFType, variant_kernel_name(v))
-        build_main_loop(LL, pool, regs, stack)
+        build_main_loop(LL, pool, regs, stack, dispatch_mode=dispatch_mode)
     return LL
 
 
-def build_interpreter_main_amdgcn(gfx: str = "gfx1100", variants: list[str] = None) -> PlatformIRBuilder:
+def build_interpreter_main_amdgcn(gfx: str = "gfx1100", variants: list[str] = None, dispatch_mode: DispatchMode = DispatchMode.SWITCH) -> PlatformIRBuilder:
     """Build an AMDGCN module containing one kernel per requested variant."""
     if variants is None:
         variants = list(VARIANTS)
@@ -292,9 +440,9 @@ def build_interpreter_main_amdgcn(gfx: str = "gfx1100", variants: list[str] = No
     first, *rest = variants
     pool, regs, stack = VARIANTS[first]
     LL = AMDGCNIRBuilder.create_kernel_module(GEvalFType, variant_kernel_name(first), gfx=gfx)
-    build_main_loop(LL, pool, regs, stack)
+    build_main_loop(LL, pool, regs, stack, dispatch_mode=dispatch_mode)
     for v in rest:
         pool, regs, stack = VARIANTS[v]
         LL = AMDGCNIRBuilder.add_kernel(LL, GEvalFType, variant_kernel_name(v))
-        build_main_loop(LL, pool, regs, stack)
+        build_main_loop(LL, pool, regs, stack, dispatch_mode=dispatch_mode)
     return LL

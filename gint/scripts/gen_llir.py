@@ -4,7 +4,7 @@ import rich
 import argparse
 import subprocess
 from typing import Literal, Optional
-from gint.kernel.interpreter.main import build_interpreter_main_nvptx, build_interpreter_main_amdgcn
+from gint.kernel.interpreter.main import DispatchMode, build_interpreter_main_nvptx, build_interpreter_main_amdgcn
 from gint.kernel import platforms
 
 
@@ -96,12 +96,23 @@ def main():
     )
     argp.add_argument("--cc", type=int, default=None)
     argp.add_argument("--gfx", type=str, default="gfx1100", help="AMD GFX target (e.g. gfx1100, gfx11-generic)")
+    argp.add_argument("--dispatch-mode", type=str, default="switch",
+                      choices=['switch', 'alloca-switch', 'balanced', 'optimal', 'alloca-balanced'],
+                      help="Dispatch mode for opcode dispatch (default: switch)")
     args = argp.parse_args()
 
+    dispatch_mode = {
+        'switch': DispatchMode.SWITCH,
+        'alloca-switch': DispatchMode.ALLOCA_SWITCH,
+        'balanced': DispatchMode.BALANCED_TREE,
+        'optimal': DispatchMode.OPTIMAL_TREE,
+        'alloca-balanced': DispatchMode.ALLOCA_BALANCED,
+    }[args.dispatch_mode]
+
     if args.target == 'amdgcn':
-        mod = build_interpreter_main_amdgcn(args.gfx)
+        mod = build_interpreter_main_amdgcn(args.gfx, dispatch_mode=dispatch_mode)
     else:
-        mod = build_interpreter_main_nvptx()
+        mod = build_interpreter_main_nvptx(dispatch_mode=dispatch_mode)
     ir = mod.emit()
     if args.check_only:
         ir = invoke_opt_shim(ir)
