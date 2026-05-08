@@ -1,4 +1,4 @@
-from ..state import StackMachineState
+from ..state import StackMachineState, InvalidStateException
 from ...platforms.platform import PlatformIRBuilder
 from ..instruction import DefaultControlInstruction, DefaultControlOperandInstruction
 from ...platforms.common import *
@@ -76,16 +76,19 @@ class DupBroadcastW(DefaultControlOperandInstruction):
 
 class FPermW(DefaultControlOperandInstruction):
     """
-    Permute the 4 elements of the top-of-stack vector.
+    Permute the elements of the top-of-stack vector.
     Operand is an i32 encoding 4 i8 indices (i8x4 layout, little-endian):
       bits  7.. 0 -> index for output lane 0
       bits 15.. 8 -> index for output lane 1
       bits 23..16 -> index for output lane 2
       bits 31..24 -> index for output lane 3
-    Each index selects which input lane (0–3) feeds the corresponding output lane.
+    Each index selects which input lane feeds the corresponding output lane.
+    Only valid for REG_WIDTH=4 (i32 fits exactly 4 i8 lane indices).
     """
 
     def emit(self, LL: PlatformIRBuilder, state: StackMachineState):
+        if state.reg_width != 4:
+            raise InvalidStateException()
         v = state.peek()
         op = self.op  # i32
 
@@ -97,7 +100,7 @@ class FPermW(DefaultControlOperandInstruction):
         for lane in range(state.reg_width):
             idx_i8 = LL.extract_element(op_vec, i32(lane))
             idx = LL.zext(idx_i8, i32)
-            # Build a binary selection tree over the 4 input elements.
+            # Build a binary selection tree over the input elements.
             selected = binary_cond_tree(LL, v, 0, len(v), idx)
             result.append(selected)
 
@@ -114,9 +117,12 @@ class FShuf2(DefaultControlOperandInstruction):
       bits 15.. 8 -> index into vec1 for output lane 1  (y)
       bits 23..16 -> index into vec2 for output lane 2  (z)
       bits 31..24 -> index into vec2 for output lane 3  (w)
+    Only valid for REG_WIDTH=4 (i32 fits exactly 4 i8 lane indices, split 2+2).
     """
 
     def emit(self, LL: PlatformIRBuilder, state: StackMachineState):
+        if state.reg_width != 4:
+            raise InvalidStateException()
         vec2 = state.peek()
         vec1 = state.peek(1)
         op = self.op  # i32

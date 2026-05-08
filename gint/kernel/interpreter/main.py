@@ -1,3 +1,5 @@
+import os
+
 from llvmlite import ir
 from ..platforms.common import *
 from ..platforms.platform import PlatformIRBuilder
@@ -23,7 +25,7 @@ from .instructions.reg import *
 POOL_SIZE = 12   # unified stack+register pool; stack grows up, regs down from top
 NUM_REGS = 8    # reg n = pool[POOL_SIZE-1-n]; effective max stack = POOL_SIZE - NUM_REGS = 4
 MAX_STACK = 8
-REG_WIDTH = 4
+REG_WIDTH = int(os.environ.get("GINT_REG_WIDTH", "4"))
 SMEM_PER_WARP = MAX_N_TENSORS * 7 * 4
 
 
@@ -167,7 +169,9 @@ INSNS: dict[type[Instruction], int] = {
 }
 
 
-def build_main_loop(LL: PlatformIRBuilder, pool_size: int = POOL_SIZE, num_regs: int = NUM_REGS, max_stack: int = MAX_STACK):
+def build_main_loop(LL: PlatformIRBuilder, pool_size: int = POOL_SIZE, num_regs: int = NUM_REGS, max_stack: int = MAX_STACK, reg_width: int = None):
+    if reg_width is None:
+        reg_width = REG_WIDTH
     smem_base = _ensure_smem_global(LL)
 
     # early exit warps beyond user scheduling
@@ -200,7 +204,7 @@ def build_main_loop(LL: PlatformIRBuilder, pool_size: int = POOL_SIZE, num_regs:
     for i in range(max_stack + 1):
         dispatch_bbs[i] = LL.append_basic_block("dispatch.%d" % i)
         LL.position_at_end(dispatch_bbs[i])
-        dispatch_states[i] = StackMachineState(LL, smem_base, pool_size, REG_WIDTH, i, num_regs, max_stack)
+        dispatch_states[i] = StackMachineState(LL, smem_base, pool_size, reg_width, i, num_regs, max_stack)
     undef_bb = LL.append_basic_block("unreachable")
     
     def br_state(state: StackMachineState):
@@ -216,7 +220,7 @@ def build_main_loop(LL: PlatformIRBuilder, pool_size: int = POOL_SIZE, num_regs:
     state.pc = entry_pc
     state.opcode = entry_opcode
     for i in range(pool_size):
-        state.pool[i] = [f32(ir.Undefined)] * REG_WIDTH
+        state.pool[i] = [f32(ir.Undefined)] * reg_width
     emit_load_tensor_infos(LL, state, tinfo_ptr)
     br_state(state)
 
@@ -264,7 +268,7 @@ def variant_kernel_name(variant: str) -> str:
     return f"geval_{variant}"
 
 
-def build_interpreter_main_nvptx(variants: list[str] = None) -> PlatformIRBuilder:
+def build_interpreter_main_nvptx(variants: list[str] = None, reg_width: int = None) -> PlatformIRBuilder:
     """Build an NVPTX module containing one kernel per requested variant.
 
     Returns the IR builder of the LAST variant; the module (`LL.module`)
@@ -276,15 +280,15 @@ def build_interpreter_main_nvptx(variants: list[str] = None) -> PlatformIRBuilde
     first, *rest = variants
     pool, regs, stack = VARIANTS[first]
     LL = NVPTXIRBuilder.create_kernel_module(GEvalFType, variant_kernel_name(first))
-    build_main_loop(LL, pool, regs, stack)
+    build_main_loop(LL, pool, regs, stack, reg_width=reg_width)
     for v in rest:
         pool, regs, stack = VARIANTS[v]
         LL = NVPTXIRBuilder.add_kernel(LL, GEvalFType, variant_kernel_name(v))
-        build_main_loop(LL, pool, regs, stack)
+        build_main_loop(LL, pool, regs, stack, reg_width=reg_width)
     return LL
 
 
-def build_interpreter_main_amdgcn(gfx: str = "gfx1100", variants: list[str] = None) -> PlatformIRBuilder:
+def build_interpreter_main_amdgcn(gfx: str = "gfx1100", variants: list[str] = None, reg_width: int = None) -> PlatformIRBuilder:
     """Build an AMDGCN module containing one kernel per requested variant."""
     if variants is None:
         variants = list(VARIANTS)
@@ -292,9 +296,9 @@ def build_interpreter_main_amdgcn(gfx: str = "gfx1100", variants: list[str] = No
     first, *rest = variants
     pool, regs, stack = VARIANTS[first]
     LL = AMDGCNIRBuilder.create_kernel_module(GEvalFType, variant_kernel_name(first), gfx=gfx)
-    build_main_loop(LL, pool, regs, stack)
+    build_main_loop(LL, pool, regs, stack, reg_width=reg_width)
     for v in rest:
         pool, regs, stack = VARIANTS[v]
         LL = AMDGCNIRBuilder.add_kernel(LL, GEvalFType, variant_kernel_name(v))
-        build_main_loop(LL, pool, regs, stack)
+        build_main_loop(LL, pool, regs, stack, reg_width=reg_width)
     return LL

@@ -1,4 +1,4 @@
-from ..state import StackMachineState
+from ..state import StackMachineState, InvalidStateException
 from ...platforms.platform import PlatformIRBuilder
 from ..instruction import DefaultControlOperandInstruction
 from ...platforms.common import *
@@ -37,8 +37,11 @@ class FMAImm(DefaultControlOperandInstruction):
 
 
 class LoadImm4F(DefaultControlOperandInstruction):
-    """Load 4 int8 packed in i32 operand, cast each to f32"""
+    """Load 4 int8 packed in i32 operand, cast each to f32.
+    Only valid for REG_WIDTH=4 (i32 packs exactly 4 i8 values)."""
     def emit(self, LL: PlatformIRBuilder, state: StackMachineState):
+        if state.reg_width != 4:
+            raise InvalidStateException()
         vals = []
         for i in range(4):
             # Extract i-th byte (little endian: byte 0 is LSB)
@@ -49,8 +52,11 @@ class LoadImm4F(DefaultControlOperandInstruction):
 
 
 class LoadImm4I(DefaultControlOperandInstruction):
-    """Load 4 int8 packed in i32 operand, cast each to i32 and bitcast to f32"""
+    """Load 4 int8 packed in i32 operand, cast each to i32 and bitcast to f32.
+    Only valid for REG_WIDTH=4 (i32 packs exactly 4 i8 values)."""
     def emit(self, LL: PlatformIRBuilder, state: StackMachineState):
+        if state.reg_width != 4:
+            raise InvalidStateException()
         vals = []
         for i in range(4):
             # Extract i-th byte

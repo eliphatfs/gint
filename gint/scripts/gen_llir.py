@@ -1,9 +1,17 @@
 import os
 import re
+import sys
 import rich
 import argparse
 import subprocess
 from typing import Literal, Optional
+
+# Parse --reg-width early so GINT_REG_WIDTH is set before main.py is imported.
+for i, arg in enumerate(sys.argv):
+    if arg == '--reg-width' and i + 1 < len(sys.argv):
+        os.environ['GINT_REG_WIDTH'] = sys.argv[i + 1]
+        break
+
 from gint.kernel.interpreter.main import build_interpreter_main_nvptx, build_interpreter_main_amdgcn
 from gint.kernel import platforms
 
@@ -96,12 +104,14 @@ def main():
     )
     argp.add_argument("--cc", type=int, default=None)
     argp.add_argument("--gfx", type=str, default="gfx1100", help="AMD GFX target (e.g. gfx1100, gfx11-generic)")
+    argp.add_argument("--reg-width", type=int, default=None,
+                      help="Register width (ILP factor). Defaults to GINT_REG_WIDTH env var or 4.")
     args = argp.parse_args()
 
     if args.target == 'amdgcn':
-        mod = build_interpreter_main_amdgcn(args.gfx)
+        mod = build_interpreter_main_amdgcn(args.gfx, reg_width=args.reg_width)
     else:
-        mod = build_interpreter_main_nvptx()
+        mod = build_interpreter_main_nvptx(reg_width=args.reg_width)
     ir = mod.emit()
     if args.check_only:
         ir = invoke_opt_shim(ir)

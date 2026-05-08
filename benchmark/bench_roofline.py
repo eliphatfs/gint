@@ -19,6 +19,7 @@ Usage:
 """
 
 import argparse
+import csv
 import math
 import os
 import pathlib
@@ -242,7 +243,9 @@ def build_roofline(n=1 << 24, degree=16, enable_fp_fusion=True):
     gint_kernel = _make_gint_poly(degree)
     triton_kernel, _D = _make_triton_poly(degree)
 
-    chunk = 128  # REGW * WARP
+    _REGW = int(os.environ.get("GINT_REG_WIDTH", "4"))
+    _WARP = 32
+    chunk = _REGW * _WARP
     M = cdiv(n, chunk)
     N = chunk
 
@@ -287,6 +290,10 @@ def main():
     p.add_argument('--clear-triton-cache', action='store_true')
     p.add_argument('--triton-no-fma', action='store_true',
                    help='Pass --fmad=false to ptxas (disables FMA fusion in Triton)')
+    p.add_argument('--gint-only', action='store_true',
+                   help='Only benchmark gint (skip triton and eager)')
+    p.add_argument('--output-csv', type=str, default=None,
+                   help='Write results to CSV file instead of stdout table')
     args = p.parse_args()
 
     degrees = [int(d.strip()) for d in args.degree.split(',')]
@@ -297,41 +304,61 @@ def main():
     prime_cuda()
     prime_backends()
 
+    # Prepare CSV output if requested
+    csv_writer = None
+    csv_file = None
+    if args.output_csv:
+        csv_file = open(args.output_csv, 'w', newline='')
+        csv_writer = csv.writer(csv_file)
+        csv_writer.writerow(['degree', 'impl', 'startup_ms', 'wall_ms', 'kernel_ms'])
+
+    K = args.startup_calls
+
     for degree in degrees:
         impls, ref, shape_str, atol, _verify_fn = build_roofline(
             n=args.n, degree=degree,
             enable_fp_fusion=not args.triton_no_fma)
 
-        print(f"\n{'='*70}")
-        print(f"poly (geometric series) roofline benchmark  ({shape_str})")
-        print(f"device={torch.cuda.get_device_name()}, dtype=fp32")
-        print(f"warmup={args.warmup}, iters={args.iters}\n")
+        if not args.gint_only:
+            print(f"\n{'='*70}")
+            print(f"poly (geometric series) roofline benchmark  ({shape_str})")
+            print(f"device={torch.cuda.get_device_name()}, dtype=fp32")
+            print(f"warmup={args.warmup}, iters={args.iters}\n")
 
-        K = args.startup_calls
-        header = f"{'impl':<10}" + "".join(
-            f"{'call'+str(i+1):>10}" for i in range(K))
-        header += f"{'startup':>12}{'wall':>10}{'kernel':>10}"
-        print(header)
-        print('-' * len(header))
+            header = f"{'impl':<10}" + "".join(
+                f"{'call'+str(i+1):>10}" for i in range(K))
+            header += f"{'startup':>12}{'wall':>10}{'kernel':>10}"
+            print(header)
+            print('-' * len(header))
 
         for name, fn in impls.items():
+            if args.gint_only and name != 'gint':
+                continue
             early = [time_call_ms(fn) for _ in range(K)]
             verify(name, ref, fn(), atol=atol)
             runtime = median_ms(fn, args.warmup, args.iters)
             kernel = kernel_time_ms(fn)
             startup = sum(early) - K * runtime
-            early_str = "".join(f"{t:>10.3f}" for t in early)
-            print(f"{name:<10}{early_str}{startup:>12.3f}{runtime:>10.4f}"
-                  f"{kernel:>10.4f}")
 
-        # Report throughput
-        gbytes = args.n * 2 * 4 / 1e9  # load + store, 4 bytes each
-        gflops = args.n * degree * 2 / 1e9  # degree FMAs, 2 FLOPs each
-        print(f"\nGB per call: {gbytes:.3f}   GFLOP per call: {gflops:.3f}")
-        print("startup = sum(first K calls) - K * wall  (ms)")
-        print("wall    = end-to-end median per-call time (sync around each "
-              "call)")
-        print("kernel  = GPU-only kernel time per call from torch.profiler")
+            if csv_writer:
+                csv_writer.writerow([degree, name, f"{startup:.3f}", f"{runtime:.4f}", f"{kernel:.4f}"])
+            else:
+                early_str = "".join(f"{t:>10.3f}" for t in early)
+                print(f"{name:<10}{early_str}{startup:>12.3f}{runtime:>10.4f}"
+                      f"{kernel:>10.4f}")
+
+        if not args.gint_only:
+            # Report throughput
+            gbytes = args.n * 2 * 4 / 1e9  # load + store, 4 bytes each
+            gflops = args.n * degree * 2 / 1e9  # degree FMAs, 2 FLOPs each
+            print(f"\nGB per call: {gbytes:.3f}   GFLOP per call: {gflops:.3f}")
+            print("startup = sum(first K calls) - K * wall  (ms)")
+            print("wall    = end-to-end median per-call time (sync around each "
+                  "call)")
+            print("kernel  = GPU-only kernel time per call from torch.profiler")
+
+    if csv_file:
+        csv_file.close()
 
 
 if __name__ == '__main__':
