@@ -531,11 +531,7 @@ def _plan_spills(
             if len(on_stack) + len(in_reg) > pool_limit:
                 feasible = False
 
-        if not new_buried:
-            return node_to_reg, overflow, feasible
-        extra_buried |= new_buried
-
-    return node_to_reg, overflow, feasible
+        return node_to_reg, overflow, feasible
 
 
 # ---------------------------------------------------------------------------
@@ -1825,7 +1821,7 @@ class GintCompiler:
         else:  # '2dw'
             load_fn, store_fn = fe.fldg_2dw, fe.fstg_2dw
 
-        # Open a FrontendState context so all fe.* calls accumulate into fe_state.bc.
+        # ---  bytecode generation  ---
         fe_state = FrontendState([])
         token = _frontend_state.set(fe_state)
         try:
@@ -1839,14 +1835,10 @@ class GintCompiler:
                 if op_desc is None:
                     raise RuntimeError(f"Unsupported op reached compiler: {node.target}")
 
-                # Commutative fast path: if both args are already on the
-                # virtual stack at depths 0/1 in either order, skip the
-                # Swap that the normal arg-loading path would emit.
                 if codegen.try_skip_commutative_args(node, op_desc):
                     codegen.emit_op(node, op_desc, num_pushed=2)
                     continue
 
-                # Handle operands in the prescribed arg order.
                 arg_indices = resolve_arg_order(op_desc, node)
                 pushed = 0
                 for idx in arg_indices:
@@ -1855,7 +1847,6 @@ class GintCompiler:
                         codegen.handle_operand(arg)
                         pushed += 1
 
-                # Emit the operation and manage the result.
                 codegen.emit_op(node, op_desc, num_pushed=pushed)
 
             fe.halt()
