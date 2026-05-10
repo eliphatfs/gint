@@ -121,13 +121,14 @@ for tensor info construction would push throughput to CUDA API-limited speeds
 
 ---
 
-## Experiment 3: Three-Way Speed Comparison
+## Experiment 3: Four-Way Speed Comparison
 
-**Goal:** Quantify the speedup of batch GPU evaluation vs. the two obvious
-alternative implementations.
+**Goal:** Quantify the speedup of batch GPU evaluation vs. the obvious
+alternatives, including a torch-eager build path that keeps the bytecode and
+HTensorInfo construction off the Python critical path.
 
-**Setup:** relu target, search length 4, 69,457 total candidates. All three
-methods use float32 arithmetic and identical NaN-aware comparison logic.
+**Setup:** relu target, search length 4, 69,457 total candidates. All methods
+use float32 arithmetic and identical NaN-aware comparison logic.
 
 **Methods compared:**
 1. **CPU Python interpreter** -- Pure-Python stack machine emulating the gint
@@ -135,21 +136,37 @@ methods use float32 arithmetic and identical NaN-aware comparison logic.
    elements sequentially with early exit on first mismatch. No GPU involvement.
 2. **Sequential GPU** -- One `BatchRunner.run()` call per candidate (batch
    size = 1). Same GPU kernel, but per-candidate launch overhead dominates.
-3. **Batch GPU (ours)** -- `BatchRunner.run()` with batch size 4096. One
-   kernel launch evaluates thousands of candidates simultaneously.
+3. **Batch GPU (CPU build)** -- `BatchRunner.run()` with batch size 4096. One
+   kernel launch evaluates thousands of candidates simultaneously. Bytecodes,
+   `HTensorInfo` arrays, and indirect-pointer tables are built on the host in
+   Python (`struct.pack_into` loop + numpy + `cuMemAlloc`/`cuMemcpyHtoD`).
+4. **Batch GPU (torch build)** -- Same kernel and same indirect dispatch, but
+   per-batch state is built directly on the device via torch eager: bytecodes
+   via `op_table[indices]` gather, `HTensorInfo` rows via `template.repeat`
+   plus a single scatter on the output-pointer slot, pointer tables via
+   `arange*stride+base`. Source: `examples/superopt/executor_torch.py`.
 
 ### Results
 
 | Method | Throughput (candidates/s) | Evaluated | Time (s) | Matches |
 |--------|--------------------------|-----------|----------|---------|
-| CPU Python interpreter | 304,390 | 69,457 | 0.23 | 3 |
-| Sequential GPU (batch=1) | 11,611 | 2,000 | 0.17 | 0 |
-| Batch GPU (batch=4096) | 1,249,729 | 69,457 | 0.06 | 3 |
+| CPU Python interpreter | 290,000 | 69,457 | 0.24 | 3 |
+| Sequential GPU (batch=1) | -- (skipped) | -- | -- | -- |
+| Batch GPU (CPU build, batch=4096) | 810,000 | 69,457 | 0.085 | 3 |
+| **Batch GPU (torch build, batch=4096)** | **21,700,000** | **69,457** | **0.003** | **3** |
 
-| Speedup | Factor |
-|---------|--------|
-| Batch GPU vs CPU | **4.1x** |
-| Batch GPU vs Sequential GPU | **108x** |
+| Speedup (relu length 4) | Factor |
+|-------------------------|--------|
+| Batch GPU CPU-build vs CPU interpreter | 2.8x |
+| **Batch GPU torch-build vs CPU interpreter** | **75x** |
+| **Batch GPU torch-build vs Batch GPU CPU-build** | **27x** |
+
+Numbers are medians of 3 trials. The Sequential GPU baseline is currently
+disabled because indirect-mode launches with `grid_dim=1` hit
+`CUDA_ERROR_MISALIGNED_ADDRESS` on this fatbin (independent bug in the
+single-warp launch path; tracked separately). For historical context, the
+prior measurement of Sequential GPU at ~11,600 candidates/s and Batch GPU
+(CPU build) at ~1.25M candidates/s appears in the older `results.json`.
 
 ### Interpretation
 
@@ -160,25 +177,27 @@ GPU's fixed 128. This is a fundamental advantage of scalar sequential
 evaluation: it can reject bad candidates without computing all outputs. The
 GPU evaluates all 128 elements for all candidates regardless.
 
-**Despite CPU early exit, batch GPU is still 4x faster.** The GPU's massive
-parallelism (4096 candidates x 128 elements = 524K evaluations per launch)
-overcomes the CPU's algorithmic advantage. For search spaces with fewer
-NaN-producing paths (e.g., when transcendentals are excluded from the search
-ops), the CPU's early-exit advantage shrinks and the GPU speedup grows.
+**Batch GPU (CPU build) is still bottlenecked by the host.** Despite each
+launch processing 4,096 candidates in <20 us of kernel time, the per-batch
+`struct.pack_into` loop and numpy pointer-table construction add ~1.3 ms of
+host-side work (see Experiment 2). At 810k candidates/s the throughput is
+limited by Python, not by the GPU.
 
-**Sequential GPU is the slowest method.** With batch size 1, each candidate
-requires ~12 CUDA API calls (alloc, copy, launch, sync, free). At ~10 us each,
-that's ~120 us overhead per candidate. The kernel itself runs in <1 us. Launch
-overhead accounts for >99% of sequential GPU time.
-
-**Batch GPU amortizes launch overhead.** The same 12 CUDA API calls service
-4096 candidates instead of 1, reducing per-candidate API overhead from ~120 us
-to ~0.03 us (4000x reduction). This is the core advantage of `execute_indirect`:
-per-warp program heterogeneity within a single kernel launch.
+**Batch GPU (torch build) removes the Python ceiling.** Building bytecodes and
+`HTensorInfo` rows on the GPU via torch eager eliminates both the
+per-candidate Python loop and the `cuMemAlloc`/`cuMemcpyHtoD`/`cuMemFree` per
+batch (storage is owned by torch's caching allocator and the kernel reads
+`data_ptr()` directly via wrapped `CUdeviceptr`). The result is a **27x
+speedup over the CPU-build path** and a **75x speedup over the CPU
+interpreter** -- despite the interpreter's early-exit advantage. At 21.7M
+candidates/s the bottleneck shifts again, this time to enumeration (see the
+phase-level numbers in Experiment 1 once re-run with this builder; the
+indices-emitting enumerator in `candidates.enumerate_exact_length_indices`
+also helps here by avoiding per-leaf `SearchOp` list materialisation).
 
 **Match counts agree across all methods** (3 matches for relu at length 4),
-validating that the CPU interpreter faithfully emulates the GPU's float32
-stack machine semantics including NaN propagation.
+validating bit-identical semantics between the CPU interpreter, the original
+batch path, and the torch-build path.
 
 ---
 

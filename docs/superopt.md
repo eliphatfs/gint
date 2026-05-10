@@ -20,8 +20,9 @@ python -m examples.superopt --list
 ## Architecture
 
 - **`opcodes.py`**: search space definition — 33+ ops with stack effects (min_depth, net_effect). Expandable with transcendentals.
-- **`candidates.py`**: DFS enumeration with depth-reachability pruning. For length 5 unary targets, prunes 33^5=40M down to ~1.5M valid sequences. Also has numpy-vectorized random batch generation for stochastic search.
-- **`executor.py`**: `BatchRunner` — concatenates all candidate bytecodes into one device allocation, builds per-candidate tensor infos with only the output pointer patched, uses a single indirect-mode kernel launch. ~8 CUDA API calls regardless of batch size.
+- **`candidates.py`**: DFS enumeration with depth-reachability pruning. For length 5 unary targets, prunes 33^5=40M down to ~1.5M valid sequences. Also has numpy-vectorized random batch generation for stochastic search. `enumerate_exact_length_indices` is a sibling of `enumerate_exact_length` that emits `(N, length)` int32 op-indices into a preallocated buffer instead of yielding `SearchOp` lists — feeds the torch-eager builder.
+- **`executor.py`**: `BatchRunner` — concatenates all candidate bytecodes into one device allocation, builds per-candidate tensor infos with only the output pointer patched, uses a single indirect-mode kernel launch. ~8 CUDA API calls regardless of batch size. Builds happen on the host (Python `struct.pack_into` + numpy + `cuMemAlloc`/`cuMemcpyHtoD`).
+- **`executor_torch.py`**: `BatchRunnerGPU` — same wire format as `BatchRunner` but builds bytecodes (via `op_table[indices]` gather), `HTensorInfo` rows (template repeat + scatter on the output-pointer slot), and indirect-pointer tables (`arange*stride+base`) on the GPU via torch eager. Storage is owned by torch's caching allocator; the kernel reads `data_ptr()` directly via wrapped `CUdeviceptr`. ~27× faster end-to-end than `BatchRunner` on relu length 4 (see `bench/README.md` Experiment 3).
 - **`search.py`**: brute-force (exhaustive, length 1..N) and stochastic (random mutation hill climbing) modes. Candidates verified with 10 additional random test vector sets.
 - **`targets.py`**: reference sequences from `op_registry.py` to optimize.
 

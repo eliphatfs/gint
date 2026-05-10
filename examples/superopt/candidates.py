@@ -43,6 +43,65 @@ def enumerate_exact_length(ops, input_depth, output_depth, length):
     yield from _recurse(input_depth, 0, [])
 
 
+def enumerate_exact_length_indices(ops, input_depth, output_depth, length):
+    """Enumerate all stack-valid sequences of *length*, emitting op-indices.
+
+    Functionally equivalent to enumerate_exact_length but returns a
+    contiguous int32 numpy array of shape (N, length) — column j is the
+    index into `ops` chosen at body position j. Skips the per-leaf
+    Python list of SearchOp objects (a major cost at 14M leaves) by
+    writing directly into a preallocated buffer.
+    """
+    if not ops or length == 0:
+        return np.empty((0, length), dtype=np.int32)
+    max_inc = max((op.net_effect for op in ops), default=0)
+    max_dec = max((-op.net_effect for op in ops), default=0)
+
+    # Cache (min_depth, net_effect, idx) triples — avoids attribute lookups
+    # inside the hot recursion (each op is touched billions of times).
+    op_table = [(op.min_depth, op.net_effect, i) for i, op in enumerate(ops)]
+
+    # Preallocate per-row scratch + grow result buffer geometrically
+    # (avoids Python list-of-rows + final np.stack).
+    cur = np.empty(length, dtype=np.int32)
+    cap = 1 << 12
+    buf = np.empty((cap, length), dtype=np.int32)
+    n_out = 0
+
+    def _recurse(depth, pos):
+        nonlocal cap, buf, n_out
+        if pos == length:
+            if depth == output_depth:
+                if n_out == cap:
+                    cap *= 2
+                    new_buf = np.empty((cap, length), dtype=np.int32)
+                    new_buf[:n_out] = buf[:n_out]
+                    buf = new_buf
+                buf[n_out] = cur
+                n_out += 1
+            return
+        remaining = length - pos - 1
+        for min_depth, net_effect, idx in op_table:
+            if depth < min_depth:
+                continue
+            nd = depth + net_effect
+            if nd < 0 or nd > MAX_STACK:
+                continue
+            if remaining == 0:
+                if nd != output_depth:
+                    continue
+            else:
+                lo = nd - remaining * max_dec
+                hi = nd + remaining * max_inc
+                if output_depth < lo or output_depth > hi:
+                    continue
+            cur[pos] = idx
+            _recurse(nd, pos + 1)
+
+    _recurse(input_depth, 0)
+    return buf[:n_out]
+
+
 def make_prefix(arity):
     """Build the load-input bytecode prefix (flat list of int32 words).
 

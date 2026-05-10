@@ -1,9 +1,12 @@
-"""Experiment 3: Three-way speed comparison.
+"""Experiment 3: Four-way speed comparison.
 
-Compares candidate evaluation throughput across three execution strategies:
+Compares candidate evaluation throughput across four execution strategies:
   1. CPU Python interpreter  — pure-Python stack machine emulator
   2. Sequential GPU          — one kernel launch per candidate (normal executor)
-  3. Batch GPU (ours)        — indirect mode, 1 warp per candidate per launch
+  3. Batch GPU (CPU build)   — indirect mode, 1 warp per candidate per launch,
+                                bytecodes/tinfos/pointer tables built on CPU
+  4. Batch GPU (torch build) — same kernel, but bytecodes/tinfos/pointer
+                                tables built via torch eager on the GPU
 
 Target: relu (69K candidates at length 4, chosen for manageable CPU runtime)
 """
@@ -23,9 +26,11 @@ from ..opcodes import (
     OP_DUP, OP_POP, OP_DUPX1, OP_DUPX2, OP_SWAP,
 )
 from ..candidates import (
-    enumerate_exact_length, sequences_to_bytecodes, make_reference_bytecode,
+    enumerate_exact_length, enumerate_exact_length_indices,
+    sequences_to_bytecodes, make_reference_bytecode,
 )
 from ..executor import BatchRunner, run_reference
+from ..executor_torch import BatchRunnerGPU
 from ..targets import get_target
 
 TEST_SIZE = 128
@@ -172,6 +177,9 @@ def _compare_outputs(candidate_outputs, ref_output, atol=1e-6, rtol=1e-5):
 
 def run(target_name="relu", search_length=4, max_cpu_candidates=None,
         max_seq_candidates=None, verbose=True):
+    # max_seq_candidates kept for back-compat; Sequential GPU is currently
+    # disabled (see comment in body).
+    del max_seq_candidates
     """Run three-way comparison. Returns dict of results."""
     target = get_target(target_name)
     arity = target["arity"]
@@ -181,9 +189,8 @@ def run(target_name="relu", search_length=4, max_cpu_candidates=None,
     seqs = list(enumerate_exact_length(ops, arity, 1, search_length))
     n_total = len(seqs)
 
-    # Cap candidate counts for slower methods
+    # Cap candidate count for the (slow) CPU Python interpreter.
     cpu_n = min(n_total, max_cpu_candidates or n_total)
-    seq_n = min(n_total, max_seq_candidates or min(n_total, 2000))
 
     inputs = _make_test_inputs(arity)
     ref_output = torch.empty(TEST_SIZE, device="cuda", dtype=torch.float32)
@@ -191,10 +198,9 @@ def run(target_name="relu", search_length=4, max_cpu_candidates=None,
     run_reference(ref_bc, inputs, ref_output, arity)
 
     if verbose:
-        print(f"Three-way comparison: {target_name} (length {search_length})")
+        print(f"Four-way comparison: {target_name} (length {search_length})")
         print(f"  Total candidates: {n_total:,}")
         print(f"  CPU candidates:   {cpu_n:,}")
-        print(f"  Seq-GPU cands:    {seq_n:,}")
         print()
 
     # --- Method 1: CPU Python interpreter ---
@@ -228,28 +234,14 @@ def run(target_name="relu", search_length=4, max_cpu_candidates=None,
               f"({cpu_n:,} in {t_cpu:.2f}s, {cpu_matches} matches)")
 
     # --- Method 2: Sequential GPU (one launch per candidate) ---
-    runner_single = BatchRunner(arity, TEST_SIZE)
-    # Warmup the single-candidate runner
-    bc_w = sequences_to_bytecodes([seqs[0]], arity)
-    out_w = torch.empty(1, TEST_SIZE, device="cuda", dtype=torch.float32)
-    runner_single.run(bc_w, inputs, out_w)
-
-    t0 = time.perf_counter()
-    seq_matches = 0
-    for seq in seqs[:seq_n]:
-        bc = sequences_to_bytecodes([seq], arity)
-        out = torch.empty(1, TEST_SIZE, device="cuda", dtype=torch.float32)
-        runner_single.run(bc, inputs, out)
-        if _compare_outputs(out, ref_output).item():
-            seq_matches += 1
-    t_seq = time.perf_counter() - t0
-    seq_throughput = seq_n / t_seq
-
+    # Currently disabled: indirect-mode launches with grid_dim=1 hit a
+    # CUDA_ERROR_MISALIGNED_ADDRESS in the kernel (independent bug, unrelated
+    # to the batch builder). The previous numbers in this experiment were
+    # produced before that regression and are quoted in the README for context.
     if verbose:
-        print(f"  Sequential GPU:     {seq_throughput:>12,.0f} candidates/s  "
-              f"({seq_n:,} in {t_seq:.2f}s, {seq_matches} matches)")
+        print(f"  Sequential GPU:     skipped (N=1 launch path is currently broken)")
 
-    # --- Method 3: Batch GPU (ours) ---
+    # --- Method 3: Batch GPU (CPU build) ---
     runner = BatchRunner(arity, TEST_SIZE)
     # Warmup
     bc_warmup = sequences_to_bytecodes(seqs[:min(BATCH_SIZE, n_total)], arity)
@@ -270,11 +262,36 @@ def run(target_name="relu", search_length=4, max_cpu_candidates=None,
     batch_throughput = n_total / t_batch
 
     if verbose:
-        print(f"  Batch GPU (ours):   {batch_throughput:>12,.0f} candidates/s  "
+        print(f"  Batch GPU (CPU build):   {batch_throughput:>12,.0f} candidates/s  "
               f"({n_total:,} in {t_batch:.2f}s, {batch_matches} matches)")
+
+    # --- Method 4: Batch GPU (torch-eager build) ---
+    # Re-enumerate as op-indices so the build phase is also kept off Python.
+    idx_all = enumerate_exact_length_indices(ops, arity, 1, search_length)
+    runner_t = BatchRunnerGPU(arity, ops, TEST_SIZE)
+    # Warmup
+    warm_idx = torch.from_numpy(idx_all[: min(BATCH_SIZE, n_total)]).cuda()
+    out_warm = torch.empty(warm_idx.shape[0], TEST_SIZE, device="cuda", dtype=torch.float32)
+    runner_t.run(warm_idx, inputs, out_warm)
+
+    t0 = time.perf_counter()
+    torch_matches = 0
+    for start in range(0, n_total, BATCH_SIZE):
+        end = min(start + BATCH_SIZE, n_total)
+        batch_idx = torch.from_numpy(idx_all[start:end]).cuda()
+        out_buf = torch.empty(batch_idx.shape[0], TEST_SIZE, device="cuda", dtype=torch.float32)
+        runner_t.run(batch_idx, inputs, out_buf)
+        hit_mask = _compare_outputs(out_buf, ref_output)
+        torch_matches += hit_mask.sum().item()
+    t_torch = time.perf_counter() - t0
+    torch_throughput = n_total / t_torch
+
+    if verbose:
+        print(f"  Batch GPU (torch build): {torch_throughput:>12,.0f} candidates/s  "
+              f"({n_total:,} in {t_torch:.2f}s, {torch_matches} matches)")
         print()
-        print(f"  Speedup vs CPU:     {batch_throughput / cpu_throughput:.1f}x")
-        print(f"  Speedup vs seq GPU: {batch_throughput / seq_throughput:.1f}x")
+        print(f"  Speedup vs CPU interp:    {torch_throughput / cpu_throughput:.1f}x")
+        print(f"  Speedup vs batch CPU bld: {torch_throughput / batch_throughput:.2f}x")
 
     results = {
         "experiment": "three_way_comparison",
@@ -288,10 +305,8 @@ def run(target_name="relu", search_length=4, max_cpu_candidates=None,
             "matches": cpu_matches,
         },
         "sequential_gpu": {
-            "n_evaluated": seq_n,
-            "time_s": round(t_seq, 3),
-            "throughput_per_s": round(seq_throughput),
-            "matches": seq_matches,
+            "skipped": True,
+            "reason": "indirect-mode launch with grid_dim=1 hits CUDA_ERROR_MISALIGNED_ADDRESS",
         },
         "batch_gpu": {
             "n_evaluated": n_total,
@@ -299,8 +314,14 @@ def run(target_name="relu", search_length=4, max_cpu_candidates=None,
             "throughput_per_s": round(batch_throughput),
             "matches": batch_matches,
         },
-        "speedup_vs_cpu": round(batch_throughput / cpu_throughput, 1),
-        "speedup_vs_seq_gpu": round(batch_throughput / seq_throughput, 1),
+        "batch_gpu_torch_build": {
+            "n_evaluated": n_total,
+            "time_s": round(t_torch, 3),
+            "throughput_per_s": round(torch_throughput),
+            "matches": torch_matches,
+        },
+        "speedup_vs_cpu": round(torch_throughput / cpu_throughput, 1),
+        "speedup_torch_vs_cpu_build": round(torch_throughput / batch_throughput, 2),
     }
 
     return results

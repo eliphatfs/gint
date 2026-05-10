@@ -16,6 +16,10 @@ from gint.kernel.interpreter.main import SMEM_PER_WARP
 from gint.kernel.interpreter.structs import HTensorInfo
 from gint.host.utils import cdiv
 
+# Superopt search bodies are short and stack-shallow; s7 (POOL_SIZE=7, MAX_STACK=7)
+# is the smaller/faster variant and is sufficient for all candidates we generate.
+SUPEROPT_VARIANT = "s7"
+
 _TI_SIZE = ctypes.sizeof(HTensorInfo)
 
 
@@ -81,7 +85,7 @@ class BatchRunner:
 
         # Kernel handle
         executor = get_executor()
-        self._dctx, self._cufunc, self._conc, self._nsm = executor.geval_func_handle()
+        self._dctx, self._cufunc, self._conc, self._nsm = executor.geval_func_handle(SUPEROPT_VARIANT)
         self._heuristic = executor.heuristic_best_warps
 
         # Build template HTensorInfo (all tensor slots share the same layout)
