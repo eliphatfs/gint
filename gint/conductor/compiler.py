@@ -498,6 +498,10 @@ def _plan_spills(
 
             # Free dying args (last use at this step). Args may be in
             # regs, on the stack, or both for the rare ext-IO case.
+            # ext_io nodes with internal uses leave a persistent stack copy
+            # via emit_op's ``dup + store`` sequence — the codegen never pops
+            # that copy, so don't remove it from on_stack here either, or the
+            # simulation will under-report stack depth and miss burial.
             for arg in node.args:
                 if not isinstance(arg, Node):
                     continue
@@ -506,6 +510,8 @@ def _plan_spills(
                 if arg in in_reg:
                     free_regs.append(in_reg.pop(arg))
                     free_regs.sort()
+                if arg in ext_io:
+                    continue
                 while arg in on_stack:
                     on_stack.remove(arg)
 
@@ -531,7 +537,12 @@ def _plan_spills(
             if len(on_stack) + len(in_reg) > pool_limit:
                 feasible = False
 
+        if new_buried - extra_buried:
+            extra_buried |= new_buried
+            continue
         return node_to_reg, overflow, feasible
+
+    return node_to_reg, overflow, feasible
 
 
 # ---------------------------------------------------------------------------

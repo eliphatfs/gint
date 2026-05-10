@@ -410,8 +410,7 @@ def build_ggx_importance(N=1 << 22):
     bwd_impls['jit'] = _make_bwd(lambda: f_jit(x, y, roughness), x, is_tuple=True)
     bwd_impls['inductor'] = _bwd_compile(_make_bwd, ggx_importance_eager, 'inductor', None, None, (x, y, roughness), x, True)
     bwd_impls['inductor-rg'] = _bwd_compile(_make_bwd, ggx_importance_eager, 'inductor', 'reduce-overhead', None, (x, y, roughness), x, True)
-    # gint-nocg omitted: AOT backward for trig-heavy ops needs > 8 global
-    # slots after fixing the burial issue, which exceeds max_tensors.
+    bwd_impls['gint-nocg'] = _bwd_compile(_make_bwd, ggx_importance_eager, 'gint', None, {'cuda_graphs': False, 'clone_outputs': False}, (x, y, roughness), x, True)
 
     return impls, bwd_impls, ref, f"shape=(N={N},)", 1e-4
 
