@@ -112,6 +112,8 @@ gint/
 
 examples/
   superopt/          # GPU-accelerated bytecode superoptimizer (see docs/superopt.md)
+  rl_rewards/        # 20-task heterogeneous-RL reward benchmark — gint indirect dispatch
+                     # vs eager-serial torch (run: `python -m examples.rl_rewards`)
 
 tests/               # unittest modules
 benchmark/           # Performance benchmarks
