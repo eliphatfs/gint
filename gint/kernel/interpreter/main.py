@@ -1,6 +1,5 @@
 from llvmlite import ir
 import os
-import copy
 from ..platforms.common import *
 from ..platforms.platform import PlatformIRBuilder
 from ..platforms.nvptx import NVPTXIRBuilder
@@ -197,58 +196,26 @@ def build_main_loop(LL: PlatformIRBuilder, pool_size: int = POOL_SIZE, num_regs:
     smem_base = LL.gep(smem_base, [i32(0), LL.mul(i32(SMEM_PER_WARP), LL.thread_idx_y())])
 
     entry_bb = LL.block
-
-    # Single loop-head block holds ALL the pool/pc/opcode PHIs (one shared
-    # set, instead of one PHI set per stack depth).  Each dispatch.i block
-    # then reads these shared PHIs directly.  This collapses the cross-block
-    # PHI-inter-reference network: previously dispatch.0's pool PHI took as
-    # incoming *dispatch.1's pool PHI* (when a stack-pop dropped sp 1->0),
-    # forming a cross-loop-layer PHI web that the AMDGPU coalescer cannot fold
-    # into a small number of physical VGPRs (root cause of the 256-VGPR /
-    # 153-spill blowup).  Now every pool PHI's incoming is either the PHI
-    # itself (untouched slot, trivial self-loop) or a concrete value computed
-    # in a single case block — never another dispatch block's PHI — so the
-    # coalescer can reuse registers across the mutually-exclusive paths.
-    loop_head_bb = LL.append_basic_block("dispatch.head")
-    LL.position_at_end(loop_head_bb)
-    head_state = StackMachineState(LL, smem_base, pool_size, REG_WIDTH, 0, num_regs, max_stack)
-    sp_phi = LL.phi(i32)
-
     dispatch_bbs: dict[int, ir.Block] = {}
     dispatch_states: dict[int, StackMachineState] = {}
     for i in range(max_stack + 1):
         dispatch_bbs[i] = LL.append_basic_block("dispatch.%d" % i)
-        # Share head_state's PHIs; only sp differs (compile-time constant i).
-        shared = copy.copy(head_state)
-        shared.sp = i
-        dispatch_states[i] = shared
+        LL.position_at_end(dispatch_bbs[i])
+        dispatch_states[i] = StackMachineState(LL, smem_base, pool_size, REG_WIDTH, i, num_regs, max_stack)
     undef_bb = LL.append_basic_block("unreachable")
-
-    # loop_head: route to the per-stack-depth dispatch block via the shared sp PHI.
-    LL.position_at_end(loop_head_bb)
-    sp_switch = LL.switch(sp_phi, undef_bb)
-    for i in range(max_stack + 1):
-        sp_switch.add_case(i, dispatch_bbs[i])
-    # The sp router is also a dense uniform (SGPR) switch over 0..max_stack;
-    # on AMDGPU keep it as a jump table too (it is small, but uniform so
-    # s_setpc dispatch is valid and avoids the LowerSwitch comparison tree).
-    if getattr(LL, "_is_amdgcn", False):
-        sp_switch.set_metadata(
-            "amdgpu.skip.lowerswitch", LL.module.add_metadata([]))
-
+    
     def br_state(state: StackMachineState):
-        sp_phi.add_incoming(i32(state.sp), LL.block)
-        for s, t in zip(head_state.flat_regs(), state.flat_regs()):
+        sp = state.sp
+        for s, t in zip(dispatch_states[sp].flat_regs(), state.flat_regs()):
             s.add_incoming(t, LL.block)
-        return LL.branch(loop_head_bb)
-
+        return LL.branch(dispatch_bbs[sp])
+    
     LL.position_at_end(entry_bb)
     entry_pc = code_ptr
     entry_opcode = LL.make_uniform(LL.load(entry_pc))
-    state = head_state.clone()
+    state = dispatch_states[0].clone()
     state.pc = entry_pc
     state.opcode = entry_opcode
-    state.sp = 0
     for i in range(pool_size):
         state.pool[i] = [f32(ir.Undefined)] * REG_WIDTH
     emit_load_tensor_infos(LL, state, tinfo_ptr)
