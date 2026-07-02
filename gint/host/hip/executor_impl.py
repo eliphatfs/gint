@@ -4,7 +4,7 @@ import ctypes
 import numpy
 from hip import hip
 from typing import Optional, Sequence
-from ...kernel.interpreter.main import SMEM_PER_WARP, VARIANTS, variant_kernel_name
+from ...kernel.interpreter.main import SMEM_PER_WARP, smem_per_warp_for, VARIANTS, variant_kernel_name
 from ...kernel.interpreter.structs import HTensorInfo
 from ..executor import BaseExecutor, BaseExecutableProgram, TensorInterface, _convert_arg, select_variant, _variant_max
 from .driver import current_context, hipfb_load, launch_kernel, check_hip_error
@@ -29,9 +29,10 @@ class HipExecutor(BaseExecutor):
         if key not in self.func_cache:
             sym = variant_kernel_name(variant).encode()
             hipfunc = hipfb_load(dctx, self.fatbin, sym)
+            this_smem = smem_per_warp_for(variant)
             concurrencies = []
             for num_warps in [1, 2, 4]:
-                _, blocks = check_hip_error(hip.hipModuleOccupancyMaxActiveBlocksPerMultiprocessor(hipfunc, num_warps * 32, SMEM_PER_WARP * num_warps))
+                _, blocks = check_hip_error(hip.hipModuleOccupancyMaxActiveBlocksPerMultiprocessor(hipfunc, num_warps * 32, this_smem * num_warps))
                 concurrencies.append((num_warps, blocks))
             _, device = check_hip_error(hip.hipGetDevice())
             _, num_cu = check_hip_error(hip.hipDeviceGetAttribute(hip.hipDeviceAttribute_t.hipDeviceAttributeMultiprocessorCount, device))
@@ -87,7 +88,7 @@ class HipExecutor(BaseExecutor):
         hipstream = hip.hipStream_t(cuda_stream)
         check_hip_error(hip.hipMemcpyHtoDAsync(dinfo, ctypes.addressof(ti), ctypes.sizeof(ti), hipstream))
         best_warps = self.heuristic_best_warps(grid_dim, concurrencies, num_cu)
-        launch_kernel(hipfunc, dcode, dinfo, nargs, grid_dim, 0, grid_dim=cdiv(grid_dim, best_warps), block_dim=(32, best_warps, 1), smem_bytes=SMEM_PER_WARP * best_warps, stream=hipstream)
+        launch_kernel(hipfunc, dcode, dinfo, nargs, grid_dim, 0, grid_dim=cdiv(grid_dim, best_warps), block_dim=(32, best_warps, 1), smem_bytes=smem_per_warp_for(variant) * best_warps, stream=hipstream)
 
     def execute_indirect(
         self,
@@ -150,5 +151,5 @@ class HipExecutor(BaseExecutor):
         launch_kernel(
             hipfunc, code_ptrs_dev, tinfo_ptrs_dev, max_ntensors, grid_dim, 1,
             grid_dim=cdiv(grid_dim, best_warps), block_dim=(32, best_warps, 1),
-            smem_bytes=SMEM_PER_WARP * best_warps, stream=hip.hipStream_t(cuda_stream)
+            smem_bytes=smem_per_warp_for(batch_variant) * best_warps, stream=hip.hipStream_t(cuda_stream)
         )

@@ -25,8 +25,7 @@ POOL_SIZE = 12   # unified stack+register pool; stack grows up, regs down from t
 NUM_REGS = 8    # reg n = pool[POOL_SIZE-1-n]; effective max stack = POOL_SIZE - NUM_REGS = 4
 MAX_STACK = 8
 REG_WIDTH = 4
-SMEM_PER_WARP = MAX_N_TENSORS * 7 * 4
-
+SMEM_TENSOR_INFO_BYTES = MAX_N_TENSORS * 7 * 4  # per-warp tensor-info region
 
 # Kernel variants. Each entry: (pool_size, num_regs, max_stack).
 # The kernel symbol baked into the fatbin/HSACO is `geval_<name>`.
@@ -36,6 +35,85 @@ VARIANTS: dict[str, tuple[int, int, int]] = {
     'l12': (12, 8, 8),   # large: covers register-heavy kernels (e.g. inv4x4)
 }
 DEFAULT_VARIANT = 'l12'  # back-compat default for callers that don't select
+
+
+# Spill-window switch (see StackMachineState docstring).  0 disables (all
+# pool slots live in VGPRs, classic behaviour) for that variant.  When >0,
+# only the top `spill_window` stack slots are kept in VGPRs; lower preserved
+# slots spill to per-warp smem to break the cross-dispatch-block PHI web.
+# Must exceed the interpreter's deepest peek depth (2, via DupX2), so >=3 is
+# the floor when enabled.
+#
+# The window is set PER VARIANT: the spill scheme only pays off for variants
+# that actually scratch-spill (deep-stack / register-heavy).  s7 is already
+# 0-spill, so windowing it only adds spill/reload round-trips for mid-stack
+# kernels (e.g. bmm4x4, max_stack 6) with no spill to recover -> net slowdown.
+# Hence s7 defaults to 0 (classic), l12 to 4.
+#
+# Controlled by the GINT_SPILL_WINDOW env var: a single int (applies to all
+# variants) or a comma list "name:int,..." (per-variant; unlisted variants
+# default to 0).  The NVPTX build path forces 0 for every variant regardless.
+def _default_spill_windows() -> dict:
+    v = os.environ.get("GINT_SPILL_WINDOW")
+    if v is not None and v.strip() != "":
+        if ":" in v:
+            d = {}
+            for part in v.split(","):
+                if not part.strip():
+                    continue
+                name, w = part.split(":")
+                d[name.strip()] = int(w)
+            return d
+        w = int(v)
+        return {name: w for name in VARIANTS}
+    return {"s7": 0, "l12": 4}
+
+
+SPILL_WINDOW_DEFAULT = _default_spill_windows()
+
+
+def spill_window_for(variant: str) -> int:
+    """Active spill window for a variant (0 = classic, off)."""
+    return SPILL_WINDOW_DEFAULT.get(variant, 0)
+
+
+# Per-warp smem budget = tensor-info region + spill region.  The spill region
+# must fit the worst-case variant that has windowing on (max spilled pure-stack
+# slots, each wave32 lanes wide, REG_WIDTH f32 each).  SMEM_PER_WARP is read by
+# the host executors both for the warp-base offset and for the dynamic-smem
+# request at launch (and hence by the occupancy API), so it must already
+# include the spill bytes when the scheme is on for any variant.
+def _spill_region_bytes() -> int:
+    max_spill_slots = 0
+    for name, (pool, regs, stack) in VARIANTS.items():
+        W = spill_window_for(name)
+        if W <= 0:
+            continue
+        # spilled pure-stack slots: k < pool-regs (pure stack) and k < stack-W.
+        max_spill_slots = max(max_spill_slots, min(pool - regs, max(0, stack - W)))
+    # wave32 lanes * spill_slots * REG_WIDTH * 4 bytes(f32)
+    return 32 * max_spill_slots * REG_WIDTH * 4
+
+SMEM_PER_WARP = SMEM_TENSOR_INFO_BYTES + _spill_region_bytes()
+
+
+def smem_per_warp_for(variant: str) -> int:
+    """Dynamic smem (bytes) a kernel of `variant` actually requests at launch.
+
+    Only variants whose spill window is on reserve the spill region; classic
+    variants (window 0) need just the tensor-info region.  Keeping this
+    per-variant avoids forcing 0-spill variants (e.g. s7) to reserve the
+    spill region of windowed variants (e.g. l12), which would needlessly cut
+    their LDS-limited occupancy.
+    """
+    base = SMEM_TENSOR_INFO_BYTES
+    W = spill_window_for(variant)
+    if W <= 0:
+        return base
+    pool, regs, stack = VARIANTS[variant]
+    spill_slots = min(pool - regs, max(0, stack - W))
+    return base + 32 * spill_slots * REG_WIDTH * 4
+
 
 
 def _is_invalid_reg_op(Insn, num_regs: int) -> bool:
@@ -168,7 +246,7 @@ INSNS: dict[type[Instruction], int] = {
 }
 
 
-def build_main_loop(LL: PlatformIRBuilder, pool_size: int = POOL_SIZE, num_regs: int = NUM_REGS, max_stack: int = MAX_STACK):
+def build_main_loop(LL: PlatformIRBuilder, pool_size: int = POOL_SIZE, num_regs: int = NUM_REGS, max_stack: int = MAX_STACK, spill_window: int = 0, smem_per_warp: int = SMEM_PER_WARP):
     smem_base = _ensure_smem_global(LL)
 
     # early exit warps beyond user scheduling
@@ -193,7 +271,7 @@ def build_main_loop(LL: PlatformIRBuilder, pool_size: int = POOL_SIZE, num_regs:
     tinfo_ptr.add_incoming(resolved['ind'][1], resolved['ind'][2])
     tinfo_ptr.add_incoming(resolved['dir'][1], resolved['dir'][2])
 
-    smem_base = LL.gep(smem_base, [i32(0), LL.mul(i32(SMEM_PER_WARP), LL.thread_idx_y())])
+    smem_base = LL.gep(smem_base, [i32(0), LL.mul(i32(smem_per_warp), LL.thread_idx_y())])
 
     entry_bb = LL.block
     dispatch_bbs: dict[int, ir.Block] = {}
@@ -201,7 +279,7 @@ def build_main_loop(LL: PlatformIRBuilder, pool_size: int = POOL_SIZE, num_regs:
     for i in range(max_stack + 1):
         dispatch_bbs[i] = LL.append_basic_block("dispatch.%d" % i)
         LL.position_at_end(dispatch_bbs[i])
-        dispatch_states[i] = StackMachineState(LL, smem_base, pool_size, REG_WIDTH, i, num_regs, max_stack)
+        dispatch_states[i] = StackMachineState(LL, smem_base, pool_size, REG_WIDTH, i, num_regs, max_stack, spill_window=spill_window)
     undef_bb = LL.append_basic_block("unreachable")
     
     def br_state(state: StackMachineState):
@@ -216,8 +294,11 @@ def build_main_loop(LL: PlatformIRBuilder, pool_size: int = POOL_SIZE, num_regs:
     state = dispatch_states[0].clone()
     state.pc = entry_pc
     state.opcode = entry_opcode
-    for i in range(pool_size):
-        state.pool[i] = [f32(ir.Undefined)] * REG_WIDTH
+    # Entry: stack is empty (sp=0), so only registers are active.  Initialise
+    # active slots to undef; inactive (spilled/below-window) slots stay None
+    # (they will be populated by the first push).
+    for k in state.active_slots(0):
+        state.pool[k] = [f32(ir.Undefined)] * REG_WIDTH
     emit_load_tensor_infos(LL, state, tinfo_ptr)
     br_state(state)
 
@@ -286,11 +367,11 @@ def build_interpreter_main_nvptx(variants: list[str] = None) -> PlatformIRBuilde
     first, *rest = variants
     pool, regs, stack = VARIANTS[first]
     LL = NVPTXIRBuilder.create_kernel_module(GEvalFType, variant_kernel_name(first))
-    build_main_loop(LL, pool, regs, stack)
+    build_main_loop(LL, pool, regs, stack, spill_window=0, smem_per_warp=SMEM_PER_WARP)  # NVPTX: classic, single smem stride
     for v in rest:
         pool, regs, stack = VARIANTS[v]
         LL = NVPTXIRBuilder.add_kernel(LL, GEvalFType, variant_kernel_name(v))
-        build_main_loop(LL, pool, regs, stack)
+        build_main_loop(LL, pool, regs, stack, spill_window=0, smem_per_warp=SMEM_PER_WARP)
     return LL
 
 
@@ -309,9 +390,9 @@ def build_interpreter_main_amdgcn(gfx: str = "gfx1100", variants: list[str] = No
     first, *rest = variants
     pool, regs, stack = VARIANTS[first]
     LL = AMDGCNIRBuilder.create_kernel_module(GEvalFType, variant_kernel_name(first), gfx=gfx)
-    build_main_loop(LL, pool, regs, stack)
+    build_main_loop(LL, pool, regs, stack, spill_window=spill_window_for(first), smem_per_warp=smem_per_warp_for(first))
     for v in rest:
         pool, regs, stack = VARIANTS[v]
         LL = AMDGCNIRBuilder.add_kernel(LL, GEvalFType, variant_kernel_name(v))
-        build_main_loop(LL, pool, regs, stack)
+        build_main_loop(LL, pool, regs, stack, spill_window=spill_window_for(v), smem_per_warp=smem_per_warp_for(v))
     return LL
