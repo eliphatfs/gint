@@ -31,7 +31,7 @@ class Instruction:
         if delta is None:
             delta = i32(2)
         upd_pc = LL.gep(state.pc, [delta], inbounds=True)
-        upd_opcode = LL.load(upd_pc)
+        upd_opcode = LL.make_uniform(LL.load(upd_pc))
         state.pc = upd_pc
         state.opcode = upd_opcode
 

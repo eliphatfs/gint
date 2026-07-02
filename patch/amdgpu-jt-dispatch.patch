@@ -1,0 +1,821 @@
+From: gint project
+Subject: [PATCH] AMDGPU s_setpc_b64 O(1) jump-table dispatch for interpreter kernels
+
+Enables LLVM 22.1's AMDGPU backend to lower a dense dispatch `switch` (marked
+with `!amdgpu.skip.lowerswitch` metadata) into an O(1) `s_setpc_b64` jump
+table instead of an O(log N) comparison/bit-test tree. Targeted at bytecode-
+interpreter kernels (e.g. gint) that dispatch one program per wave, where the
+dispatch index is uniform across the wave.
+
+Three parts:
+
+1. LowerSwitch skip — a switch carrying `!amdgpu.skip.lowerswitch` is left
+   intact (preserved into ISel) instead of being converted to a binary
+   search tree.   [lib/Transforms/Utils/LowerSwitch.cpp]
+
+2. StructurizeCFG skip — regions whose terminator is a switch with the skip
+   metadata are bypassed (StructurizeCFG requires BranchInst terminators and
+   would otherwise crash/restructure). UnifyLoopExits likewise bypasses them.
+   [lib/Transforms/Scalar/StructurizeCFG.cpp, lib/Transforms/Utils/UnifyLoopExits.cpp]
+
+3. AMDGPU BR_JT lowering + s_setpc dispatch:
+   - BlockAddress materialization via the existing PC-relative reloc infra
+     (s_getpc + s_add with rel32).   [SIISelLowering.{h,cpp}]
+   - LowerBR_JT produces the SI_BR_JT pseudo; MCInstLower handles
+     MO_BlockAddress / MO_JumpTableIndex.   [SIISelLowering.{h,cpp},
+     AMDGPUMCInstLower.cpp, SIInstrInfo.{td,cpp}, SIInstructions.td]
+   - SIExpandJTDispatch (new pre-RA pass) expands SI_BR_JT into
+     s_getpc -> s_add (JTI-PostGetPC, split &0xFFFFFFFF/>>32) -> s_load ->
+     sext -> s_add/s_addc -> s_setpc. A MO_JumpTableIndex operand is kept on
+     s_getpc so BranchFolding's jump-table liveness scan keeps the table.
+     [SIExpandJTDispatch.cpp, AMDGPU.h, CMakeLists.txt, AMDGPUTargetMachine.cpp]
+   - Jump tables forced into .text (same section as code) so EK_LabelDifference32
+     entries and the &0xFFFFFFFF/>>32 offset split are same-section label
+     differences that the assembler resolves.   [AMDGPUTargetObjectFile.{h,cpp}]
+
+Verified on gfx1201 (RDNA3.5) with the gint interpreter (106-opcode dispatch):
+full test suite passes, dispatch is genuine s_setpc_b64 (138 dispatch sites,
+17 jump tables), and the interpreter's GPU kernel time drops below torch eager.
+
+Build: standard cmake+ninja LLVM build with -DLLVM_TARGETS_TO_BUILD=AMDGPU.
+Apply:  patch -p1 < amdgpu-jt-dispatch.patch
+        (from the llvm-project source root, against the 22.1.0 release tree)
+
+---
+diff -ruN a/llvm/lib/Target/AMDGPU/AMDGPU.h b/llvm/lib/Target/AMDGPU/AMDGPU.h
+--- a/llvm/lib/Target/AMDGPU/AMDGPU.h	2026-02-24 07:35:28.000000000 +0000
++++ b/llvm/lib/Target/AMDGPU/AMDGPU.h	2026-07-02 16:33:56.675213472 +0000
+@@ -39,6 +39,7 @@
+ FunctionPass *createSIFoldOperandsLegacyPass();
+ FunctionPass *createSIPeepholeSDWALegacyPass();
+ FunctionPass *createSILowerI1CopiesLegacyPass();
++FunctionPass *createSIExpandJTDispatchPass();
+ FunctionPass *createSIShrinkInstructionsLegacyPass();
+ FunctionPass *createSILoadStoreOptimizerLegacyPass();
+ FunctionPass *createSIWholeQuadModeLegacyPass();
+@@ -93,6 +94,14 @@
+                         MachineFunctionAnalysisManager &MFAM);
+ };
+ 
++class SIExpandJTDispatchPass : public PassInfoMixin<SIExpandJTDispatchPass> {
++public:
++  SIExpandJTDispatchPass() = default;
++  PreservedAnalyses run(MachineFunction &MF,
++                         MachineFunctionAnalysisManager &MFAM);
++};
++
++
+ void initializeAMDGPUDAGToDAGISelLegacyPass(PassRegistry &);
+ 
+ void initializeAMDGPUAlwaysInlinePass(PassRegistry&);
+diff -ruN a/llvm/lib/Target/AMDGPU/AMDGPUISelLowering.h b/llvm/lib/Target/AMDGPU/AMDGPUISelLowering.h
+--- a/llvm/lib/Target/AMDGPU/AMDGPUISelLowering.h	2026-02-24 07:35:28.000000000 +0000
++++ b/llvm/lib/Target/AMDGPU/AMDGPUISelLowering.h	2026-07-02 18:07:58.069871530 +0000
+@@ -16,6 +16,7 @@
+ #define LLVM_LIB_TARGET_AMDGPU_AMDGPUISELLOWERING_H
+ 
+ #include "llvm/CodeGen/CallingConvLower.h"
++#include "llvm/CodeGen/MachineJumpTableInfo.h"
+ #include "llvm/CodeGen/TargetLowering.h"
+ 
+ namespace llvm {
+diff -ruN a/llvm/lib/Target/AMDGPU/AMDGPUMCInstLower.cpp b/llvm/lib/Target/AMDGPU/AMDGPUMCInstLower.cpp
+--- a/llvm/lib/Target/AMDGPU/AMDGPUMCInstLower.cpp	2026-02-24 07:35:28.000000000 +0000
++++ b/llvm/lib/Target/AMDGPU/AMDGPUMCInstLower.cpp	2026-07-02 16:39:09.541134575 +0000
+@@ -101,6 +101,50 @@
+     MCOp = MCOperand::createExpr(Expr);
+     return true;
+   }
++  case MachineOperand::MO_BlockAddress: {
++    // Materialize an in-function block-address placeholder as a reference to
++    // the basic block's label symbol, with the same relocation specifier
++    // mechanism used for global addresses (e.g. MO_REL32_LO/HI for the
++    // s_getpc + s_add(rel32) sequence emitted by LowerBlockAddress).
++    const BlockAddress *BA = MO.getBlockAddress();
++    MCSymbol *Sym = AP.GetBlockAddressSymbol(BA);
++    const MCExpr *Expr =
++        MCSymbolRefExpr::create(Sym, getSpecifier(MO.getTargetFlags()), Ctx);
++    int64_t Offset = MO.getOffset();
++    if (Offset != 0) {
++      Expr = MCBinaryExpr::createAdd(Expr,
++                                     MCConstantExpr::create(Offset, Ctx), Ctx);
++    }
++    MCOp = MCOperand::createExpr(Expr);
++    return true;
++  }
++  case MachineOperand::MO_JumpTableIndex: {
++    // The jump-table symbol for the dispatch table (emitted by SI_BR_JT).
++    // Uses the same relocation-specifier mechanism as globals/block-addresses
++    // so the s_getpc + s_add(rel32) sequence resolves to the table base.
++    // JTI operands have no offset field, so the PC-rel +4 fixup (the symbol is
++    // encoded 4 bytes after the start of the s_add_u32/s_add_u64 instruction)
++    // is applied here directly as a constant add, keyed off the rel32 target
++    // flag. MO_REL32 (single 64-bit add) gets +4; the lo/hi split forms each
++    // get their own fixed offset.
++    MCSymbol *Sym = AP.GetJTISymbol(MO.getIndex());
++    const MCExpr *Expr =
++        MCSymbolRefExpr::create(Sym, getSpecifier(MO.getTargetFlags()), Ctx);
++    unsigned Flags = MO.getTargetFlags();
++    int64_t Offset = 0;
++    if (Flags == SIInstrInfo::MO_REL32)
++      Offset = 4;
++    else if (Flags == SIInstrInfo::MO_REL32_LO)
++      Offset = 4;
++    else if (Flags == SIInstrInfo::MO_REL32_HI)
++      Offset = 12;
++    if (Offset != 0) {
++      Expr = MCBinaryExpr::createAdd(Expr,
++                                     MCConstantExpr::create(Offset, Ctx), Ctx);
++    }
++    MCOp = MCOperand::createExpr(Expr);
++    return true;
++  }
+   case MachineOperand::MO_ExternalSymbol: {
+     MCSymbol *Sym = Ctx.getOrCreateSymbol(StringRef(MO.getSymbolName()));
+     const MCSymbolRefExpr *Expr = MCSymbolRefExpr::create(Sym, Ctx);
+diff -ruN a/llvm/lib/Target/AMDGPU/AMDGPUTargetMachine.cpp b/llvm/lib/Target/AMDGPU/AMDGPUTargetMachine.cpp
+--- a/llvm/lib/Target/AMDGPU/AMDGPUTargetMachine.cpp	2026-02-24 07:35:28.000000000 +0000
++++ b/llvm/lib/Target/AMDGPU/AMDGPUTargetMachine.cpp	2026-07-02 17:56:36.751387417 +0000
+@@ -1515,6 +1515,13 @@
+   }
+   addPass(&DeadMachineInstructionElimID);
+   addPass(createSIShrinkInstructionsLegacyPass());
++  // Expand SI_BR_JT (jump-table dispatch) here, AFTER EarlyMachineLICM /
++  // MachineLICM have run. S_GETPC_B64 is modeled side-effect-free, so if we
++  // emitted it earlier (right after ISel) LICM would hoist it out of the
++  // dispatch loop, decoupling it from the rel32@lo/+4 fixup that is keyed to
++  // the s_add's own address — which sent s_setpc into the middle of an
++  // unrelated block. Running here keeps s_getpc inside the dispatch block.
++  addPass(createSIExpandJTDispatchPass());
+ }
+ 
+ bool GCNPassConfig::addILPOpts() {
+@@ -2306,6 +2313,9 @@
+   }
+   addMachineFunctionPass(DeadMachineInstructionElimPass(), PMW);
+   addMachineFunctionPass(SIShrinkInstructionsPass(), PMW);
++  // Expand SI_BR_JT here, AFTER EarlyMachineLICM (see the legacy-path comment
++  // in GCNPassConfig::addMachineSSAOptimization).
++  addMachineFunctionPass(SIExpandJTDispatchPass(), PMW);
+ }
+ 
+ void AMDGPUCodeGenPassBuilder::addOptimizedRegAlloc(
+diff -ruN a/llvm/lib/Target/AMDGPU/AMDGPUTargetObjectFile.cpp b/llvm/lib/Target/AMDGPU/AMDGPUTargetObjectFile.cpp
+--- a/llvm/lib/Target/AMDGPU/AMDGPUTargetObjectFile.cpp	2026-02-24 07:35:28.000000000 +0000
++++ b/llvm/lib/Target/AMDGPU/AMDGPUTargetObjectFile.cpp	2026-07-02 18:07:58.069871530 +0000
+@@ -26,6 +26,19 @@
+   return TargetLoweringObjectFileELF::SelectSectionForGlobal(GO, Kind, TM);
+ }
+ 
++MCSection *AMDGPUTargetObjectFile::getSectionForJumpTable(
++    const Function &F, const TargetMachine &TM,
++    const MachineJumpTableEntry *JTE) const {
++  // Emit jump tables into the .text section (same section as the function
++  // body) rather than .rodata. AMDGPU uses EK_LabelDifference32 jump-table
++  // entries (`.long BB - JT`); if the table lands in a different section
++  // from the code (here .rodata vs .text), the cross-section label difference
++  // is not resolvable at assembly time and the entries get emitted as 0,
++ // corrupting the dispatch. Keeping the table in .text makes the
++  // `BB - JT` difference a same-section offset that resolves correctly.
++  return TextSection;
++}
++
+ MCSection *AMDGPUTargetObjectFile::getExplicitSectionGlobal(
+     const GlobalObject *GO, SectionKind SK, const TargetMachine &TM) const {
+   // Set metadata access for the explicit section
+diff -ruN a/llvm/lib/Target/AMDGPU/AMDGPUTargetObjectFile.h b/llvm/lib/Target/AMDGPU/AMDGPUTargetObjectFile.h
+--- a/llvm/lib/Target/AMDGPU/AMDGPUTargetObjectFile.h	2026-02-24 07:35:28.000000000 +0000
++++ b/llvm/lib/Target/AMDGPU/AMDGPUTargetObjectFile.h	2026-07-02 18:05:59.162766385 +0000
+@@ -15,16 +15,36 @@
+ #ifndef LLVM_LIB_TARGET_AMDGPU_AMDGPUTARGETOBJECTFILE_H
+ #define LLVM_LIB_TARGET_AMDGPU_AMDGPUTARGETOBJECTFILE_H
+ 
++#include "llvm/CodeGen/MachineJumpTableInfo.h"
+ #include "llvm/CodeGen/TargetLoweringObjectFileImpl.h"
++#include "llvm/IR/GlobalObject.h"
+ 
+ namespace llvm {
+ 
++class MachineJumpTableEntry;
++
+ class AMDGPUTargetObjectFile : public TargetLoweringObjectFileELF {
+   public:
+     MCSection *SelectSectionForGlobal(const GlobalObject *GO, SectionKind Kind,
+                                       const TargetMachine &TM) const override;
+     MCSection *getExplicitSectionGlobal(const GlobalObject *GO, SectionKind Kind,
+                                         const TargetMachine &TM) const override;
++    MCSection *getSectionForJumpTable(const Function &F, const TargetMachine &TM,
++                                      const MachineJumpTableEntry *JTE) const override;
++    // Force jump tables through getSectionForJumpTable (which returns .text on
++    // AMDGPU) instead of staying in whatever section happens to be current.
++    // The default keeps label-difference tables in the current section, which
++    // on AMDGPU is .rodata by the time the table is emitted (the kernel
++    // descriptor switches there first). Even with EK_BlockAddress entries the
++    // dispatch's PC-relative base (s_getpc + s_add with a post-getpc label)
++    // computes `JTI - PostGetPC`; if JTI is in .rodata and PostGetPC in .text
++    // the `&4294967295` / `>>32` split of that cross-section difference is not
++    // a relocatable expression the assembler accepts. Keeping the table in
++    // .text makes it same-section.
++    bool shouldPutJumpTableInFunctionSection(bool UsesLabelDifference,
++                                             const Function &F) const override {
++      return false;
++    }
+ };
+ 
+ } // end namespace llvm
+diff -ruN a/llvm/lib/Target/AMDGPU/CMakeLists.txt b/llvm/lib/Target/AMDGPU/CMakeLists.txt
+--- a/llvm/lib/Target/AMDGPU/CMakeLists.txt	2026-02-24 07:35:28.000000000 +0000
++++ b/llvm/lib/Target/AMDGPU/CMakeLists.txt	2026-07-02 16:32:55.637063267 +0000
+@@ -167,6 +167,7 @@
+   SILoadStoreOptimizer.cpp
+   SILowerControlFlow.cpp
+   SILowerI1Copies.cpp
++  SIExpandJTDispatch.cpp
+   SILowerWWMCopies.cpp
+   SILowerSGPRSpills.cpp
+   SIMachineFunctionInfo.cpp
+diff -ruN a/llvm/lib/Target/AMDGPU/SIExpandJTDispatch.cpp b/llvm/lib/Target/AMDGPU/SIExpandJTDispatch.cpp
+--- a/llvm/lib/Target/AMDGPU/SIExpandJTDispatch.cpp	1970-01-01 00:00:00.000000000 +0000
++++ b/llvm/lib/Target/AMDGPU/SIExpandJTDispatch.cpp	2026-07-02 18:36:05.697074628 +0000
+@@ -0,0 +1,254 @@
++//===-- SIExpandJTDispatch.cpp - Expand SI_BR_JT jump-table dispatch ------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This pass expands the SI_BR_JT pseudo (produced by LowerBR_JT for a dense
++// switch dispatched via a jump table) into the real instruction sequence:
++//
++//   s_getpc_b64    s[BaseLo:BaseHi]            ; PC of next instr
++//   s_add_co_u32   BaseLo, BaseLo, jt@rel32@lo+4
++//   s_add_co_ci_u32 BaseHi, BaseHi, jt@rel32@hi+12  -> table base (64-bit)
++//   s_lshl_b32     ByteOff32, IdxLo, 3       ; index*8 = byte offset
++//   s_load_dwordx2 Target, Base64, ByteOff32 ; load jump-table entry
++//   s_setpc_b64    Target                     ; O(1) dispatch
++//
++// It runs BEFORE register allocation (in addInstSelector, right after ISel)
++// so the freshly-created virtual registers are allocated normally. We use
++// distinct 32-bit vregs (BaseLo/BaseHi) for the two halves of the rel32 add
++// and REG_SEQUENCE them into a 64-bit Base64, because defining sub0/sub1 of a
++// single vreg before RA trips LiveVariables' single-definition assumption.
++//
++// The +4/+12 PC-rel fixups are applied in AMDGPUMCInstLower at MCExpr level
++// because JTI operands have no offset field.
++//
++//===----------------------------------------------------------------------===//
++
++#include "AMDGPU.h"
++#include "GCNSubtarget.h"
++#include "MCTargetDesc/AMDGPUMCTargetDesc.h"
++#include "SIInstrInfo.h"
++#include "llvm/CodeGen/MachineFunctionPass.h"
++#include "llvm/CodeGen/MachineInstrBuilder.h"
++#include "llvm/CodeGen/MachineOperand.h"
++#include "llvm/CodeGen/MachineRegisterInfo.h"
++#include "llvm/MC/MCContext.h"
++#include "llvm/MC/MCExpr.h"
++#include "llvm/MC/MCSymbol.h"
++#include "llvm/InitializePasses.h"
++
++using namespace llvm;
++
++// Forward declaration: INITIALIZE_PASS below generates the definition, but
++// the legacy pass constructor (which precedes it) references it.
++namespace llvm {
++void initializeSIExpandJTDispatchPass(PassRegistry &);
++}
++
++#define DEBUG_TYPE "si-expand-jt-dispatch"
++#define PASS_NAME "SI Expand Jump-Table Dispatch"
++
++namespace {
++
++/// Core expansion logic, shared by the legacy and NewPM entry points.
++static bool expandJTDispatch(MachineFunction &MF, const SIInstrInfo *TII) {
++  MachineRegisterInfo &MRI = MF.getRegInfo();
++  bool Changed = false;
++
++  for (MachineBasicBlock &MBB : MF) {
++    for (MachineInstr &MI : make_early_inc_range(MBB)) {
++      if (MI.getOpcode() != AMDGPU::SI_BR_JT)
++        continue;
++
++      DebugLoc DL = MI.getDebugLoc();
++      MachineOperand JTOp = MI.getOperand(0);   // jump-table symbol (JTI)
++      Register IndexReg = MI.getOperand(1).getReg();
++
++      // Distinct virtual registers (no sub0/sub1 defs of a single vreg before
++      // RA: LiveVariables requires at most one def per vreg).
++      //   PCReg       : 64-bit program counter from s_getpc (single 64-bit def)
++      //   BaseLo/BaseHi: 32-bit halves of the table base (PC.sub + JTI offset)
++      //   Base64      : REG_SEQUENCE composing BaseLo:BaseHi into a 64-bit SGPR
++      //   ByteOff32   : 32-bit byte offset (index<<2) for the SMRD soffset.
++      //                Jump-table entries are 4 bytes each (EK_LabelDifference32:
++      //                each entry is `.long BB - JT`, a 32-bit *relative* offset
++      //                from the table base), so index<<2 selects the entry.
++      //   EntryOff32  : the loaded 4-byte relative offset (BB - JT)
++      //   SignExt32   : arithmetic shift-right by 31 of EntryOff32, i.e. the
++      //                sign-extension of the (possibly negative) 32-bit offset
++      //                to its high half (0 for >=0, -1 for <0).
++      //   TgtLo/TgtHi : absolute target address = table base + sign-extended off
++      //   Tgt64       : REG_SEQUENCE composing TgtLo:TgtHi into a 64-bit SGPR
++      Register PCReg    = MRI.createVirtualRegister(&AMDGPU::SReg_64RegClass);
++      Register BaseLo  = MRI.createVirtualRegister(&AMDGPU::SReg_32_XM0RegClass);
++      Register BaseHi  = MRI.createVirtualRegister(&AMDGPU::SReg_32_XM0RegClass);
++      Register Base64  = MRI.createVirtualRegister(&AMDGPU::SReg_64RegClass);
++      Register ByteOff32 = MRI.createVirtualRegister(&AMDGPU::SReg_32_XM0RegClass);
++      Register EntryOff32 = MRI.createVirtualRegister(&AMDGPU::SReg_32_XM0RegClass);
++      Register SignExt32 = MRI.createVirtualRegister(&AMDGPU::SReg_32_XM0RegClass);
++      Register TgtLo  = MRI.createVirtualRegister(&AMDGPU::SReg_32_XM0RegClass);
++      Register TgtHi  = MRI.createVirtualRegister(&AMDGPU::SReg_32_XM0RegClass);
++      Register Tgt64  = MRI.createVirtualRegister(&AMDGPU::SReg_64RegClass);
++
++      auto InsertPt = MI.getIterator();
++
++      // Compute the jump-table base address (Base64 = JTI symbol address).
++      //
++      // We use the same PC-relative mechanism as SIInstrInfo::insertIndirectBranch
++      // (the long-branch path): s_getpc_b64 then s_add_u32 / s_addc_u32 with a
++      // *symbol* operand (OffsetSym, MO_FAR_BRANCH_OFFSET) whose variable value
++      // is `(JTI - PostGetPC)`, where PostGetPC is a label attached to the
++      // s_getpc instruction. s_getpc returns the address of PostGetPC, so
++      //   s8 = PostGetPC + (JTI - PostGetPC) = JTI
++      // with no dependence on the s_add position. This is essential because the
++      // hazard recognizer can insert s_wait_alu between s_getpc and s_add; a
++      // rel32@lo/@hi fixup keyed to the s_add's own address would then be off by
++      // the inserted instruction size and send s_setpc into the wrong place.
++      // Keying the offset to the s_getpc's post-instruction label makes the
++      // computation immune to whatever the scheduler/hazard recognizer inserts
++      // in between. (S_ADD_PC_I64 would do this in one instruction but it is
++      // gfx1250+ only; gfx1201 lacks it.)
++      MachineInstr *GetPC =
++          BuildMI(MBB, InsertPt, DL, TII->get(AMDGPU::S_GETPC_B64), PCReg);
++      // Keep a live reference to the jump table so BranchFolding's liveness
++      // scan (BranchFolding.cpp ~line 263: it removes any jump table with no
++      // surviving MO_JumpTableIndex operand) keeps the table. SI_BR_JT used to
++      // carry that operand; once we expand it away the JTI operand disappears
++      // and BranchFolding would RemoveJumpTable() the table, zeroing all
++      // entries and corrupting dispatch. We attach a JTI operand to the
++      // s_getpc as a side reference (the assembler ignores it; it exists only
++      // to keep the table live through control-flow optimization).
++      GetPC->addOperand(MF,
++                        MachineOperand::CreateJTI(JTOp.getIndex(),
++                                                  JTOp.getTargetFlags()));
++      MCSymbol *PostGetPCLabel =
++          MF.getContext().createTempSymbol("post_getpc", /*AlwaysAddSuffix=*/true);
++      GetPC->setPostInstrSymbol(MF, PostGetPCLabel);
++      MCSymbol *JTISym = MF.getJTISymbol(JTOp.getIndex(), MF.getContext());
++      const MCExpr *OffsetExpr = MCBinaryExpr::createSub(
++          MCSymbolRefExpr::create(JTISym, MF.getContext()),
++          MCSymbolRefExpr::create(PostGetPCLabel, MF.getContext()),
++          MF.getContext());
++      MCSymbol *OffsetSym =
++          MF.getContext().createTempSymbol("jt_offset", /*AlwaysAddSuffix=*/true);
++      OffsetSym->setVariableValue(OffsetExpr);
++
++      // s_add_u32 BaseLo, PCReg.sub0, OffsetSym(lo)  — carry-out -> SCC.
++      // Split the 64-bit (JTI - PostGetPC) offset into lo/hi via two MCSymbols
++      // that reference it (mirrors insertIndirectBranch's OffsetLo/OffsetHi).
++      MCSymbol *OffsetLo =
++          MF.getContext().createTempSymbol("jt_off_lo", /*AlwaysAddSuffix=*/true);
++      MCSymbol *OffsetHi =
++          MF.getContext().createTempSymbol("jt_off_hi", /*AlwaysAddSuffix=*/true);
++      OffsetLo->setVariableValue(
++          MCBinaryExpr::createAnd(OffsetExpr,
++                                  MCConstantExpr::create(0xFFFFFFFFu, MF.getContext()),
++                                  MF.getContext()));
++      OffsetHi->setVariableValue(
++          MCBinaryExpr::createAShr(OffsetExpr,
++                                   MCConstantExpr::create(32, MF.getContext()),
++                                   MF.getContext()));
++      BuildMI(MBB, InsertPt, DL, TII->get(AMDGPU::S_ADD_U32), BaseLo)
++          .addReg(PCReg, 0, AMDGPU::sub0)
++          .addSym(OffsetLo, SIInstrInfo::MO_FAR_BRANCH_OFFSET);
++      BuildMI(MBB, InsertPt, DL, TII->get(AMDGPU::S_ADDC_U32), BaseHi)
++          .addReg(PCReg, 0, AMDGPU::sub1)
++          .addSym(OffsetHi, SIInstrInfo::MO_FAR_BRANCH_OFFSET);
++
++      // Compose the two halves into a 64-bit SGPR for the SMRD base.
++      BuildMI(MBB, InsertPt, DL, TII->get(AMDGPU::REG_SEQUENCE), Base64)
++          .addReg(BaseLo)
++          .addImm(AMDGPU::sub0)
++          .addReg(BaseHi)
++          .addImm(AMDGPU::sub1);
++
++      // ByteOff32 = (IndexReg.sub0) << 2   (element index -> byte offset, *4:
++      // each jump-table entry is 4 bytes — EK_LabelDifference32, `.long BB-JT`).
++      BuildMI(MBB, InsertPt, DL, TII->get(AMDGPU::S_LSHL_B32), ByteOff32)
++          .addReg(IndexReg, 0, AMDGPU::sub0)
++          .addImm(2);
++
++      // s_load_dword EntryOff32, Base64, ByteOff32 (soffset), 0 imm, 0 cpol.
++      // Loads the 4-byte relative offset (BB - JT) stored in the entry.
++      BuildMI(MBB, InsertPt, DL, TII->get(AMDGPU::S_LOAD_DWORD_SGPR_IMM),
++              EntryOff32)
++          .addReg(Base64)
++          .addReg(ByteOff32)
++          .addImm(0)    // imm offset
++          .addImm(0);   // cpol (cache policy: none)
++
++      // Sign-extend the 32-bit relative offset to 64 bits (BB may precede JT,
++      // giving a negative BB-JT offset): high half = ashr(entry, 31).
++      BuildMI(MBB, InsertPt, DL, TII->get(AMDGPU::S_ASHR_I32), SignExt32)
++          .addReg(EntryOff32)
++          .addImm(31);
++
++      // Absolute target = table base + sign-extended offset (64-bit add via
++      // the s_add/s_addc carry chain).
++      BuildMI(MBB, InsertPt, DL, TII->get(AMDGPU::S_ADD_U32), TgtLo)
++          .addReg(BaseLo)
++          .addReg(EntryOff32);
++      BuildMI(MBB, InsertPt, DL, TII->get(AMDGPU::S_ADDC_U32), TgtHi)
++          .addReg(BaseHi)
++          .addReg(SignExt32);
++
++      // Compose the absolute target into a 64-bit SGPR for s_setpc.
++      BuildMI(MBB, InsertPt, DL, TII->get(AMDGPU::REG_SEQUENCE), Tgt64)
++          .addReg(TgtLo)
++          .addImm(AMDGPU::sub0)
++          .addReg(TgtHi)
++          .addImm(AMDGPU::sub1);
++
++      // s_setpc_b64 Tgt64  (O(1) dispatch to the selected instruction block)
++      BuildMI(MBB, InsertPt, DL, TII->get(AMDGPU::S_SETPC_B64)).addReg(Tgt64);
++      MI.eraseFromParent();
++      Changed = true;
++    }
++  }
++
++  return Changed;
++}
++
++class SIExpandJTDispatch : public MachineFunctionPass {
++public:
++  static char ID;
++
++  SIExpandJTDispatch() : MachineFunctionPass(ID) {
++    initializeSIExpandJTDispatchPass(*PassRegistry::getPassRegistry());
++  }
++
++  bool runOnMachineFunction(MachineFunction &MF) override;
++
++  StringRef getPassName() const override { return PASS_NAME; }
++
++  void getAnalysisUsage(AnalysisUsage &AU) const override {
++    AU.setPreservesCFG();
++    MachineFunctionPass::getAnalysisUsage(AU);
++  }
++};
++
++} // End anonymous namespace
++
++char SIExpandJTDispatch::ID = 0;
++INITIALIZE_PASS(SIExpandJTDispatch, DEBUG_TYPE, PASS_NAME, false, false)
++
++FunctionPass *llvm::createSIExpandJTDispatchPass() {
++  return new SIExpandJTDispatch();
++}
++
++PreservedAnalyses llvm::SIExpandJTDispatchPass::run(MachineFunction &MF,
++                                            MachineFunctionAnalysisManager &) {
++  const GCNSubtarget &ST = MF.getSubtarget<GCNSubtarget>();
++  bool Changed = expandJTDispatch(MF, ST.getInstrInfo());
++  if (!Changed)
++    return PreservedAnalyses::all();
++  return getMachineFunctionPassPreservedAnalyses().preserveSet<CFGAnalyses>();
++}
++
++bool SIExpandJTDispatch::runOnMachineFunction(MachineFunction &MF) {
++  const GCNSubtarget &ST = MF.getSubtarget<GCNSubtarget>();
++  return expandJTDispatch(MF, ST.getInstrInfo());
++}
+diff -ruN a/llvm/lib/Target/AMDGPU/SIISelLowering.cpp b/llvm/lib/Target/AMDGPU/SIISelLowering.cpp
+--- a/llvm/lib/Target/AMDGPU/SIISelLowering.cpp	2026-02-24 07:35:28.000000000 +0000
++++ b/llvm/lib/Target/AMDGPU/SIISelLowering.cpp	2026-07-02 16:12:45.263939532 +0000
+@@ -277,6 +277,10 @@
+ 
+   setOperationAction(ISD::GlobalAddress, {MVT::i32, MVT::i64}, Custom);
+   setOperationAction(ISD::ExternalSymbol, {MVT::i32, MVT::i64}, Custom);
++  // Enable materializing in-function block addresses (needed for jump-table
++  // dispatch lowering via s_setpc). Without this, ISel crashes on BlockAddress
++  // since AMDGPU never needed it before (LowerSwitch removed all switches).
++  setOperationAction(ISD::BlockAddress, {MVT::i32, MVT::i64}, Custom);
+ 
+   setOperationAction(ISD::SELECT, MVT::i1, Promote);
+   setOperationAction(ISD::SELECT, MVT::i64, Custom);
+@@ -309,6 +313,7 @@
+                      Custom);
+ 
+   setOperationAction(ISD::BRCOND, MVT::Other, Custom);
++  setOperationAction(ISD::BR_JT, MVT::Other, Custom);
+   setOperationAction(ISD::BR_CC,
+                      {MVT::i1, MVT::i32, MVT::i64, MVT::f32, MVT::f64}, Expand);
+ 
+@@ -6803,6 +6808,8 @@
+     return AMDGPUTargetLowering::LowerOperation(Op, DAG);
+   case ISD::BRCOND:
+     return LowerBRCOND(Op, DAG);
++  case ISD::BR_JT:
++    return LowerBR_JT(Op, DAG);
+   case ISD::RETURNADDR:
+     return LowerRETURNADDR(Op, DAG);
+   case ISD::LOAD: {
+@@ -6837,6 +6844,8 @@
+     SIMachineFunctionInfo *MFI = MF.getInfo<SIMachineFunctionInfo>();
+     return LowerGlobalAddress(MFI, Op, DAG);
+   }
++  case ISD::BlockAddress:
++    return LowerBlockAddress(Op, DAG);
+   case ISD::ExternalSymbol:
+     return LowerExternalSymbol(Op, DAG);
+   case ISD::INTRINSIC_WO_CHAIN:
+@@ -9109,6 +9118,65 @@
+   return DAG.getPOISON(Op.getValueType());
+ }
+ 
++// Materialize an in-function block address as a PC-relative address.
++// We reuse the same s_getpc + s_add(rel32) sequence used for globals
++// (buildPCRelGlobalAddress / AMDGPUISD::PC_ADD_REL_OFFSET), but with a
++// TargetBlockAddress placeholder instead of a TargetGlobalAddress. The
++// placeholder is resolved at MC lowering time to the basic block's label
++// (see AMDGPUMCInstLower for MO_BlockAddress and AsmPrinter block labels).
++//
++// Without this, ISel crashes on ISD::BlockAddress ("Cannot select
++// BlockAddress") because AMDGPU never registered a lowering for it — it never
++// needed one while LowerSwitch removed every switch. Jump-table dispatch
++// lowering needs block addresses, so we materialize them here.
++SDValue SITargetLowering::LowerBlockAddress(SDValue Op,
++                                            SelectionDAG &DAG) const {
++  auto *BASD = cast<BlockAddressSDNode>(Op);
++  const BlockAddress *BA = BASD->getBlockAddress();
++  int64_t Offset = BASD->getOffset();
++  SDLoc DL(BASD);
++  EVT PtrVT = Op.getValueType();
++
++  // PC-relative: s_getpc_b64 + s_add (block-label@rel32) + s_addc.
++  // Use MO_REL32 so the block label is encoded as a 32-bit PC-relative offset,
++  // same mechanism as PC-rel globals.
++  if (((const GCNSubtarget &)DAG.getSubtarget()).has64BitLiterals()) {
++    SDValue Ptr = DAG.getTargetBlockAddress(BA, PtrVT, Offset,
++                                            SIInstrInfo::MO_REL32 + 2);
++    return DAG.getNode(AMDGPUISD::PC_ADD_REL_OFFSET64, DL, PtrVT, Ptr);
++  }
++
++  SDValue PtrLo = DAG.getTargetBlockAddress(BA, MVT::i32, Offset,
++                                            SIInstrInfo::MO_REL32);
++  SDValue PtrHi = DAG.getTargetBlockAddress(BA, MVT::i32, Offset,
++                                            SIInstrInfo::MO_REL32 + 1);
++  return DAG.getNode(AMDGPUISD::PC_ADD_REL_OFFSET, DL, PtrVT, PtrLo, PtrHi);
++}
++
++// Lower a dense switch's jump-table dispatch into our custom BR_JT node.
++// The node carries (chain, jump-table-index, table-element-index) and is
++// expanded by the SI_BR_JT pseudo (SIInstrInfo.cpp) into:
++//   s_getpc_b64 + s_add (jt_symbol@rel32)   -> table base
++//   scale index by entry size, load the 8-byte block-address entry
++//   s_setpc_b64 to the loaded entry
++// Jump-table entries are EK_BlockAddress block labels (materialized via
++// LowerBlockAddress / MO_BlockAddress), so this reuses the PC-rel machinery.
++SDValue SITargetLowering::LowerBR_JT(SDValue Op, SelectionDAG &DAG) const {
++  SDValue Chain = Op.getOperand(0);
++  SDValue Table = Op.getOperand(1);   // JumpTableSDNode
++  SDValue Index = Op.getOperand(2);
++  SDLoc DL(Op);
++
++  int JTI = cast<JumpTableSDNode>(Table.getNode())->getIndex();
++  EVT PtrVT = MVT::i64;  // jump-table base address (entries are 8-byte block addrs)
++  // Target jump-table symbol with PC-rel relocation flags, exactly like a
++  // PC-rel global. The SI_BR_JT expander computes its address with s_getpc.
++  SDValue JT = DAG.getTargetJumpTable(JTI, PtrVT, SIInstrInfo::MO_REL32);
++
++  SDValue Ops[] = {Chain, JT, Index};
++  return DAG.getNode(AMDGPUISD::BRJT, DL, MVT::Other, Ops);
++}
++
+ SDValue SITargetLowering::copyToM0(SelectionDAG &DAG, SDValue Chain,
+                                    const SDLoc &DL, SDValue V) const {
+   // We can't use S_MOV_B32 directly, because there is no way to specify m0 as
+@@ -18467,7 +18535,16 @@
+     if (const Value *V = FLI->getValueFromVirtualReg(R->getReg()))
+       return UA->isDivergent(V);
+ 
+-    assert(Reg == FLI->DemoteRegister || isCopyFromRegOfInlineAsm(N));
++    // No IR Value mapping for this vreg. This happens for pure SelectionDAG
++    // intermediates such as the jump-table index register created by
++    // SelectionDAGBuilder::visitJumpTableHeader (used by BR_JT dispatch),
++    // which has no corresponding IR Value. The jump-table path is only ever
++    // reached for uniform dispatch (see AMDGPUISD::BRJT / LowerBR_JT), so the
++    // index vreg is allocated to an SGPR and must be uniform. Fall through to
++    // the register-class check instead of asserting, so the previously-unreachable
++    // jump-table path (areJTsAllowed was always false) can be exercised. For
++    // genuinely-divergent unknown vregs the SGPR check still returns true, so
++    // correctness is preserved.
+     return !TRI->isSGPRReg(MRI, Reg);
+   }
+   case ISD::LOAD: {
+@@ -18482,6 +18559,15 @@
+     return AMDGPU::isIntrinsicSourceOfDivergence(N->getConstantOperandVal(0));
+   case ISD::INTRINSIC_W_CHAIN:
+     return AMDGPU::isIntrinsicSourceOfDivergence(N->getConstantOperandVal(1));
++  case AMDGPUISD::BRJT:
++    // Our jump-table dispatch node (only produced by LowerBR_JT for a dense
++    // switch). The dispatch index is uniform by design of the interpreter
++    // dispatch loop (one program per wave, scalar PC), as declared by the IR
++    // producer via the amdgpu.skip.lowerswitch / uniform markers. Treat the
++    // node itself (and its index operand) as uniform so the divergence
++    // analysis does not assert on the SelectionDAGBuilder-built intermediate
++    // jump-table index CopyFromReg which has no IR Value mapping.
++    return false;
+   case AMDGPUISD::ATOMIC_CMP_SWAP:
+   case AMDGPUISD::BUFFER_ATOMIC_SWAP:
+   case AMDGPUISD::BUFFER_ATOMIC_ADD:
+diff -ruN a/llvm/lib/Target/AMDGPU/SIISelLowering.h b/llvm/lib/Target/AMDGPU/SIISelLowering.h
+--- a/llvm/lib/Target/AMDGPU/SIISelLowering.h	2026-02-24 07:35:28.000000000 +0000
++++ b/llvm/lib/Target/AMDGPU/SIISelLowering.h	2026-07-02 15:58:36.220581242 +0000
+@@ -80,6 +80,8 @@
+   SDValue LowerGlobalAddress(AMDGPUMachineFunction *MFI, SDValue Op,
+                              SelectionDAG &DAG) const override;
+   SDValue LowerExternalSymbol(SDValue Op, SelectionDAG &DAG) const;
++  SDValue LowerBlockAddress(SDValue Op, SelectionDAG &DAG) const;
++  SDValue LowerBR_JT(SDValue Op, SelectionDAG &DAG) const;
+ 
+   SDValue lowerImplicitZextParam(SelectionDAG &DAG, SDValue Op,
+                                  MVT VT, unsigned Offset) const;
+diff -ruN a/llvm/lib/Target/AMDGPU/SIInstrInfo.cpp b/llvm/lib/Target/AMDGPU/SIInstrInfo.cpp
+--- a/llvm/lib/Target/AMDGPU/SIInstrInfo.cpp	2026-02-24 07:35:28.000000000 +0000
++++ b/llvm/lib/Target/AMDGPU/SIInstrInfo.cpp	2026-07-02 16:42:20.408457533 +0000
+@@ -2435,11 +2435,15 @@
+ 
+     if (OpLo.isGlobal())
+       OpLo.setOffset(OpLo.getOffset() + Adjust + 4);
++    else if (OpLo.isBlockAddress())
++      OpLo.setOffset(OpLo.getOffset() + Adjust + 4);
+     Bundler.append(
+         BuildMI(MF, DL, get(AMDGPU::S_ADD_U32), RegLo).addReg(RegLo).add(OpLo));
+ 
+     if (OpHi.isGlobal())
+       OpHi.setOffset(OpHi.getOffset() + Adjust + 12);
++    else if (OpHi.isBlockAddress())
++      OpHi.setOffset(OpHi.getOffset() + Adjust + 12);
+     Bundler.append(BuildMI(MF, DL, get(AMDGPU::S_ADDC_U32), RegHi)
+                        .addReg(RegHi)
+                        .add(OpHi));
+@@ -2460,6 +2464,8 @@
+     Bundler.append(BuildMI(MF, DL, get(AMDGPU::S_GETPC_B64), Reg));
+     if (Op.isGlobal())
+       Op.setOffset(Op.getOffset() + 4);
++    else if (Op.isBlockAddress())
++      Op.setOffset(Op.getOffset() + 4);
+     Bundler.append(
+         BuildMI(MF, DL, get(AMDGPU::S_ADD_U64), Reg).addReg(Reg).add(Op));
+ 
+@@ -2890,7 +2896,10 @@
+ bool SIInstrInfo::isBranchOffsetInRange(unsigned BranchOp,
+                                         int64_t BrOffset) const {
+   // BranchRelaxation should never have to check s_setpc_b64 or s_add_pc_i64
+-  // because its dest block is unanalyzable.
++  // because its dest block is unanalyzable, but be defensive: an indirect
++  // branch has a computed target so it is always "in range".
++  if (BranchOp == AMDGPU::S_SETPC_B64 || BranchOp == AMDGPU::S_ADD_PC_I64)
++    return true;
+   assert(isSOPP(BranchOp) || isSOPK(BranchOp));
+ 
+   // Convert to dwords.
+diff -ruN a/llvm/lib/Target/AMDGPU/SIInstrInfo.td b/llvm/lib/Target/AMDGPU/SIInstrInfo.td
+--- a/llvm/lib/Target/AMDGPU/SIInstrInfo.td	2026-02-24 07:35:28.000000000 +0000
++++ b/llvm/lib/Target/AMDGPU/SIInstrInfo.td	2026-07-02 16:13:10.511071915 +0000
+@@ -269,6 +269,13 @@
+   SDTypeProfile<1, 1, [SDTCisVT<0, iPTR>, SDTCisSameAs<0,1>]>
+ >;
+ 
++// Jump-table dispatch node for the interpreter dispatch loop.
++// Operands: (chain, target-jump-table:iPTR, index:iPTR).  HasOther (chain-only) result.
++def SIbr_jt : SDNode<"AMDGPUISD::BRJT",
++  SDTypeProfile<0, 2, [SDTCisSameAs<0, 1>]>,
++  [SDNPHasChain]
++>;
++
+ def SIlds : SDNode<"AMDGPUISD::LDS",
+   SDTypeProfile<1, 1, [SDTCisVT<0, iPTR>, SDTCisSameAs<0,1>]>
+ >;
+diff -ruN a/llvm/lib/Target/AMDGPU/SIInstructions.td b/llvm/lib/Target/AMDGPU/SIInstructions.td
+--- a/llvm/lib/Target/AMDGPU/SIInstructions.td	2026-02-24 07:35:28.000000000 +0000
++++ b/llvm/lib/Target/AMDGPU/SIInstructions.td	2026-07-02 16:29:05.124353314 +0000
+@@ -1289,6 +1289,21 @@
+   (SI_PC_ADD_REL_OFFSET $ptr_lo, (i32 0))
+ >;
+ 
++// Same as the global-address pattern above, but for in-function block
++// addresses (jump-table dispatch). The offset-adjustment in the SIInstrInfo
++// expander handles both isGlobal() and isBlockAddress() operands.
++def : GCNPat <
++  (SIpc_add_rel_offset tblockaddress:$ptr_lo, 0),
++  (SI_PC_ADD_REL_OFFSET $ptr_lo, (i32 0))
++>;
++
++// Two-operand form: both halves are block-address placeholders (lo/hi of the
++// same block label, as produced by LowerBlockAddress's 32-bit path).
++def : GCNPat <
++  (SIpc_add_rel_offset tblockaddress:$ptr_lo, tblockaddress:$ptr_hi),
++  (SI_PC_ADD_REL_OFFSET $ptr_lo, $ptr_hi)
++>;
++
+ def SI_PC_ADD_REL_OFFSET64 : SPseudoInstSI <
+   (outs SReg_64:$dst),
+   (ins si_ga:$ptr),
+@@ -1297,6 +1312,29 @@
+   let SubtargetPredicate = Has64BitLiterals;
+ }
+ 
++// Block-address variant of the 64-bit PC-rel offset (jump-table dispatch on
++// subtargets with 64-bit literals).
++def : GCNPat <
++  (i64 (SIpc_add_rel_offset64 tblockaddress:$ptr)),
++  (SI_PC_ADD_REL_OFFSET64 $ptr)
++>;
++
++// Jump-table dispatch pseudo. Expanded in SIInstrInfo.cpp::expandPostRAPseudo
++// into: s_getpc_b64 + s_add(jt@rel32) -> base; scale index; s_load_b64 entry;
++// s_setpc_b64. Entry size 8 (EK_BlockAddress block labels, 64-bit).
++// Jump-table dispatch pseudo. Expanded in SIInstrInfo.cpp::expandPostRAPseudo
++// into: s_getpc_b64 + s_add(jt@rel32) -> base; scale index; s_load_b64 entry;
++// s_setpc_b64. Entry size 8 (EK_BlockAddress block labels, 64-bit).
++// Marked isTerminator/isBranch/isBarrier/isIndirectBranch so BranchFolding and
++// the machine CFG treats this as an unanalyzable indirect branch (like
++// S_SETPC_B64) rather than a non-branch terminator. analyzeBranch returns
++// CannotAnalyze (true) for it, so BranchFolding leaves the dispatch MBB alone.
++let isTerminator = 1, isBarrier = 1, isBranch = 1, isIndirectBranch = 1 in
++def SI_BR_JT : SPseudoInstSI <
++  (outs),
++  (ins si_ga:$jt, SReg_64:$index),
++  [(SIbr_jt tjumptable:$jt, i64:$index)]>;
++
+ def : GCNPat<
+   (AMDGPUtrap timm:$trapid),
+   (S_TRAP $trapid)
+diff -ruN a/llvm/lib/Transforms/Utils/LowerSwitch.cpp b/llvm/lib/Transforms/Utils/LowerSwitch.cpp
+--- a/llvm/lib/Transforms/Utils/LowerSwitch.cpp	2026-02-24 07:35:28.000000000 +0000
++++ b/llvm/lib/Transforms/Utils/LowerSwitch.cpp	2026-07-02 06:59:43.671418519 +0000
+@@ -544,6 +544,13 @@
+       continue;
+ 
+     if (SwitchInst *SI = dyn_cast<SwitchInst>(Cur.getTerminator())) {
++      // Allow callers to opt a switch out of lower-switch lowering so that
++      // it can survive to instruction selection as a real jump table. This
++      // is used by targets (e.g. AMDGPU) that can lower a dense, uniform
++      // switch to an indirect branch / setpc jump table but cannot do so
++      // once LowerSwitch has turned it into a comparison tree.
++      if (SI->getMetadata("amdgpu.skip.lowerswitch"))
++        continue;
+       Changed = true;
+       ProcessSwitchInst(SI, DeleteList, AC, LVI);
+     }
+diff -ruN a/llvm/lib/Transforms/Utils/UnifyLoopExits.cpp b/llvm/lib/Transforms/Utils/UnifyLoopExits.cpp
+--- a/llvm/lib/Transforms/Utils/UnifyLoopExits.cpp	2026-02-24 07:35:28.000000000 +0000
++++ b/llvm/lib/Transforms/Utils/UnifyLoopExits.cpp	2026-07-02 16:46:21.451204060 +0000
+@@ -154,6 +154,16 @@
+   SmallVector<BasicBlock *, 8> ExitingBlocks;
+   L->getExitingBlocks(ExitingBlocks);
+ 
++  // If any exiting block terminates in a switch (e.g. the gint interpreter
++  // dispatch switch kept dense via the amdgpu.skip.lowerswitch metadata),
++  // we cannot unify its loop exits through the control-flow hub (which
++  // assumes branch/callbr terminators). Leave the loop untouched — the
++  // StructurizeCFG skip and the BR_JT jump-table lowering handle the
++  // dispatch switch downstream.
++  for (BasicBlock *BB : ExitingBlocks)
++    if (isa<SwitchInst>(BB->getTerminator()))
++      return false;
++
+   DomTreeUpdater DTU(DT, DomTreeUpdater::UpdateStrategy::Eager);
+   SmallVector<BasicBlock *, 8> CallBrTargetBlocksToFix;
+   // Redirect exiting edges through a control flow hub.
+diff -ruN a/llvm/lib/Transforms/Scalar/StructurizeCFG.cpp b/llvm/lib/Transforms/Scalar/StructurizeCFG.cpp
+--- a/llvm/lib/Transforms/Scalar/StructurizeCFG.cpp	2026-02-24 07:35:28.000000000 +0000
++++ b/llvm/lib/Transforms/Scalar/StructurizeCFG.cpp	2026-07-02 17:18:55.171866742 +0000
+@@ -1409,6 +1409,22 @@
+   if (R->isTopLevelRegion() || isa<CallBrInst>(R->getEntry()->getTerminator()))
+     return false;
+ 
++  // If the region contains a switch terminator marked with the
++  // amdgpu.skip.lowerswitch metadata (the gint interpreter dispatch switch,
++  // kept dense so a patched backend can lower it to an O(1) s_setpc jump table),
++  // leave the region untouched: StructurizeCFG assumes BranchInst terminators
++  // and would destroy the switch. The dispatch index is uniform by design
++  // (one program per wave), so the jump-table lowering downstream handles it.
++  unsigned SkipLowerMD =
++      R->getEntry()->getContext().getMDKindID("amdgpu.skip.lowerswitch");
++  for (RegionNode *E : R->elements()) {
++    if (E->isSubRegion())
++      continue;
++    if (auto *SI = dyn_cast<SwitchInst>(E->getEntry()->getTerminator()))
++      if (SI->getMetadata(SkipLowerMD))
++        return false;
++  }
++
+   this->DT = DT;
+   this->TTI = TTI;
+   Func = R->getEntry()->getParent();

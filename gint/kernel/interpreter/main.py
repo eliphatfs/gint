@@ -1,4 +1,5 @@
 from llvmlite import ir
+import os
 from ..platforms.common import *
 from ..platforms.platform import PlatformIRBuilder
 from ..platforms.nvptx import NVPTXIRBuilder
@@ -211,7 +212,7 @@ def build_main_loop(LL: PlatformIRBuilder, pool_size: int = POOL_SIZE, num_regs:
     
     LL.position_at_end(entry_bb)
     entry_pc = code_ptr
-    entry_opcode = LL.load(entry_pc)
+    entry_opcode = LL.make_uniform(LL.load(entry_pc))
     state = dispatch_states[0].clone()
     state.pc = entry_pc
     state.opcode = entry_opcode
@@ -225,6 +226,15 @@ def build_main_loop(LL: PlatformIRBuilder, pool_size: int = POOL_SIZE, num_regs:
     for i in range(max_stack + 1):
         LL.position_at_end(dispatch_bbs[i])
         dispatch_switch = LL.switch(dispatch_states[i].opcode, undef_bb)
+        # On AMDGPU, prevent LowerSwitch from converting this dense dispatch
+        # switch into a comparison tree; a patched LLVM lower it to an O(1)
+        # s_setpc_b64 jump table (see docs/kernel.md dispatch). The dispatch
+        # index is uniform across the wave by the interpreter's design (one
+        # program per wave), so the jump-table target is warp-convergent.
+        if getattr(LL, "_is_amdgcn", False):
+            import llvmlite.ir as _ir
+            dispatch_switch.set_metadata(
+                "amdgpu.skip.lowerswitch", LL.module.add_metadata([]))
         dispatch_weights = [1]
         for Insn, opid in variant_insns:
             insn_bb = LL.append_basic_block("%s.%d" % (Insn.__name__, i))
@@ -285,9 +295,16 @@ def build_interpreter_main_nvptx(variants: list[str] = None) -> PlatformIRBuilde
 
 
 def build_interpreter_main_amdgcn(gfx: str = "gfx1100", variants: list[str] = None) -> PlatformIRBuilder:
-    """Build an AMDGCN module containing one kernel per requested variant."""
+    """Build an AMDGCN module containing one kernel per requested variant.
+
+    The variant set defaults to the keys of VARIANTS but can be overridden via
+    the GINT_VARIANTS env var (comma-separated) — useful for dispatch
+    debugging with the minimal 'dbg' variant only, which keeps the generated
+    kernel small enough that `-print-after-all` dumps are tractable.
+    """
     if variants is None:
-        variants = list(VARIANTS)
+        env = os.environ.get("GINT_VARIANTS")
+        variants = env.split(",") if env else list(VARIANTS)
     assert variants, "must request at least one variant"
     first, *rest = variants
     pool, regs, stack = VARIANTS[first]

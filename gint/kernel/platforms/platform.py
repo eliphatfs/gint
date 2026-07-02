@@ -29,6 +29,12 @@ class PlatformIRBuilder(ir.IRBuilder):
     
     def warp_broadcast_lane(self, value: ir.Value, lane: ir.Value) -> ir.Value:
         raise NotImplementedError
+
+    def make_uniform(self, value: ir.NamedValue) -> ir.NamedValue:
+        """Promote a per-lane value to a uniform (scalar) value. Default is
+        identity — backends with a real readfirstlane-style intrinsic override
+        this to declare the dispatch index uniform for jump-table dispatch."""
+        return value
     
     def warp_allreduce_f32(self, value: ir.Value, op: EReducePrimitiveOp) -> ir.Value:
         raise NotImplementedError

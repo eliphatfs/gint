@@ -7,6 +7,7 @@ from .platform import PlatformIRBuilder
 class AMDGCNIRBuilder(PlatformIRBuilder):
 
     _gfx: str = "gfx1100"
+    _is_amdgcn: bool = True
 
     @classmethod
     def create_kernel_module(cls, fn_type: ir.FunctionType, fn_name: str, gfx: str = "gfx1100"):
@@ -104,6 +105,20 @@ class AMDGCNIRBuilder(PlatformIRBuilder):
             ival = self.bitcast(value, i32)
             result = self.intrinsic('llvm.amdgcn.readlane', i32, [ival, lane])
             return self.bitcast(result, f32)
+        raise TypeError("Expected value type f32 or i32, got", value.type)
+
+    def make_uniform(self, value: ir.NamedValue) -> ir.NamedValue:
+        # Promote a per-lane (possibly divergent) value to a uniform (scalar)
+        # value by taking the value from the first active lane. On AMDGPU this
+        # is llvm.amdgcn.readfirstlane, which lets the dispatch-switch index be
+        # uniform so the patched backend can lower it to an O(1) s_setpc jump
+        # table (see docs/kernel.md dispatch).
+        if value.type == i32:
+            return self.intrinsic('llvm.amdgcn.readfirstlane', i32, [value])
+        if value.type == f32:
+            ival = self.bitcast(value, i32)
+            return self.bitcast(
+                self.intrinsic('llvm.amdgcn.readfirstlane', i32, [ival]), f32)
         raise TypeError("Expected value type f32 or i32, got", value.type)
 
     def warp_allreduce_f32(self, value: ir.Value, op: EReducePrimitiveOp) -> ir.Value:

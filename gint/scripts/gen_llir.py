@@ -48,6 +48,7 @@ def invoke_clang_shim(llir: bytes, target: Literal['ptx', 'amdgcn'] = 'ptx', cc:
             os.path.join(bc_dir, 'oclc_daz_opt_off.bc'),
             os.path.join(bc_dir, 'oclc_finite_only_off.bc'),
             os.path.join(bc_dir, 'oclc_unsafe_math_off.bc'),
+            os.path.join(bc_dir, 'oclc_correctly_rounded_sqrt_off.bc'),
         ]
         # Filter to only existing bitcode files (some may not be present)
         bc_existing = [f for f in bc_files if os.path.exists(f)]
@@ -60,17 +61,23 @@ def invoke_clang_shim(llir: bytes, target: Literal['ptx', 'amdgcn'] = 'ptx', cc:
             ['llvm-link', '--only-needed', '-'] + bc_existing + ['-o', '-'],
             input=llir
         )
-        cmd = [
-            'clang',
-            '--target=%s' % targets[target],
-            '-mcpu=%s' % (gfx or 'gfx1100'),
-            '-S',
-            '-x', 'ir',
-            '-O3',
-        ]
+        # Use llc directly (bypassing clang's integrated backend) so that a
+        # patched llc with the s_setpc jump-table dispatch lowering can be used.
+        # clang's integrated backend would ignore the patched llc on PATH.
         if emit_llir:
-            cmd += ['-emit-llvm']
-        cmd += ['-o', '-', '-']
+            return llir
+        cmd = [
+            'llc',
+            '-mtriple=%s' % targets[target],
+            '-mcpu=%s' % (gfx or 'gfx1100'),
+            '-O3',
+            '-o', '-',
+            '-',
+        ]
+        # Allow disabling jump tables (bit-test/comparison-tree dispatch
+        # instead) for diagnosis via the GINT_NO_JT env var.
+        if os.environ.get('GINT_NO_JT'):
+            cmd.insert(1, '-max-jump-table-size=0')
         return subprocess.check_output(cmd, input=llir)
 
 
