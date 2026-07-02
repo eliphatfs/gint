@@ -141,24 +141,72 @@ class AMDGCNIRBuilder(PlatformIRBuilder):
         return red
 
     def special_unary(self, value: ir.Value, op: EUnarySpecialOp) -> ir.Value:
+        # Use hardware llvm.amdgcn intrinsics (single instructions) wherever a
+        # direct hardware op exists, instead of __ocml_* library calls. This is
+        # critical for register pressure: ocml calls lower to s_swappc_b64, and a
+        # call is a register live-out point. Because the dispatch switch fans
+        # out into many per-stack-depth case blocks that each keep their own set
+        # of stack VGPRs alive across the call, the union of all those live sets
+        # blows VGPR to ~255 (and triggers spills). A hardware intrinsic inlines
+        # to one instruction with no call, so normal liveness applies.
+        #
+        # Precision notes (vs ocml's IEEE implementations):
+        #  - sqrt/rsqrt: exact match (hardware v_sqrt/v_rsq).
+        #  - sin/cos: see below — uses llvm.sin/llvm.cos (AMDGPU LowerTrig
+        #    adds the 1/(2pi) reduction the hardware v_sin/v_cos require).
+        #  - exp = 2^(x*log2(e)); log = log2(x)*ln(2); tan = sin/cos — composed
+        #    from hardware ops with constant scaling.
+        #  - v_log_f32 does not handle denormals; gint operates in fp32 with
+        #    denormals off by default (oclc_daz_opt_off links the off variant,
+        #    and upstream torch.eager/diffrp also flush denormals on GPU).
+        import llvmlite.ir as _ir
+        LN2 = _ir.Constant(f32, 0.6931471805599453)
+        LOG2E = _ir.Constant(f32, 1.4426950408889634)
+        if op == EUnarySpecialOp.Sqrt:
+            return self.intrinsic('llvm.amdgcn.sqrt.f32', f32, [value])
+        if op == EUnarySpecialOp.RSqrt:
+            return self.intrinsic('llvm.amdgcn.rsq.f32', f32, [value])
+        #  - sin/cos: use the generic llvm.sin/llvm.cos intrinsics (NOT
+        #    llvm.amdgcn.sin/cos). AMDGPU's SITargetLowering::LowerTrig lowers
+        #    ISD::FSIN/FCOS to `x * (1/2pi) -> v_sin_f32/v_cos_f32` — it injects
+        #    the argument reduction (0.15915494 = 1/(2pi) multiply) that the
+        #    hardware v_sin/v_cos instructions require (they take a value in
+        #    units of 2pi, not radians). Calling llvm.amdgcn.sin.f32 directly
+        #    skips the reduction and computes garbage. llvm.sin.f32 keeps it
+        #    correct AND inlined (no ocml call).
+        if op == EUnarySpecialOp.Sin:
+            return self.intrinsic('llvm.sin.f32', f32, [value])
+        if op == EUnarySpecialOp.Cos:
+            return self.intrinsic('llvm.cos.f32', f32, [value])
+        if op == EUnarySpecialOp.Tan:
+            return self.fdiv(self.intrinsic('llvm.sin.f32', f32, [value]),
+                             self.intrinsic('llvm.cos.f32', f32, [value]))
+        if op == EUnarySpecialOp.Exp:
+            return self.intrinsic('llvm.amdgcn.exp2.f32', f32,
+                                 [self.fmul(value, LOG2E)])
+        if op == EUnarySpecialOp.Exp2:
+            return self.intrinsic('llvm.amdgcn.exp2.f32', f32, [value])
+        if op == EUnarySpecialOp.Log:
+            return self.fmul(self.intrinsic('llvm.amdgcn.log.f32', f32, [value]), LN2)
+        if op == EUnarySpecialOp.Log2:
+            return self.intrinsic('llvm.amdgcn.log.f32', f32, [value])
+        # No hardware intrinsic for the inverse trigs / erf — fall back to ocml.
+        # These keep s_swappc call sites, so VGPR stays ~255 until a structural
+        # (helper-function) solution lands for them.
         intrinsic_map = {
-            EUnarySpecialOp.Sqrt: '__ocml_sqrt_f32',
-            EUnarySpecialOp.Sin: '__ocml_sin_f32',
-            EUnarySpecialOp.Cos: '__ocml_cos_f32',
-            EUnarySpecialOp.Tan: '__ocml_tan_f32',
             EUnarySpecialOp.ArcSin: '__ocml_asin_f32',
             EUnarySpecialOp.ArcCos: '__ocml_acos_f32',
             EUnarySpecialOp.ArcTan: '__ocml_atan_f32',
-            EUnarySpecialOp.Exp: '__ocml_exp_f32',
-            EUnarySpecialOp.Exp2: '__ocml_exp2_f32',
-            EUnarySpecialOp.Log: '__ocml_log_f32',
-            EUnarySpecialOp.Log2: '__ocml_log2_f32',
-            EUnarySpecialOp.RSqrt: '__ocml_rsqrt_f32',
             EUnarySpecialOp.Erf: '__ocml_erf_f32',
         }
         return self.intrinsic(intrinsic_map[op], f32, [value])
 
     def special_binary(self, a: ir.Value, b: ir.Value, op: EBinarySpecialOp) -> ir.Value:
+        # atan2 and pow have no correct hardware intrinsic. We keep them on ocml
+        # (pow especially: a hardware exp2(log2(x)*y) form is wrong for x < 0,
+        # and torch.square lowers to pow(x, 2.0), so correctness here matters).
+        # These retain s_swappc call sites; VGPR stays ~255 until a structural
+        # (helper-function) solution lands for the remaining ocml calls.
         intrinsic_map = {
             EBinarySpecialOp.ArcTan2: '__ocml_atan2_f32',
             EBinarySpecialOp.Pow: '__ocml_pow_f32',
