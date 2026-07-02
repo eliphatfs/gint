@@ -8,6 +8,48 @@ from gint.kernel.interpreter.main import build_interpreter_main_nvptx, build_int
 from gint.kernel import platforms
 
 
+# Attribute set forcing ocml math functions to inline. ocml ships asin/acos/
+# atan/atan2/erf/pow (and helpers fmuladd/atanred/epln/expep/exp) marked
+# `convergent` and without amdgpu-no-* attributes, so LLVM keeps them as
+# out-of-line s_swappc calls. A call is a register live-out point: the dispatch
+# switch fans out into per-stack-depth case blocks that each keep their own
+# stack VGPRs live across the call, so the union pins VGPR at ~255 and forces
+# spills. These functions are just polynomial approximations (fma + hardware
+# sqrt/log/exp), so always-inline + the amdgpu-no-* set lets LLVM inline them
+# fully -> 0 swappc, VGPR 256->~140, zero spill, occupancy doubled.
+_AMDGPU_NO_ATTRS = (
+    'mustprogress nofree norecurse nosync nounwind willreturn memory(none)'
+    ' "amdgpu-no-agpr" "amdgpu-no-completion-action" "amdgpu-no-default-queue"'
+    ' "amdgpu-no-dispatch-id" "amdgpu-no-dispatch-ptr" "amdgpu-no-flat-scratch-init"'
+    ' "amdgpu-no-heap-ptr" "amdgpu-no-hostcall-ptr" "amdgpu-no-implicitarg-ptr"'
+    ' "amdgpu-no-lds-kernel-id" "amdgpu-no-multigrid-sync-arg" "amdgpu-no-queue-ptr"'
+    ' "amdgpu-no-workgroup-id-x" "amdgpu-no-workgroup-id-y" "amdgpu-no-workgroup-id-z"'
+    ' "amdgpu-no-workitem-id-x" "amdgpu-no-workitem-id-y" "amdgpu-no-workitem-id-z"'
+    ' "denormal-fp-math"="dynamic,dynamic" "no-trapping-math"="true"'
+    ' "stack-protector-buffer-size"="8" "uniform-work-group-size"="false"'
+)
+_INLINE_ATTRS = '{ alwaysinline ' + _AMDGPU_NO_ATTRS + ' }'
+
+
+def _amdgcn_inline_ocml_math(llir_bc: bytes) -> bytes:
+    """Disassemble the linked bitcode, force ocml math functions to
+    always-inline (dropping convergent, adding amdgpu-no-*), reassemble."""
+    text = subprocess.check_output(
+        ['llvm-dis', '-o', '-'], input=llir_bc).decode()
+    # Find every attribute group used by an ocml/ocmlpriv math function and
+    # replace it with the inline-forcing set. Collect the group numbers first.
+    import re
+    grps = set()
+    for m in re.finditer(
+            r'define[^@]*@(__ocml[a-z_]*_f\d+|__ocmlpriv_[a-z_]*_f\d+)[^#]*#(\d+)',
+            text):
+        grps.add(m.group(2))
+    for g in sorted(grps):
+        pat = r'attributes #' + g + r' = \{[^}]*\}'
+        text = re.sub(pat, 'attributes #' + g + ' = ' + _INLINE_ATTRS, text)
+    return subprocess.check_output(['llvm-as', '-o', '-'], input=text.encode())
+
+
 def invoke_clang_shim(llir: bytes, target: Literal['ptx', 'amdgcn'] = 'ptx', cc: Optional[int] = None, gfx: Optional[str] = None, emit_llir: bool = False):
     targets = {
         'ptx': 'nvptx64-nvidia-cuda',
@@ -61,6 +103,18 @@ def invoke_clang_shim(llir: bytes, target: Literal['ptx', 'amdgcn'] = 'ptx', cc:
             ['llvm-link', '--only-needed', '-'] + bc_existing + ['-o', '-'],
             input=llir
         )
+        # Force ocml math functions (asin/acos/atan/atan2/erf/pow/exp and
+        # their helpers fmuladd/atanred/epln/expep) to inline into geval.
+        # ocml ships them marked `convergent` and without amdgpu-no-* attributes,
+        # so LLVM keeps them as out-of-line s_swappc calls; a call is a register
+        # live-out point that pins the dispatch loop's stack VGPRs at ~255 and
+        # forces spills. These functions are just polynomial approximations
+        # (fma + hardware sqrt/log/exp), so always-inline + the amdgpu-no-* set
+        # lets LLVM inline them fully -> 0 swappc, VGPR 256->~140, zero spill,
+        # occupancy doubled. (Only for amdgcn; NVPTX libdevice uses nvvm_reflect
+        # and is handled separately.)
+        if target == 'amdgcn':
+            llir = _amdgcn_inline_ocml_math(llir)
         # Use llc directly (bypassing clang's integrated backend) so that a
         # patched llc with the s_setpc jump-table dispatch lowering can be used.
         # clang's integrated backend would ignore the patched llc on PATH.
