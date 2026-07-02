@@ -224,7 +224,8 @@ def _direct_cudagraph_wrap(compiled, sample_args, clone_outputs: bool = True):
     return wrapper
 
 
-def compile(fn=None, *, backend: str = "gint", **kwargs) -> Callable:
+def compile(fn=None, *, backend: str = "gint",
+            dynamo_cache_size_limit: int = None, **kwargs) -> Callable:
     """``torch.compile`` drop-in that scopes dynamo to gint's static-shape model.
 
     gint bakes shapes/strides/grid_dim into per-shape bytecode, so it can't
@@ -255,16 +256,27 @@ def compile(fn=None, *, backend: str = "gint", **kwargs) -> Callable:
     import functools
 
     if fn is None:
-        return functools.partial(compile, backend=backend, **kwargs)
+        return functools.partial(compile, backend=backend,
+                                 dynamo_cache_size_limit=dynamo_cache_size_limit,
+                                 **kwargs)
 
     base = torch.compile(fn, backend=backend, **kwargs)
 
     @functools.wraps(fn)
     def wrapper(*args, **kw):
-        with torch._dynamo.config.patch(
+        # gint compiles per-(shape, stride) by design, so each distinct
+        # call shape costs one dynamo cache entry. ``dynamo_cache_size_limit``
+        # (opt-in) scopes a larger ``cache_size_limit`` to this call for
+        # shape-cycling workloads (e.g. mip-level loops). Left at the torch
+        # default when None: more cache entries also mean more guard checks
+        # per call, which measurably hurts small, hot compiled functions.
+        patch_kwargs = dict(
             automatic_dynamic_shapes=False,
             assume_static_by_default=True,
-        ):
+        )
+        if dynamo_cache_size_limit is not None:
+            patch_kwargs['cache_size_limit'] = dynamo_cache_size_limit
+        with torch._dynamo.config.patch(**patch_kwargs):
             return base(*args, **kw)
 
     return wrapper

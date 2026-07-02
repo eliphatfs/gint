@@ -11,3 +11,12 @@ tmp
 
 gint/host/cuda/gint.fatbin.xz
 gint/host/hip/gint.fatbin.xz
+
+# Local agent config (.pi harness; .claude local-only files — skills/ stays tracked)
+/.pi/
+/.claude/settings.local.json
+/.claude/scheduled_tasks.lock
+
+# Throwaway profile / scratch scripts and one-off artifacts in benchmark/
+/benchmark/_*.py
+/benchmark/ablation_roofline.png

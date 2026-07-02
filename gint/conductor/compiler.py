@@ -464,6 +464,12 @@ def _plan_spills(
                          if op_desc is not None
                          else list(range(len(node.args))))
             sim = list(on_stack)
+            sim_claims: Dict[Node, int] = {}
+            op_appearances: Dict[Node, int] = {}
+            for idx in arg_order:
+                if idx < len(node.args) and isinstance(node.args[idx], Node):
+                    a = node.args[idx]
+                    op_appearances[a] = op_appearances.get(a, 0) + 1
             for idx in arg_order:
                 if idx >= len(node.args):
                     continue
@@ -478,11 +484,22 @@ def _plan_spills(
                     continue
                 # Stack-only candidate.
                 rev_pos = next((j for j, n in enumerate(reversed(sim)) if n is arg), -1)
+                already = sim_claims.get(arg, 0)
+                sim_claims[arg] = already + 1
                 if rev_pos == -1:
                     sim.append(arg)
                     continue
                 if rev_pos == 0:
-                    pass  # already on top
+                    # Mirror handle_operand's dup rule: a dup pushes one
+                    # extra slot when this claim has no unclaimed copy, or
+                    # when later claims/uses would starve.
+                    copies = sum(1 for n in sim if n is arg)
+                    avail = copies - already
+                    claims_left = op_appearances.get(arg, 1) - already - 1
+                    uses_later = last_use.get(arg, -1) > i
+                    if avail <= 0 or ((uses_later or claims_left > 0)
+                                      and avail == 1):
+                        sim.append(arg)
                 elif rev_pos == 1:
                     top = sim.pop(); sec = sim.pop()
                     sim.append(top); sim.append(sec)
@@ -617,7 +634,12 @@ class StackCodegen:
 
     def _check_overflow(self):
         if len(self.vstack) > self.max_stack:
-            raise RuntimeError(f"Stack overflow: depth {len(self.vstack)} > {self.max_stack}")
+            # _UnplannableSubgraph (not RuntimeError) so the compiler drops
+            # just this subgraph to the eager-fallback path instead of
+            # failing the whole AOT frame when the spill planner's stack
+            # simulation diverges from actual codegen.
+            raise _UnplannableSubgraph(
+                f"stack overflow during codegen: depth {len(self.vstack)} > {self.max_stack}")
 
     # --- Operand handling ---
 
@@ -649,26 +671,42 @@ class StackCodegen:
                 self.load_fn(0, self.tensor_map[arg])
                 self.vstack.append(arg)
             else:
-                raise RuntimeError(f"Node {arg.name} not on stack, not in register, and has no global tensor entry")
+                raise _UnplannableSubgraph(
+                    f"node {arg.name} not on stack, not in register, and has no global tensor entry")
 
         elif depth == 0:
-            # Already on top. Duplicate when:
-            # - the top slot is already claimed by an earlier operand of the
-            #   current op (e.g. mul(x, x) — the second x needs its own slot), or
-            # - more uses remain after this one (preserve a copy for later).
-            if already_claimed >= 1 or uses_left > 1:
+            # Already on top. Count the copies physically on the virtual
+            # stack vs. how many this op has already claimed; dup only when
+            # this claim has no unclaimed copy to take (e.g. the second x
+            # of mul(x, x) after a fresh load), or when consuming the last
+            # unclaimed copy would starve a later use. The previous rule
+            # (`already_claimed >= 1 or uses_left > 1`) double-dup'd
+            # mul(x, x) on an in-subgraph x, leaving a dead copy on the
+            # hardware stack for the rest of the program.
+            copies = sum(1 for n in self.vstack if n is arg)
+            avail = copies - already_claimed
+            if avail <= 0 or (uses_left > 1 and avail == 1):
                 fe.dup()
                 self.vstack.append(arg)
 
         elif depth == 1:
             # One slot below top.
-            if arg in self.node_to_reg:
+            if uses_left <= 1 and already_claimed == 0:
+                # Last use of a stack-resident copy: consume it in place via
+                # Swap (1 insn, no memory traffic). Reloading from reg/global
+                # here would leave this copy dead on the stack forever —
+                # wasting a slot AND an extra load.
+                fe.swap()
+                top = self.vstack.pop()
+                sec = self.vstack.pop()
+                self.vstack.append(top)
+                self.vstack.append(sec)
+            elif arg in self.node_to_reg:
                 # A reg-load is cheaper than reshuffling the stack.
                 fe.fload_reg(self.node_to_reg[arg])
                 self.vstack.append(arg)
             elif arg in self.tensor_map:
-                # Cheaper to reload from global than shuffle the stack (avoids a
-                # Swap that would displace the current top for later ops).
+                # Reload keeps the buried stack copy intact for later uses.
                 self.load_fn(0, self.tensor_map[arg])
                 self.vstack.append(arg)
             else:
@@ -700,8 +738,8 @@ class StackCodegen:
                 self.load_fn(0, self.tensor_map[arg])
                 self.vstack.append(arg)
             else:
-                raise RuntimeError(
-                    f"Node {arg.name} buried at depth {depth} with no global tensor entry; "
+                raise _UnplannableSubgraph(
+                    f"node {arg.name} buried at depth {depth} with no global tensor entry; "
                     "subgraph scheduling produced an unresolvable stack state"
                 )
 
@@ -1247,8 +1285,12 @@ class GintCompiler:
                         # Stride or shape mismatch — can't fuse. Fall back
                         # to standalone reduction; the pointwise nodes that
                         # would have been fused run via _run_eager instead.
-                        compiled[sg_index] = self._compile_reduction_subgraph(
-                            reduction_node, partitioner)
+                        try:
+                            compiled[sg_index] = self._compile_reduction_subgraph(
+                                reduction_node, partitioner)
+                        except _UnplannableSubgraph:
+                            i += 1
+                            continue
                         merged_schedules.append([reduction_node])
                         sg_index += 1
                         i += 1
@@ -1257,8 +1299,13 @@ class GintCompiler:
                     sg_index += 1
                     i += 2 if pw_schedule else 1
                     continue
-                compiled[sg_index] = self._compile_reduction_subgraph(
-                    reduction_node, partitioner)
+                try:
+                    compiled[sg_index] = self._compile_reduction_subgraph(
+                        reduction_node, partitioner)
+                except _UnplannableSubgraph:
+                    # Drop the reduction; its node runs via _run_eager.
+                    i += 1
+                    continue
             else:
                 pending_pws.append(schedule)
                 i += 1
@@ -1819,7 +1866,9 @@ class GintCompiler:
         # the reduction tile selector exactly.
         block_size = plan['block_size']
         batch_dims = list(plan['batch_dims'])
-        if block_size < 128 and len(batch_dims) >= 1:
+        import os as _os
+        if block_size < 128 and len(batch_dims) >= 1 \
+                and not _os.environ.get('GINT_PW_1D_ONLY'):
             tile = _select_pointwise_tiling(block_size)
         else:
             tile = dict(B=1, R=128, mode='1d')
@@ -1851,6 +1900,20 @@ class GintCompiler:
                     continue
 
                 arg_indices = resolve_arg_order(op_desc, node)
+
+                # Commutative binary op with exactly one arg sitting on top
+                # of the virtual stack: claim that one first (in place), then
+                # push the other on top. The declared order would bury the
+                # stack-resident arg under the fresh push and force a Swap
+                # or a dead global reload.
+                if (op_desc.commutative and len(arg_indices) == 2):
+                    a0 = node.args[arg_indices[0]]
+                    a1 = node.args[arg_indices[1]]
+                    if (isinstance(a0, Node) and isinstance(a1, Node)
+                            and a0 is not a1
+                            and codegen._depth(a1) == 0
+                            and codegen._depth(a0) != 0):
+                        arg_indices = [arg_indices[1], arg_indices[0]]
                 pushed = 0
                 for idx in arg_indices:
                     arg = node.args[idx]
@@ -2465,8 +2528,8 @@ class GintCompiler:
                                     depth = GintCompiler._vstack_depth(
                                         chunk_vstack, arg)
                                     if depth == -1:
-                                        raise RuntimeError(
-                                            f"Arg {arg.name} not on chunk "
+                                        raise _UnplannableSubgraph(
+                                            f"arg {arg.name} not on chunk "
                                             f"stack for {nd.name}")
                                     if depth == 0:
                                         pass
@@ -2477,8 +2540,8 @@ class GintCompiler:
                                         chunk_vstack.append(top)
                                         chunk_vstack.append(sec)
                                     else:
-                                        raise RuntimeError(
-                                            f"Arg {arg.name} buried at "
+                                        raise _UnplannableSubgraph(
+                                            f"arg {arg.name} buried at "
                                             f"depth {depth} for {nd.name}")
                                     pushed += 1
                         desc.emit_fn(nd)
@@ -2699,8 +2762,8 @@ class GintCompiler:
                                     # Scalar / intermediate: on chunk_vstack
                                     depth = GintCompiler._vstack_depth(chunk_vstack, arg)
                                     if depth == -1:
-                                        raise RuntimeError(
-                                            f"Arg {arg.name} not on chunk stack "
+                                        raise _UnplannableSubgraph(
+                                            f"arg {arg.name} not on chunk stack "
                                             f"for {node.name}")
                                     if depth == 0:
                                         pass  # already on top
@@ -2711,8 +2774,8 @@ class GintCompiler:
                                         chunk_vstack.append(top)
                                         chunk_vstack.append(sec)
                                     else:
-                                        raise RuntimeError(
-                                            f"Arg {arg.name} buried at depth {depth} "
+                                        raise _UnplannableSubgraph(
+                                            f"arg {arg.name} buried at depth {depth} "
                                             f"for {node.name}")
                                     pushed += 1
 
